@@ -1,0 +1,37 @@
+target/
+frontend/node_modules/
+frontend/dist/
+.runtime/
+data/
+/.data-migration-*/
+/downloads-test/
+/upload-test/
+/upload-archive-test/
+/thumbnail-cache/
+*.log
+.idea/
+.vscode/
+
+# Local working notes and private validation evidence
+/AGENTS.md
+/.agents/
+/docs/
+/requirements.md
+/architecture.md
+/prototype.html
+
+# Credentials, databases and native session files
+.env
+.env.*
+!.env.example
+*.sqlite
+*.sqlite-*
+*.db
+*.db-*
+*.session
+*.session-*
+*.binlog
+*.pem
+*.key
+*.p12
+*.pfx
