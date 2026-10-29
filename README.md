@@ -1,6 +1,6 @@
 # Telegram 资源台
 
-Windows x64 本机 Telegram 资源管理工具，使用已有 Telegram 账号，支持浏览自己的频道、下载可访问频道的媒体，以及向自己频道主帖的评论区上传文件。
+Telegram 资源管理工具，使用已有 Telegram 账号，支持浏览自己的频道、下载可访问频道的媒体，以及向自己频道主帖的评论区上传文件。
 
 ## 本地环境
 
@@ -8,7 +8,6 @@ Windows x64 本机 Telegram 资源管理工具，使用已有 Telegram 账号，
 
 | 环境 | 要求 |
 | --- | --- |
-| 操作系统 | Windows x64 |
 | Java | JDK 21 |
 | 原生运行库 | 匹配的 Microsoft VC++ x64 运行库 |
 | 构建工具 | Maven 3.9 |
