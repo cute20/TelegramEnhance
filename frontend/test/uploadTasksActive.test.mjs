@@ -48,8 +48,28 @@ test('inactive upload panel does not load, poll, page or issue mutations, and fi
   await f.state.load();f.state.loadMore();await f.state.action(value,'start');await f.state.checkFailures(reviewTask());await f.state.retryFailed(reviewTask());await f.state.lookupRetry(reviewTask())
   assert.equal(f.calls.length,0);assert.equal(f.state.offset.value,0)
   f.expect(LIST,list([value]));f.props.active=true;await flush();assert.equal(f.calls.length,1)
-  const timer=f.timers.at(-1);assert.ok(timer);f.props.active=false;await flush();assert.equal(timer.cancelled,true)
-  timer.callback();await flush();assert.equal(f.calls.length,1);assert.equal(f.state.tasks.value[0].id,ID)
+  assert.equal(f.timers.length,0,'READY history does not schedule automatic reads');f.props.active=false;await flush()
+  await f.state.readProgress();assert.equal(f.calls.length,1);assert.equal(f.state.tasks.value[0].id,ID)
+})
+
+test('upload progress reads only the known active task and leaves history loading and controls untouched',async t=>{
+  const active=task({state:'RUNNING'}),f=mount(t,{steps:[{path:LIST,value:list([active])}]});await flush()
+  const response=deferred();f.expect('/transfers/upload/tasks/'+ID,response.promise)
+  const reading=f.state.readProgress();assert.equal(f.state.loading.value,false);assert.equal(f.state.busy.value,'')
+  await f.state.readProgress();assert.equal(f.calls.length,2)
+  response.resolve(task({state:'RUNNING',updatedAt:2}));await reading
+  assert.equal(f.state.tasks.value[0].updatedAt,2);assert.equal(f.state.offset.value,1)
+  assert.equal(f.state.hasMore.value,false);assert.equal(f.calls.filter(call=>call.path===LIST).length,1)
+})
+
+test('user pause supersedes an older upload progress read and a transient progress failure does not flash an error',async t=>{
+  const active=task({state:'RUNNING'}),f=mount(t,{steps:[{path:LIST,value:list([active])}]});await flush()
+  f.expect('/transfers/upload/tasks/'+ID,new Error('temporary progress error'));await f.state.readProgress()
+  assert.equal(f.state.error.value,'');assert.equal(f.state.tasks.value[0].state,'RUNNING')
+  const response=deferred();f.expect('/transfers/upload/tasks/'+ID,response.promise);const reading=f.state.readProgress()
+  f.expect('/transfers/upload/tasks/'+ID+'/pause',task({state:'PAUSED'}),'POST');await f.state.action(active,'pause')
+  response.resolve(active);await reading;assert.equal(f.state.tasks.value[0].state,'PAUSED')
+  assert.equal(f.timers.filter(timer=>!timer.cancelled).length,0)
 })
 
 test('reactivation and refresh nonce changes coalesce behind an in-flight GET without overlap',async t=>{

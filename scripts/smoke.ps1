@@ -11,7 +11,7 @@ function Assert-Check($condition, [string]$name) {
     Write-Output "PASS: $name"
 }
 function Start-TestBackend {
-    $arguments = @('-Xmx256m', ('"-Dworkbench.data=' + $testRoot + '"'), '-cp', '"target/telegram-resource-workbench-0.1.0-SNAPSHOT.jar;target/lib/*"', 'io.github.telegramenhance.WorkbenchApplication')
+    $arguments = @('-Xmx256m', '-Dworkbench.auto-connect=false', ('"-Dworkbench.data=' + $testRoot + '"'), '-cp', '"target/telegram-resource-workbench-0.1.0-SNAPSHOT.jar;target/lib/*"', 'io.github.telegramenhance.WorkbenchApplication')
     $script:backend = Start-Process -FilePath $javaExe -ArgumentList $arguments -WorkingDirectory $projectRoot -WindowStyle Hidden -RedirectStandardOutput (Join-Path $testRoot 'backend.log') -RedirectStandardError (Join-Path $testRoot 'error.log') -PassThru
     $runtimeFile = Join-Path $testRoot 'runtime.json'
     for ($i=0; $i -lt 60; $i++) {
@@ -193,7 +193,7 @@ try {
     $null = Request 'POST' '/telegram/disconnect'
     $proxy = Request 'POST' '/proxy/test'
     Assert-Check ($proxy.level -eq 'ERROR') 'proxy check after disconnect handles a fresh client'
-    $arguments=@(('"-Dworkbench.data=' + $testRoot + '"'),'-cp','"target/telegram-resource-workbench-0.1.0-SNAPSHOT.jar;target/lib/*"','io.github.telegramenhance.WorkbenchApplication')
+    $arguments=@('-Dworkbench.auto-connect=false',('"-Dworkbench.data=' + $testRoot + '"'),'-cp','"target/telegram-resource-workbench-0.1.0-SNAPSHOT.jar;target/lib/*"','io.github.telegramenhance.WorkbenchApplication')
     $second = Start-Process -FilePath $javaExe -ArgumentList $arguments -WorkingDirectory $projectRoot -WindowStyle Hidden -RedirectStandardOutput (Join-Path $testRoot 'second.log') -RedirectStandardError (Join-Path $testRoot 'second-error.log') -PassThru
     $exited=$second.WaitForExit(10000)
     Assert-Check ($exited -and $second.ExitCode -ne 0) 'second instance refused'

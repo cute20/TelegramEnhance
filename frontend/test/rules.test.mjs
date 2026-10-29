@@ -23,6 +23,14 @@ function mount(t){
   t.after(()=>{hooks.forEach(f=>f());scope.stop();assert.deepEqual(errors,[]);assert.equal(steps.length,0)})
   return {state,props,calls,expect:(path,value,method='POST')=>steps.push({path,value,method})}
 }
+test('upload rules update only on an explicit refresh and retain the open draft',async t=>{
+  const f=mount(t);await flush();f.state.edit(null);f.state.form.name='stable upload draft'
+  assert.equal(f.calls.length,1);assert.equal(f.state.formOpen.value,true)
+  assert.equal(f.state.form.name,'stable upload draft');assert.equal(f.state.busy.value,'')
+  f.state.closeForm();f.expect('/rules',{mode:'RULES',items:[]},'GET');await f.state.refresh()
+  assert.equal(f.calls.length,2)
+})
+
 test('only observation results for this account pass validation',()=>{const r=result();assert.equal(rules.validRule(r,'1'),true);assert.equal(rules.validRule(r,'2'),false);r.mode='AUTO_UPLOAD';assert.equal(rules.validRule(r,'1'),false)})
 test('saving creates a paused rule and never creates or starts a transfer',async t=>{const f=mount(t);await flush();f.state.edit(null);Object.assign(f.state.form,input());f.expect('/rules',result());await f.state.save();assert.equal(f.state.items.value[0].rule.enabled,false);assert.equal(f.calls.length,2);assert.equal(f.calls[1].options.body.input.window.mode,'ALL_DAY');assert.equal(f.calls.some(c=>c.path.includes('transfers')),false)})
 test('editing reactive rule copies fields and saves a new version with original revision',async t=>{const f=mount(t);await flush();f.state.items.value=[result()];f.state.edit(f.state.items.value[0]);f.state.form.window={mode:'WINDOW',start:'22:00',end:'08:00',timezone:'Asia/Shanghai'};assert.equal(f.state.items.value[0].rule.input.window.mode,'ALL_DAY');const next=result();next.rule.version=2;next.rule.revision=2;next.rule.input.window=f.state.form.window;f.expect('/rules/'+ID,next,'PUT');await f.state.save();assert.equal(f.calls[1].options.body.revision,1);assert.equal(f.state.items.value[0].rule.version,2)})
@@ -39,6 +47,40 @@ test('unknown upload save can be closed and reopened while retaining the exact o
 test('an old edit revision does not clear uncertain save or permit another submission',async t=>{const f=mount(t);await flush();f.state.edit(result());f.state.form.name='edited';f.expect('/rules/'+ID,new Error('timeout'),'PUT');await f.state.save();f.state.closeForm();f.expect('/rules/'+ID,result(),'GET');await f.state.lookup();assert.equal(f.state.uncertain.value,true);assert.match(f.state.error.value,/尚未确认新版本/);await f.state.save();assert.equal(f.calls.length,3);const next=result();next.rule.version=2;next.rule.revision=2;next.rule.input.name='edited';f.expect('/rules/'+ID,next,'GET');await f.state.lookup();assert.equal(f.state.uncertain.value,false);assert.equal(f.state.items.value[0].rule.version,2)})
 
 test('account changes discard a closed uncertain upload form and its pending operation',async t=>{const f=mount(t);await flush();f.state.edit(null);Object.assign(f.state.form,input());f.expect('/rules',new Error('timeout'));await f.state.save();f.state.closeForm();f.props.authorized=false;await flush();f.state.reopenForm();await f.state.lookup();assert.equal(f.state.formOpen.value,false);assert.equal(f.state.uncertain.value,false);assert.equal(f.state.form.name,'');assert.equal(f.calls.length,2)})
+
+test('service polling and brief interruption preserve an upload draft and its automatic-name choice',async t=>{
+  const f=mount(t);await flush();f.state.edit(null);Object.assign(f.state.form,input());f.state.nameAutomatic.value=false
+  const draft=JSON.parse(JSON.stringify(f.state.form))
+  f.expect('/rules',{mode:'OBSERVE_ONLY',items:[]},'GET');await f.state.refresh()
+  assert.equal(f.state.formOpen.value,true)
+  f.props.available=false;await flush();assert.equal(f.state.formOpen.value,true);assert.deepEqual(f.state.form,draft)
+  await f.state.save();assert.equal(f.calls.length,2)
+  f.expect('/rules',{mode:'OBSERVE_ONLY',items:[]},'GET');f.props.available=true;await flush()
+  assert.equal(f.state.formOpen.value,true);assert.deepEqual(f.state.form,draft);assert.equal(f.state.nameAutomatic.value,false)
+  assert.equal(f.calls.every(call=>(call.options.method??'GET')==='GET'),true)
+})
+
+test('in-flight upload save becomes uncertain on service interruption and keeps the same operation lookup',async t=>{
+  const f=mount(t);await flush();f.state.edit(null);Object.assign(f.state.form,input())
+  let release;f.expect('/rules',new Promise(resolve=>release=resolve));const saving=f.state.save()
+  const operation=f.calls[1].options.body.operationId
+  f.props.available=false;await flush();assert.equal(f.state.uncertain.value,true);assert.equal(f.state.formOpen.value,true)
+  f.expect('/rules',{mode:'OBSERVE_ONLY',items:[]},'GET');f.props.available=true;await flush()
+  release(result());await saving;await flush()
+  assert.equal(f.state.formOpen.value,true);assert.equal(f.state.form.name,'sample');assert.equal(f.state.uncertain.value,true)
+  await f.state.save();assert.equal(f.calls.filter(call=>call.options.method==='POST').length,1)
+  f.expect('/rules/by-operation/'+operation,result(),'GET');await f.state.lookup()
+  assert.equal(f.state.uncertain.value,false);assert.equal(f.state.formOpen.value,false)
+})
+
+test('unknown upload edit and its frozen revision survive a service reconnect',async t=>{
+  const f=mount(t);await flush();f.state.edit(result());f.state.form.name='edited'
+  f.expect('/rules/'+ID,new Error('timeout'),'PUT');await f.state.save()
+  f.props.available=false;await flush()
+  f.expect('/rules',{mode:'OBSERVE_ONLY',items:[]},'GET');f.props.available=true;await flush()
+  assert.equal(f.state.formOpen.value,true);assert.equal(f.state.form.name,'edited');assert.equal(f.state.editing.value.rule.revision,1)
+  assert.equal(f.state.uncertain.value,true);await f.state.save();assert.equal(f.calls.filter(call=>call.options.method==='PUT').length,1)
+})
 test('late observation cannot update an account that changed while reading',async t=>{const f=mount(t);await flush();let release;f.expect('/rules/'+ID+'/observe',new Promise(r=>release=r));const pending=f.state.act(result(),'observe');f.props.authorized=false;await flush();release(result());await pending;assert.equal(f.state.items.value.length,0);assert.equal(f.state.busy.value,'')})
 test('rule grouping preview is read only and no action can send a transfer',async t=>{const f=mount(t);await flush();const preview={id:ID,accountId:'1',state:'PREVIEW_ONLY',permission:'MEDIA_ALLOWED_AT_CHECK',sourceDirectory:'D:\\source',archiveDirectory:'D:\\archive',channelTitle:'sample',postTitle:'sample',postText:'',discussionTitle:'discussion',postLink:input().link,recursive:true,captionMode:'FILENAME',fileCount:0,totalBytes:0,otherFiles:0,deferredFiles:0,linkedEntries:0,duplicateFiles:0,slowModeSeconds:0,targetCheckedAt:1,createdAt:1,expiresAt:600001,groups:[],warnings:[]};f.expect('/rules/'+ID+'/preview',{ruleId:ID,version:1,revision:1,preview});await f.state.act(result(),'preview');assert.equal(f.state.preview.value.preview.state,'PREVIEW_ONLY');assert.equal(f.calls.some(c=>c.path.includes('/transfers/')),false)})
 

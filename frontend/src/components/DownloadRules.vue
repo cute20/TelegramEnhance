@@ -30,6 +30,9 @@ const form = reactive(empty())
 const sourceMode = computed(() => downloadRuleSourceMode(form))
 const allTypesSelected = computed(() => downloadRuleTypes.every(item => form.types.includes(item.type)))
 const canAccess = computed(() => props.authorized && props.available && !!props.accountId)
+const working = computed(() => pending.value && !!busy.value && !['list', 'channels'].includes(busy.value))
+const channelsLoading = computed(() => pending.value && busy.value === 'channels')
+const sourceEntry = computed(() => sourceMode.value === 'POST' ? 'POST' : manualSource.value ? 'MANUAL' : 'CHANNEL')
 const channelOptions = computed(() => {
   const options = channels.value?.items ?? [], previous = editing.value?.rule
   return previous && !options.some(channel => channel.id === previous.channelId)
@@ -38,25 +41,25 @@ const channelOptions = computed(() => {
 type Mutation = { kind: 'create'; operationId: string; input: DownloadRuleInput }
   | { kind: 'update' | 'enabled' | 'check' | 'takeover'; view: DownloadRuleView; input?: DownloadRuleInput }
 const uncertain = ref<Mutation | null>(null)
+let activeMutation: Mutation | null = null
 let generation = 0, requestSequence = 0, disposed = false, refreshQueued = false
-let timer: ReturnType<typeof setTimeout> | undefined
+let channelsQueued = false, channelsAttempted = false
 const base = '/rules/download'
 const clone = <T,>(value: T): T => JSON.parse(JSON.stringify(value)) as T
 type Ticket = { generation: number; sequence: number; account: string | null }
 function alive(ticket: Ticket) { return !disposed && ticket.generation === generation && ticket.sequence === requestSequence && ticket.account === props.accountId && canAccess.value }
-function stopTimer() { clearTimeout(timer); timer = undefined }
-function schedule() { stopTimer(); if (!disposed && canAccess.value && !pending.value) timer = setTimeout(() => { void refresh() }, 5000) }
 function begin(kind: string): Ticket | null {
   if (disposed || !canAccess.value || pending.value) return null
-  stopTimer(); pending.value = true; busy.value = kind
+  pending.value = true; busy.value = kind
   return { generation, sequence: ++requestSequence, account: props.accountId }
 }
 function finish(ticket: Ticket) {
   if (ticket.sequence !== requestSequence) return
   pending.value = false
-  if (alive(ticket)) busy.value = ''
+  busy.value = ''
   if (disposed) return
-  if (refreshQueued && canAccess.value) { refreshQueued = false; void refresh() } else schedule()
+  if (channelsQueued && canAccess.value && formOpen.value && sourceEntry.value === 'CHANNEL') { channelsQueued = false; void loadChannels() }
+  else if (refreshQueued && canAccess.value) { refreshQueued = false; void refresh() }
 }
 function report(cause: unknown) { if (cause instanceof ApiError && [401, 403].includes(cause.status)) emit('accessError', cause) }
 const message = (cause: unknown) => cause instanceof Error ? cause.message : '操作未完成。'
@@ -83,6 +86,7 @@ async function refresh() {
 }
 async function loadChannels() {
   const ticket = begin('channels'); if (!ticket) return
+  channelsQueued = false; channelsAttempted = true
   channelError.value = ''
   try {
     const result = await api<DownloadChannels>('/transfers/download/channels', { timeout: 50000 })
@@ -93,14 +97,23 @@ async function loadChannels() {
   finally { finish(ticket) }
 }
 function edit(view: DownloadRuleView | null) {
-  if (pending.value || uncertain.value || !canAccess.value || view && !current(view)) return
+  if (working.value || uncertain.value || !canAccess.value || view && !current(view)) return
   closeConfirmation(); editing.value = view ? clone(view) : null
   Object.assign(form, empty(), { sourceMode: 'CHANNEL', postKey: null, mainMessageId: null }, clone(view?.rule.input ?? empty()))
-  manualSource.value = false; formOpen.value = true; error.value = ''; notice.value = ''; channelError.value = ''
+  manualSource.value = !!view && sourceMode.value === 'CHANNEL' && view.rule.input.source !== view.rule.channelId
+  formOpen.value = true; error.value = ''; notice.value = ''; channelError.value = ''
+  if (!channels.value) channelsAttempted = false
+  ensureChannels()
+}
+function ensureChannels() {
+  if (!formOpen.value || sourceEntry.value !== 'CHANNEL' || channels.value || channelsAttempted || !canAccess.value) return
+  if (pending.value) channelsQueued = true
+  else void loadChannels()
 }
 function closeForm() {
-  if (pending.value) return
-  formOpen.value = false
+  if (working.value) return
+  if (channelsLoading.value) { generation++; channelsAttempted = false }
+  formOpen.value = false; channelsQueued = false
   if (!uncertain.value) { editing.value = null; error.value = ''; channelError.value = '' }
 }
 function reopenForm() {
@@ -108,25 +121,34 @@ function reopenForm() {
   if (uncertain.value?.kind === 'create' || uncertain.value?.kind === 'update') formOpen.value = true
 }
 function changeSourceMode(mode: DownloadRuleSourceMode) {
-  if (pending.value || uncertain.value || sourceMode.value === mode) return
+  if (working.value || uncertain.value || sourceMode.value === mode) return
   Object.assign(form, { sourceMode: mode, source: '', tags: '', keywords: '', postKey: null, mainMessageId: null })
   manualSource.value = false; channelError.value = ''; error.value = ''
 }
+function selectSourceEntry(entry: 'CHANNEL' | 'POST' | 'MANUAL') {
+  if (working.value || uncertain.value || sourceEntry.value === entry) return
+  const mode = entry === 'POST' ? 'POST' : 'CHANNEL'
+  if (sourceMode.value !== mode) changeSourceMode(mode)
+  else Object.assign(form, { source: '', postKey: null, mainMessageId: null })
+  manualSource.value = entry === 'MANUAL'; channelsQueued = false; channelError.value = ''
+  if (entry === 'CHANNEL') ensureChannels()
+}
 function chooseSource(source: string) {
-  if (pending.value || uncertain.value) return
+  if (working.value || uncertain.value) return
   form.source = source
   if (!form.name.trim()) form.name = (channelOptions.value.find(channel => channel.id === source)?.title ?? '').slice(0, 80)
 }
 function toggleType(type: DownloadRuleType) {
-  if (pending.value || uncertain.value) return
+  if (working.value || uncertain.value) return
   form.types = form.types.includes(type) ? form.types.filter(item => item !== type) : [...form.types, type]
 }
 function toggleAllTypes() {
-  if (pending.value || uncertain.value) return
+  if (working.value || uncertain.value) return
   form.types = allTypesSelected.value ? [] : downloadRuleTypes.map(item => item.type)
 }
 async function mutate(command: Mutation, path: string, body: unknown, method = 'POST') {
   const ticket = begin(command.kind); if (!ticket) return
+  activeMutation = clone(command)
   error.value = ''; notice.value = ''
   try {
     const result = await api<DownloadRuleView>(path, { method, body, timeout: 150000 })
@@ -155,7 +177,7 @@ async function mutate(command: Mutation, path: string, body: unknown, method = '
     if (!(cause instanceof ApiError) || cause.status >= 500 || cause.status === 409) {
       uncertain.value = clone(command); error.value += ' 本次结果未确认，请先核对；不会自动重复提交。'
     }
-  } finally { finish(ticket) }
+  } finally { activeMutation = null; finish(ticket) }
 }
 async function save() {
   if (pending.value || uncertain.value || !formOpen.value || !canAccess.value) return
@@ -225,35 +247,45 @@ function progress(view: DownloadRuleView) { const summary = view.summary; return
 const rangeSummary = (view: DownloadRuleView) => downloadRuleSourceMode(view.rule.input) === 'POST'
   ? '范围固定为这条主帖；评论读取状态与新增媒体分别核对。'
   : view.summary.historyDone ? '本轮主帖目录已到边界；评论和待核实范围仍分别处理。' : '主帖目录尚未到边界。'
-watch([() => props.authorized, () => props.available, () => props.accountId], () => {
-  generation++; stopTimer(); closeConfirmation(); items.value = []; channels.value = null; browsing.value = null
-  editing.value = null; formOpen.value = false; uncertain.value = null; error.value = ''; listError.value = ''; notice.value = ''; channelError.value = ''; busy.value = ''; Object.assign(form, empty())
+watch([() => props.authorized, () => props.available, () => props.accountId], (context, previous) => {
+  const identityChanged = !previous || context[0] !== previous[0] || context[2] !== previous[2]
+  if (channelsLoading.value) channelsAttempted = false
+  generation++; closeConfirmation(); browsing.value = null; busy.value = ''
+  if (identityChanged) {
+    items.value = []; channels.value = null; editing.value = null; formOpen.value = false; manualSource.value = false
+    uncertain.value = null; activeMutation = null; error.value = ''; listError.value = ''; notice.value = ''; channelError.value = ''; Object.assign(form, empty())
+    channelsQueued = false; channelsAttempted = false
+  } else if (activeMutation) {
+    uncertain.value = clone(activeMutation)
+    error.value = '连接中断，已保留本次提交，请恢复连接后核对保存结果；不会自动重复提交。'
+  }
   refreshQueued = canAccess.value
+  if (!identityChanged) ensureChannels()
   if (!pending.value && canAccess.value) void refresh()
 }, { immediate: true })
-onBeforeUnmount(() => { disposed = true; generation++; stopTimer(); closeConfirmation(); channels.value = null; items.value = [] })
+onBeforeUnmount(() => { disposed = true; generation++; closeConfirmation(); channels.value = null; items.value = [] })
 </script>
 
 <template>
   <section class="download-rules" aria-label="持续下载规则">
-    <header class="download-rule-heading"><span class="rule-count">{{ items.length }} 条下载规则</span><div class="download-rule-actions"><button type="button" class="btn" :disabled="!canAccess || pending" @click="refresh">刷新</button><button type="button" class="btn primary" :disabled="!canAccess || pending || !!uncertain" @click="edit(null)">新建下载规则</button></div></header>
+    <header class="download-rule-heading"><span class="rule-count">{{ items.length }} 条下载规则</span><div class="download-rule-actions"><button type="button" class="btn" :disabled="!canAccess || working" @click="refresh()">刷新</button><button type="button" class="btn primary" :disabled="!canAccess || working || !!uncertain" @click="edit(null)">新建下载规则</button></div></header>
     <p v-if="!canAccess" class="notice warning">请先连接 Telegram 并恢复本机服务，查看当前账号的持续下载规则。</p>
     <p v-if="listError" class="notice warning" role="status">{{ listError }}<span v-if="items.length">当前保留上次成功读取的规则。</span></p>
     <p v-if="error && !formOpen" class="notice danger" role="alert">{{ error }}</p><p v-if="notice" class="notice" role="status">{{ notice }}</p>
-    <div v-if="uncertain && !formOpen" class="download-rule-uncertain"><span>本次操作需要核对，其他修改已暂停。</span><button type="button" class="btn" :disabled="pending || !canAccess" @click="lookup">核对本次操作结果</button><button v-if="uncertain.kind === 'create' || uncertain.kind === 'update'" type="button" class="btn" :disabled="pending || !canAccess" @click="reopenForm">返回表单</button></div>
-    <RuleFormDialog :open="formOpen" :title="editing ? '修改下载规则' : '新建下载规则'" :busy="pending" @close="closeForm">
+    <div v-if="uncertain && !formOpen" class="download-rule-uncertain"><span>本次操作需要核对，其他修改已暂停。</span><button type="button" class="btn" :disabled="working || !canAccess" @click="lookup">核对本次操作结果</button><button v-if="uncertain.kind === 'create' || uncertain.kind === 'update'" type="button" class="btn" :disabled="working || !canAccess" @click="reopenForm">返回表单</button></div>
+    <RuleFormDialog :open="formOpen" :title="editing ? '修改下载规则' : '新建下载规则'" :busy="working" @close="closeForm">
     <form v-if="formOpen" class="download-rule-form" @submit.prevent="save">
       <p class="download-rule-muted">选择下载范围，设置媒体与保存位置。保存后先暂停，启用后才开始自动下载。</p>
+      <p v-if="!canAccess" class="notice warning" role="status">连接暂时中断，已保留填写内容；恢复连接后可继续。</p>
       <p v-if="error" class="notice danger" role="alert">{{ error }}</p>
-      <div v-if="uncertain" class="download-rule-uncertain"><span>保存结果尚未确认，请先核对。</span><button type="button" class="btn" :disabled="pending || !canAccess" @click="lookup">核对本次操作结果</button></div>
-      <fieldset :disabled="pending || !!uncertain || !canAccess">
-        <div class="download-rule-source-modes" role="group" aria-label="下载范围"><button type="button" :class="{ selected: sourceMode === 'CHANNEL' }" :aria-pressed="sourceMode === 'CHANNEL'" @click="changeSourceMode('CHANNEL')">频道筛选</button><button type="button" :class="{ selected: sourceMode === 'POST' }" :aria-pressed="sourceMode === 'POST'" @click="changeSourceMode('POST')">指定主帖</button></div>
-        <template v-if="sourceMode === 'CHANNEL'">
-        <div class="download-rule-channel"><SourceChannelSelect :model-value="form.source" :channels="channelOptions" :disabled="pending || !!uncertain || !canAccess" @update:model-value="chooseSource" /><button type="button" class="btn" @click="loadChannels">{{ busy === 'channels' ? '读取中…' : '读取可选频道' }}</button></div>
-        <p v-if="channelError" class="download-rule-warning">{{ channelError }}</p><p v-if="channels?.partial" class="download-rule-muted">频道发现有界，本次列表可能未列全。其他可访问频道可在下方填写来源。</p><p v-for="warning in channels?.warnings ?? []" :key="warning" class="download-rule-muted">{{ warning }}</p>
-        <button type="button" class="btn" :aria-expanded="manualSource" @click="manualSource = !manualSource">{{ manualSource ? '收起来源输入' : '填写其他频道来源' }}</button>
-        <label v-if="manualSource">频道来源<input v-model="form.source" class="input" placeholder="频道链接、@用户名、频道ID或私有频道主帖链接" maxlength="2048" autocomplete="off" /></label>
+      <div v-if="uncertain" class="download-rule-uncertain"><span>保存结果尚未确认，请先核对。</span><button type="button" class="btn" :disabled="working || !canAccess" @click="lookup">核对本次操作结果</button></div>
+      <fieldset :disabled="working || !!uncertain || !canAccess">
+        <div class="download-rule-source-modes" role="group" aria-label="下载范围"><button type="button" :class="{ selected: sourceEntry === 'CHANNEL' }" :aria-pressed="sourceEntry === 'CHANNEL'" @click="selectSourceEntry('CHANNEL')">频道筛选</button><button type="button" :class="{ selected: sourceEntry === 'POST' }" :aria-pressed="sourceEntry === 'POST'" @click="selectSourceEntry('POST')">指定主帖</button><button type="button" :class="{ selected: sourceEntry === 'MANUAL' }" :aria-pressed="sourceEntry === 'MANUAL'" @click="selectSourceEntry('MANUAL')">手动输入频道</button></div>
+        <template v-if="sourceEntry === 'CHANNEL'">
+        <div class="download-rule-channel"><SourceChannelSelect :model-value="form.source" :channels="channelOptions" :loading="channelsLoading" :disabled="working || !!uncertain || !canAccess" @update:model-value="chooseSource" /><button type="button" class="btn" :disabled="pending" @click="loadChannels">{{ channelsLoading ? '读取中…' : '刷新频道' }}</button></div>
+        <p v-if="channelError" class="download-rule-warning">{{ channelError }} 可点击“刷新频道”重试。</p><p v-if="channels?.partial" class="download-rule-muted">未找到频道时，可切换顶部“手动输入频道”。</p><p v-for="warning in channels?.warnings ?? []" :key="warning" class="download-rule-muted">{{ warning }}</p>
         </template>
+        <label v-else-if="sourceEntry === 'MANUAL'">频道来源<input v-model="form.source" class="input" placeholder="频道链接、@用户名、频道ID或私有频道主帖链接" maxlength="2048" autocomplete="off" /></label>
         <template v-else><label>主帖链接<input v-model="form.source" class="input" required placeholder="https://t.me/频道名/消息编号" maxlength="2048" autocomplete="off" /></label><small>仅下载这条主帖及其评论中的所选媒体，持续检查后续新增内容。</small></template>
         <label>规则名称<input v-model="form.name" class="input" required maxlength="80" :placeholder="sourceMode === 'POST' ? '例如：收藏主帖的持续下载' : '选择频道后可自动填写，也可以修改'" /></label>
         <template v-if="sourceMode === 'CHANNEL'">
@@ -265,7 +297,7 @@ onBeforeUnmount(() => { disposed = true; generation++; stopTimer(); closeConfirm
         <div class="download-rule-window"><label>执行时段<select v-model="form.window.mode" class="input"><option value="ALL_DAY">全天</option><option value="WINDOW">指定北京时间时段</option></select></label><template v-if="form.window.mode === 'WINDOW'"><label>开始<input v-model="form.window.start" class="input" type="time" required /></label><label>结束<input v-model="form.window.end" class="input" type="time" required /></label></template></div>
         <small>北京时间，支持跨午夜。窗口结束或暂停后不启动下一个文件，已开始的当前文件继续完成。</small>
         <p v-if="editing" class="download-rule-warning">修改后规则会暂停，再次启用会重新检查来源，可能再次下载已有内容；已创建的任务保持原参数。</p>
-        <div class="download-rule-actions"><button class="btn primary" type="submit">{{ busy === 'create' || busy === 'update' ? '保存中…' : '保存并暂停' }}</button><button class="btn" type="button" @click="closeForm">取消</button></div>
+        <div class="download-rule-actions"><button class="btn primary" type="submit" :disabled="pending">{{ busy === 'create' || busy === 'update' ? '保存中…' : '保存并暂停' }}</button><button class="btn" type="button" @click="closeForm">取消</button></div>
       </fieldset>
     </form>
     </RuleFormDialog>
@@ -281,12 +313,12 @@ onBeforeUnmount(() => { disposed = true; generation++; stopTimer(); closeConfirm
       <p v-if="view.summary.job" class="rule-latest">最近任务：{{ taskLabels[view.summary.job.state] ?? view.summary.job.state }} · 已保存 {{ view.summary.job.completed }}/{{ view.summary.job.total }}<span v-if="view.summary.job.manual"> · 已转为手动</span><span v-else-if="view.summary.job.ruleVersion !== view.rule.version"> · 旧版本任务</span></p>
       <p v-if="view.summary.job?.held" class="download-rule-warning">任务已手动暂停，请到任务中心处理。</p>
       <details class="rule-observation"><summary>读取进度</summary><p>{{ progress(view) }}</p><p>{{ rangeSummary(view) }}</p></details>
-      <div class="download-rule-actions"><button class="btn" type="button" :disabled="pending || !!uncertain || !canAccess || !canCheckDownloadRule(view)" @click="check(view)">立即检查</button><button v-if="view.summary.job" class="btn" type="button" @click="emit('tasks')">查看任务</button><button v-if="canTakeoverDownloadRule(view)" class="btn" type="button" :disabled="pending || !!uncertain || !canAccess" @click="prepareConfirmation(view, 'takeover')">将此任务转为手动</button></div>
-      <template #actions><button type="button" class="btn" :disabled="pending || !canAccess" @click="browse(view)">浏览帖子</button><button type="button" class="btn" :disabled="pending || !!uncertain || !canAccess" @click="view.rule.enabled ? pause(view) : prepareConfirmation(view, 'enable')">{{ view.rule.enabled ? '暂停' : '启用' }}</button><button type="button" class="btn" :disabled="pending || !!uncertain || !canAccess" @click="edit(view)">修改规则</button></template>
+      <div class="download-rule-actions"><button class="btn" type="button" :disabled="working || !!uncertain || !canAccess || !canCheckDownloadRule(view)" @click="check(view)">立即检查</button><button v-if="view.summary.job" class="btn" type="button" @click="emit('tasks')">查看任务</button><button v-if="canTakeoverDownloadRule(view)" class="btn" type="button" :disabled="working || !!uncertain || !canAccess" @click="prepareConfirmation(view, 'takeover')">将此任务转为手动</button></div>
+      <template #actions><button type="button" class="btn" :disabled="working || !canAccess" @click="browse(view)">浏览帖子</button><button type="button" class="btn" :disabled="working || !!uncertain || !canAccess" @click="view.rule.enabled ? pause(view) : prepareConfirmation(view, 'enable')">{{ view.rule.enabled ? '暂停' : '启用' }}</button><button type="button" class="btn" :disabled="working || !!uncertain || !canAccess" @click="edit(view)">修改规则</button></template>
     </CompactRecord>
   </section>
   <NewTransfer v-if="browsing" :key="browsing.rule.id + ':' + browsing.rule.revision" preview-only :browse-source="browsing.rule.input" :authorized="authorized" :available="available" :account-id="accountId" @close="browsing = null" @settings="browsing = null" @access-error="emit('accessError', $event)" />
-  <dialog ref="confirmationDialog" class="download-rule-dialog" @cancel="closeConfirmation"><template v-if="confirmation"><h2>{{ confirmation.kind === 'enable' ? '确认启用持续下载' : '确认转为手动处理' }}</h2><strong>{{ confirmation.view.rule.input.name }} · {{ confirmation.view.rule.channelTitle }}</strong><template v-if="confirmation.kind === 'enable'"><p v-if="downloadRuleSourceMode(confirmation.view.rule.input) === 'POST'">只持续检查这条指定主帖及其评论，所选媒体会实际下载，重复媒体单独保存。</p><p v-else>会扫描全部可读历史并持续检查新帖、旧帖评论，符合条件的媒体会实际下载，重复媒体单独保存。</p><p>{{ filterLabel(confirmation.view.rule.input) }}<br />{{ typeLabel(confirmation.view.rule.input) }}<br />{{ confirmation.view.rule.input.includeMain ? '包含主帖自身全部媒体' : '不含主帖自身媒体' }}</p><p>保存根目录：<code>{{ confirmation.view.rule.input.targetDirectory }}</code><br />{{ windowLabel(confirmation.view.rule.input) }}</p><p>当前文件继续完成后才受暂停和窗口结束限制。修改保存会新建版本从头扫描，可能再次下载已有内容；旧任务不改。</p></template><template v-else><p>仅将当前停稳的任务解除规则控制，参数、文件和状态保留，不会立即开始下载。之后请到任务中心继续或处理。</p><p>规则若仍启用，可以继续产生后续任务；原媒体声明保留，不会重复当前页。</p></template><div class="download-rule-actions"><button class="btn" type="button" :disabled="pending" @click="closeConfirmation">取消</button><button class="btn" type="button" :disabled="pending" @click="confirm">{{ confirmation.kind === 'enable' ? '确认启用并允许下载' : '确认转为手动' }}</button></div></template></dialog>
+  <dialog ref="confirmationDialog" class="download-rule-dialog" @cancel="closeConfirmation"><template v-if="confirmation"><h2>{{ confirmation.kind === 'enable' ? '确认启用持续下载' : '确认转为手动处理' }}</h2><strong>{{ confirmation.view.rule.input.name }} · {{ confirmation.view.rule.channelTitle }}</strong><template v-if="confirmation.kind === 'enable'"><p v-if="downloadRuleSourceMode(confirmation.view.rule.input) === 'POST'">只持续检查这条指定主帖及其评论，所选媒体会实际下载，重复媒体单独保存。</p><p v-else>会扫描全部可读历史并持续检查新帖、旧帖评论，符合条件的媒体会实际下载，重复媒体单独保存。</p><p>{{ filterLabel(confirmation.view.rule.input) }}<br />{{ typeLabel(confirmation.view.rule.input) }}<br />{{ confirmation.view.rule.input.includeMain ? '包含主帖自身全部媒体' : '不含主帖自身媒体' }}</p><p>保存根目录：<code>{{ confirmation.view.rule.input.targetDirectory }}</code><br />{{ windowLabel(confirmation.view.rule.input) }}</p><p>当前文件继续完成后才受暂停和窗口结束限制。修改保存会新建版本从头扫描，可能再次下载已有内容；旧任务不改。</p></template><template v-else><p>仅将当前停稳的任务解除规则控制，参数、文件和状态保留，不会立即开始下载。之后请到任务中心继续或处理。</p><p>规则若仍启用，可以继续产生后续任务；原媒体声明保留，不会重复当前页。</p></template><div class="download-rule-actions"><button class="btn" type="button" :disabled="working" @click="closeConfirmation">取消</button><button class="btn" type="button" :disabled="working" @click="confirm">{{ confirmation.kind === 'enable' ? '确认启用并允许下载' : '确认转为手动' }}</button></div></template></dialog>
 </template>
 
 <style scoped>

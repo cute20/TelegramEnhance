@@ -14,20 +14,36 @@ const emit = defineEmits<{ accessError: [cause: ApiError] }>()
 const batches = ref<DownloadBatchStatus[]>([])
 const offset = ref(0), loading = ref(false), pending = ref(false), busy = ref(''), error = ref(''), workerWarning = ref('')
 const hasMore = ref(true), loadingMore = ref(false), historyError = ref('')
-let refreshOffset = 0
 const uncertainIds = ref<string[]>([])
 const detailBatchId = ref(''), detailTaskId = ref(''), taskDetail = ref<DownloadTask | null>(null), detailError = ref('')
 const canAccess = computed(() => props.authorized && props.available && !!props.accountId)
 const isActive = () => !disposed && props.active !== false
 let generation = 0, detailGeneration = 0, disposed = false, refreshQueued = false
+let progressEpoch = 0, progressPending = false, progressIndex = 0
 let timer: ReturnType<typeof setTimeout> | undefined
 const limit = 10
 
 function current(context: number, account: string | null) { return !disposed && context === generation && canAccess.value && props.accountId === account }
-function stopTimer() { clearTimeout(timer); timer = undefined }
+function stopTimer() { clearTimeout(timer); timer = undefined; progressEpoch++ }
+const activeBatch = (batch: DownloadBatchStatus) => ['RUNNING', 'QUEUED', 'PAUSING'].includes(batch.state) && !uncertainIds.value.includes(batch.id)
 function schedule() {
   stopTimer()
-  if (!disposed && isActive() && canAccess.value && !pending.value) timer = setTimeout(() => { void load(false, true) }, batches.value.some(batch => ['RUNNING', 'QUEUED', 'PAUSING'].includes(batch.state)) ? 2000 : 10000)
+  if (isActive() && canAccess.value && !pending.value && !progressPending && batches.value.some(activeBatch)) timer = setTimeout(() => { void readProgress() }, 2000)
+}
+async function readProgress() {
+  if (!isActive() || !canAccess.value || pending.value || progressPending) return
+  const active = batches.value.filter(activeBatch)
+  const selected = active.find(batch => ['RUNNING', 'PAUSING'].includes(batch.state)) ?? active[progressIndex++ % active.length]
+  if (!selected) return
+  const context = generation, epoch = progressEpoch, account = props.accountId
+  progressPending = true
+  try {
+    const result = await api<DownloadBatchStatus>('/transfers/download/batches/' + encodeURIComponent(selected.id))
+    if (!current(context, account) || !isActive() || epoch !== progressEpoch) return
+    if (!validBatchStatus(result, selected) || result.id !== selected.id) return
+    batches.value = batches.value.map(batch => batch.id === result.id && JSON.stringify(batch) !== JSON.stringify(result) ? result : batch)
+  } catch (cause) { if (current(context, account) && epoch === progressEpoch) reportAccessError(cause) }
+  finally { progressPending = false; schedule() }
 }
 function finish() {
   pending.value = false
@@ -45,10 +61,10 @@ function applyBatch(result: DownloadBatchStatus) {
   }
   batches.value = batches.value.map(batch => batch.id === result.id ? result : batch)
 }
-async function load(append = false, polling = false) {
+async function load(append = false) {
   if (!isActive() || !canAccess.value || pending.value || append && (!hasMore.value || uncertainIds.value.length)) return
   refreshQueued = false
-  const start = append ? offset.value : polling ? Math.min(refreshOffset, Math.floor(Math.max(0, offset.value - 1) / limit) * limit) : 0
+  const start = append ? offset.value : 0
   const context = generation, account = props.accountId
   stopTimer(); pending.value = true; loading.value = true; loadingMore.value = append
   try {
@@ -65,7 +81,6 @@ async function load(append = false, polling = false) {
     batches.value = merged; workerWarning.value = result.workerWarning ?? ''
     if (append) historyError.value = ''
     if (append || offset.value === 0 || newHead) { offset.value = start + result.items.length; hasMore.value = result.items.length === limit }
-    refreshOffset = start + limit < offset.value ? start + limit : 0
     if (detailBatchId.value && !batches.value.some(batch => batch.id === detailBatchId.value)) clearDetail()
     if (!uncertainIds.value.length) error.value = ''
   } catch (cause) {
@@ -137,7 +152,7 @@ function batchAlert(batch: DownloadBatchStatus) {
 }
 
 watch([() => props.authorized, () => props.available, () => props.accountId], () => {
-  generation++; stopTimer(); batches.value = []; offset.value = 0; hasMore.value = true; refreshOffset = 0; loadingMore.value = false; historyError.value = ''; error.value = ''; workerWarning.value = ''; busy.value = ''; loading.value = false; uncertainIds.value = []; clearDetail()
+  generation++; stopTimer(); batches.value = []; offset.value = 0; hasMore.value = true; loadingMore.value = false; historyError.value = ''; error.value = ''; workerWarning.value = ''; busy.value = ''; loading.value = false; uncertainIds.value = []; clearDetail()
   if (pending.value) refreshQueued = true
   else if (canAccess.value) void load()
 }, { immediate: true })

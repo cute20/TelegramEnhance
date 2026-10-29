@@ -1,17 +1,15 @@
 <script setup lang="ts">
-import {computed,ref,watch} from 'vue'
+import {computed,ref} from 'vue'
 import AppIcon from './AppIcon.vue'
 const props=defineProps<{title:string;description:string;status:string;tone?:'neutral'|'success'|'warning'|'active';timestamp?:number;timeLabel?:string;defaultExpanded?:boolean;alert?:string|null}>()
 const expanded=ref(!!props.defaultExpanded)
-const manual=ref(false)
 const timeText=computed(()=>props.timestamp&&Number.isFinite(props.timestamp)?new Intl.DateTimeFormat('zh-CN',{timeZone:'Asia/Shanghai',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'}).format(props.timestamp):'')
 function toggled(event:Event){expanded.value=(event.currentTarget as HTMLDetailsElement).open}
-watch(()=>props.defaultExpanded,value=>{if(!manual.value)expanded.value=!!value})
 </script>
 <template>
   <article class="compact-record">
     <details class="record-disclosure" :open="expanded" @toggle="toggled">
-      <summary class="record-summary" @click="manual=true">
+      <summary class="record-summary">
         <span class="record-main"><strong class="record-title" :title="title">{{title}}</strong><span class="record-meta"><span :title="description">{{description}}</span><time v-if="timeText">{{timeLabel??'更新'}} {{timeText}}</time></span></span>
         <span class="record-end"><span class="record-state" :class="tone??'neutral'">{{status}}</span><span class="record-hint">{{expanded?'收起':'详情'}}<AppIcon name="chevron" /></span></span>
         <span v-if="alert" class="record-alert" :title="alert">{{alert}}</span>

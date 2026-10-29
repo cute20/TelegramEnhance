@@ -21,7 +21,7 @@ const empty=():RuleInput=>({name:'',link:'',sourceDirectory:'',archiveDirectory:
 const form=reactive(empty())
 const nameAutomatic=ref(true),nameBusy=ref(false),nameError=ref('')
 let nameGeneration=0,lastNameAttempt='',lastAutoName=''
-let generation=0,disposed=false,timer:ReturnType<typeof setTimeout>|undefined,pendingOperation:string|null=null
+let generation=0,disposed=false,pendingOperation:string|null=null
 const ready=()=>props.authorized&&props.available&&!!props.accountId
 function ruleDescription(value:RuleView){return `${value.mode==='AUTO_UPLOAD'?'自动上传':'仅观察'} · ${value.rule.input.window.mode==='ALL_DAY'?'全天':`${value.rule.input.window.start}—${value.rule.input.window.end}`} · 北京时间`}
 function jobNeedsAttention(value:RuleView){return !!value.job&&['NEEDS_REVIEW','SENT_PENDING_ARCHIVE','FAILED'].includes(value.job.state)}
@@ -37,7 +37,6 @@ async function refresh(){
     if(preview.value&&!items.value.some(v=>v.rule.id===preview.value!.ruleId&&v.rule.revision===preview.value!.revision))preview.value=null
   }catch(cause){if(alive(g,account))fail(cause)}
 }
-function schedule(){clearTimeout(timer);if(disposed)return;timer=setTimeout(async()=>{await refresh();schedule()},5000)}
 watch(()=>form.sourceDirectory,source=>{form.archiveDirectory=ruleArchiveDirectory(source)},{flush:'sync'})
 watch(()=>form.link,()=>{nameGeneration++;nameBusy.value=false;nameError.value='';lastNameAttempt='';if(nameAutomatic.value&&form.name===lastAutoName)form.name=''},{flush:'sync'})
 function edit(value:RuleView|null){if(busy.value||uncertain.value)return;generation++;nameGeneration++;nameBusy.value=false;nameError.value='';nameAutomatic.value=false;editing.value=value;Object.assign(form,empty(),JSON.parse(JSON.stringify(value?value.rule.input:empty())));form.executionMode=value?.mode??'AUTO_UPLOAD';form.archiveDirectory=ruleArchiveDirectory(form.sourceDirectory);nameAutomatic.value=!value;lastNameAttempt='';lastAutoName='';formOpen.value=true;preview.value=null;error.value='';notice.value=''}
@@ -100,9 +99,15 @@ async function confirmActivation(){
   try{const result=await api<RuleView>('/rules/'+selected.rule.rule.id+'/enabled',{method:'POST',body:{revision:selected.rule.rule.revision,enabled:true,previewId:selected.preview.preview.id}});if(!alive(g,account))return;put(result);closeActivation();notice.value='自动上传已明确启用，按保存的时段处理当前及今后稳定媒体。'}
   catch(cause){if(alive(g,account)){fail(cause);closeActivation();error.value+=' 请刷新规则核对是否已启用，不会自动重复提交。'}}finally{if(alive(g,account))busy.value=''}
 }
-watch([()=>props.authorized,()=>props.available,()=>props.accountId],()=>{generation++;closeActivation();nameGeneration++;nameBusy.value=false;nameError.value='';nameAutomatic.value=true;lastNameAttempt='';lastAutoName='';items.value=[];preview.value=null;busy.value='';error.value='';notice.value='';uncertain.value=false;pendingOperation=null;formOpen.value=false;editing.value=null;Object.assign(form,empty());if(ready())void refresh()},{immediate:true})
-schedule()
-onBeforeUnmount(()=>{disposed=true;generation++;closeActivation();nameGeneration++;clearTimeout(timer)})
+watch([()=>props.authorized,()=>props.available,()=>props.accountId],(context,previous)=>{
+  const identityChanged=!previous||context[0]!==previous[0]||context[2]!==previous[2]
+  const saving=busy.value==='save'||busy.value==='lookup'
+  generation++;closeActivation();nameGeneration++;nameBusy.value=false;lastNameAttempt='';preview.value=null;busy.value=''
+  if(identityChanged){nameError.value='';nameAutomatic.value=true;lastAutoName='';items.value=[];error.value='';notice.value='';uncertain.value=false;pendingOperation=null;formOpen.value=false;editing.value=null;Object.assign(form,empty())}
+  else if(saving){uncertain.value=true;error.value='连接中断，已保留本次提交，请恢复连接后核对保存结果；不会自动重复提交。'}
+  if(ready())void refresh()
+},{immediate:true})
+onBeforeUnmount(()=>{disposed=true;generation++;closeActivation();nameGeneration++})
 </script>
 <template>
   <div class="rule-workspace">
@@ -111,13 +116,14 @@ onBeforeUnmount(()=>{disposed=true;generation++;closeActivation();nameGeneration
     <DownloadRules :authorized="authorized" :available="available" :account-id="accountId" @access-error="emit('accessError',$event)" @tasks="emit('tasks','download')" />
     </section>
     <section id="rule-panel-upload" v-show="selectedCategory==='upload'" class="upload-rules" aria-labelledby="rule-category-upload">
-    <header class="rule-toolbar rule-section-header"><span class="rule-count">{{items.length}} 条上传规则</span><button class="btn" :disabled="!!busy||!authorized||!available" @click="refresh">刷新</button><button class="btn primary" :disabled="!!busy||uncertain||!authorized||!available" @click="edit(null)">新建上传规则</button></header>
+    <header class="rule-toolbar rule-section-header"><span class="rule-count">{{items.length}} 条上传规则</span><button class="btn" :disabled="!!busy||!authorized||!available" @click="refresh()">刷新</button><button class="btn primary" :disabled="!!busy||uncertain||!authorized||!available" @click="edit(null)">新建上传规则</button></header>
     <div v-if="!authorized||!available" class="notice warning">请先连接 Telegram 并恢复本机服务。</div>
 
     <p v-if="busy&&!formOpen" class="notice" role="status">正在处理，请等待当前操作完成…</p><p v-if="error&&!formOpen" class="notice danger" role="alert">{{error}}</p><p v-if="notice" class="notice success" role="status">{{notice}}</p>
     <div v-if="uncertain&&!formOpen" class="notice warning rule-uncertain"><p>保存结果尚未确认，请先核对，避免重复创建或修改规则。</p><div class="rule-actions"><button class="btn" type="button" :disabled="!!busy" @click="lookup">核对本次保存结果</button><button class="btn" type="button" :disabled="!!busy" @click="reopenForm">返回表单</button></div></div>
     <RuleFormDialog :open="formOpen" :title="editing?'编辑上传规则':'新建上传规则'" :busy="!!busy" @close="closeForm">
     <form v-if="formOpen" class="rule-form" @submit.prevent="save">
+      <p v-if="!available" class="notice warning" role="status">连接暂时中断，已保留填写内容；恢复连接后可继续。</p>
       <p v-if="editing" class="rule-muted">修改后需重新启用，已创建的任务保持原参数。</p>
       <p v-if="busy" class="notice" role="status">正在处理，请等待当前操作完成…</p><p v-if="error" class="notice danger" role="alert">{{error}}</p>
       <fieldset :disabled="!!busy||uncertain||!authorized||!available">

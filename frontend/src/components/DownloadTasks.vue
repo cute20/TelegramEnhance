@@ -12,18 +12,33 @@ const emit = defineEmits<{ accessError: [cause: ApiError] }>()
 const tasks = ref<DownloadTask[]>([]), error = ref(''), workerWarning = ref(''), busy = ref(''), loading = ref(false)
 const offset = ref(0)
 const hasMore = ref(true), loadingMore = ref(false), historyError = ref('')
-let refreshOffset = 0
 let generation = 0, disposed = false, pending = false, refreshQueued = false
+let progressEpoch = 0, progressPending = false, progressIndex = 0
 let timer: ReturnType<typeof setTimeout> | undefined
-function stop() { clearTimeout(timer); timer = undefined }
+function stop() { clearTimeout(timer); timer = undefined; progressEpoch++ }
 const ready = () => !disposed && props.active !== false && props.authorized && props.available && !!props.accountId
 const current = (request: number, account: string | null) => !disposed && request === generation && account === props.accountId && props.authorized && props.available
-function schedule() { stop(); if (!disposed && ready() && !pending) timer = setTimeout(() => { void load(false, true) }, tasks.value.some(task => ['RUNNING','QUEUED'].includes(task.state)) ? 2000 : 10000) }
+function schedule() { stop(); if (ready() && !pending && !busy.value && !progressPending && tasks.value.some(task => ['RUNNING','QUEUED'].includes(task.state))) timer = setTimeout(() => { void readProgress() }, 2000) }
+async function readProgress() {
+  if (!ready() || pending || busy.value || progressPending) return
+  const active = tasks.value.filter(task => ['RUNNING','QUEUED'].includes(task.state))
+  const selected = active.find(task => task.state === 'RUNNING') ?? active[progressIndex++ % active.length]
+  if (!selected) return
+  const request = generation, epoch = progressEpoch, account = props.accountId
+  progressPending = true
+  try {
+    const result = await api<DownloadTask>('/transfers/download/tasks/' + encodeURIComponent(selected.id))
+    if (!current(request, account) || !ready() || epoch !== progressEpoch) return
+    if (!validTask(result) || result.id !== selected.id) return
+    tasks.value = tasks.value.map(task => task.id === result.id && JSON.stringify(task) !== JSON.stringify(result) ? result : task)
+  } catch (cause) { if (current(request, account) && epoch === progressEpoch && cause instanceof ApiError && [401, 403].includes(cause.status)) emit('accessError', cause) }
+  finally { progressPending = false; schedule() }
+}
 function finish() { pending = false; if (disposed) return; if (refreshQueued && ready()) { refreshQueued = false; void load() } else schedule() }
-async function load(append = false, polling = false) {
+async function load(append = false) {
   if (pending || !ready() || append && !hasMore.value) return
   refreshQueued = false; stop()
-  const start = append ? offset.value : polling ? Math.min(refreshOffset, Math.floor(Math.max(0, offset.value - 1) / 20) * 20) : 0
+  const start = append ? offset.value : 0
   const request = generation, account = props.accountId; pending = true; loading.value = true; loadingMore.value = append
   try {
     const result = await api<{ items: DownloadTask[]; workerWarning: string | null }>('/transfers/download/tasks?limit=20&offset=' + start)
@@ -33,7 +48,6 @@ async function load(append = false, polling = false) {
     tasks.value = mergeTaskHistory(tasks.value, result.items); workerWarning.value = result.workerWarning ?? ''; error.value = ''
     if (append) historyError.value = ''
     if (append || offset.value === 0 || newHead) { offset.value = start + result.items.length; hasMore.value = result.items.length === 20 }
-    refreshOffset = start + 20 < offset.value ? start + 20 : 0
   } catch (cause) {
     if (!current(request, account)) return
     error.value = cause instanceof Error ? cause.message : '读取任务失败。'
@@ -58,7 +72,7 @@ function automationState(value: DownloadAutomation) {
     : value.ruleVersion !== value.currentVersion ? '使用旧规则配置' : '规则已启用'
 }
 watch([() => props.authorized, () => props.available, () => props.accountId], () => {
-  generation++; stop(); tasks.value = []; error.value = ''; historyError.value = ''; busy.value = ''; loading.value = false; loadingMore.value = false; workerWarning.value = ''; offset.value = 0; hasMore.value = true; refreshOffset = 0
+  generation++; stop(); tasks.value = []; error.value = ''; historyError.value = ''; busy.value = ''; loading.value = false; loadingMore.value = false; workerWarning.value = ''; offset.value = 0; hasMore.value = true
   refreshQueued = ready(); if (!pending) void load()
 }, { immediate: true })
 watch([() => props.active, () => props.refreshVersion], () => { stop(); refreshQueued = ready(); if (!pending && ready()) void load() })

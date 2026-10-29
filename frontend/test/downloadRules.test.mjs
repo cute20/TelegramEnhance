@@ -93,7 +93,7 @@ const compiled = ts.transpileModule(compileScript(parsed.descriptor, { id: 'down
   compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 },
 }).outputText
 class ApiError extends Error { constructor(message, status) { super(message); this.status = status } }
-function mount(t, initial = view(), overrides = {}) {
+function mount(t, initial = view(), overrides = {}, cachedChannels = true) {
   const props = vue.reactive({ authorized: true, available: true, accountId: '1', ...overrides })
   const accessible = props.authorized && props.available && props.accountId
   const steps = accessible ? [{ path: BASE, value: initial instanceof Promise || initial instanceof Error ? initial : listing(Array.isArray(initial) ? initial : [initial]) }] : []
@@ -118,6 +118,9 @@ function mount(t, initial = view(), overrides = {}) {
   }, module, module.exports, (callback, delay) => { const timer = { callback, delay, cancelled: false }; timers.push(timer); return timer }, timer => { if (timer) timer.cancelled = true })
   const scope = vue.effectScope()
   const state = scope.run(() => module.exports.default.setup(props, { expose() {}, emit: (...args) => events.push(args) }))
+  // Most behavior tests reuse a successfully loaded channel list. Discovery
+  // tests opt out to exercise the actual first-open automatic request.
+  if (cachedChannels) state.channels.value = { items: [{ id: '-1001', title: '合成频道' }], scope: 'READABLE_CHANNELS', partial: false, warnings: [] }
   let dead = false
   const destroy = () => { if (!dead) { dead = true; hooks.forEach(hook => hook()); scope.stop() } }
   t.after(() => { destroy(); assert.deepEqual(failures, []); assert.equal(steps.length, 0) })
@@ -156,10 +159,10 @@ test('unknown edit remains recoverable after closing dialog and cannot clear on 
   assert.equal(f.state.uncertain.value, null); assert.equal(f.state.formOpen.value, false)
 })
 
-test('mount only reads rules; five-second polling is GET-only and never discovers/enables/starts work', async t => {
+test('mount reads rules once without any timer; further list reads require an explicit refresh', async t => {
   const f = mount(t); await flush()
-  assert.equal(f.calls.length, 1); assert.equal(f.timers.at(-1).delay, 5000)
-  f.expect(BASE, { ...listing([view()]), intervalSeconds: 2 }); f.timers.at(-1).callback(); await flush()
+  assert.equal(f.calls.length, 1); assert.equal(f.timers.length, 0)
+  f.expect(BASE, { ...listing([view()]), intervalSeconds: 2 }); await f.state.refresh()
   assert.deepEqual(f.calls.map(call => call.path), [BASE, BASE]); assert.ok(f.calls.every(call => !call.options.method))
   assert.equal(f.state.intervalSeconds.value, 2)
   assert.match(parsed.descriptor.template.content, /:default-expanded="false"/)
@@ -316,11 +319,11 @@ test('browse freezes the selected rule source without creating work and clears o
   f.state.browse(view({ rule: { revision: 99 } })); assert.equal(f.state.browsing.value.rule.revision, 1)
   assert.equal(f.calls.length, 1); f.props.available = false; await flush(); assert.equal(f.state.browsing.value, null)
 })
-test('polling is bounded and cannot overlap itself, channels, or a mutation', async t => {
+test('manual list refresh cannot overlap itself, channels, or a mutation', async t => {
   const response = deferred(), f = mount(t); await flush(); f.expect(BASE, response.promise)
-  const timer = f.timers.at(-1); timer.callback(); timer.callback(); await f.state.check(f.state.items.value[0]); await f.state.loadChannels()
-  assert.equal(f.calls.length, 2); response.resolve(listing([view()])); await flush(); assert.equal(f.maxActive(), 1)
-  assert.equal(f.timers.filter(timer => !timer.cancelled).length, 1)
+  const refreshing = f.state.refresh(); await f.state.refresh(); await f.state.check(f.state.items.value[0]); await f.state.loadChannels()
+  assert.equal(f.calls.length, 2); response.resolve(listing([view()])); await refreshing; assert.equal(f.maxActive(), 1)
+  assert.equal(f.timers.length, 0)
 })
 test('account change discards a late mutation, clears form/confirmation and queues exactly one fresh GET', async t => {
   const f = mount(t, enabled()); await flush(); const response = deferred(); f.expect(STATUS + '/check', response.promise, 'POST')
@@ -335,6 +338,135 @@ test('availability off while reading, then on, yields one current GET without ca
   response.resolve(listing([view()])); await flush(); assert.equal(f.state.items.value.length, 0)
   f.expect(BASE, listing([view()])); f.props.available = true; await flush(); assert.equal(f.calls.length, 2)
   assert.equal(f.state.items.value.length, 1); assert.equal(f.maxActive(), 1)
+})
+
+test('brief service interruption preserves the open download draft and manual source selection', async t => {
+  const f = mount(t); await flush(); fill(f.state)
+  f.state.manualSource.value = true
+  Object.assign(f.state.form, { source: '@draft', name: '未保存的下载规则', types: ['PHOTO', 'DOCUMENT'], includeMain: true })
+  const draft = copy(f.state.form)
+  f.props.available = false; await flush()
+  assert.equal(f.state.formOpen.value, true); assert.deepEqual(f.state.form, draft)
+  await f.state.save(); assert.equal(f.calls.length, 1)
+  f.expect(BASE, listing([view()])); f.props.available = true; await flush()
+  assert.equal(f.state.formOpen.value, true); assert.deepEqual(f.state.form, draft)
+  assert.equal(f.state.manualSource.value, true); assert.equal(f.calls.every(call => !call.options.method), true)
+})
+
+test('download edit keeps its frozen revision and existing uncertainty through service recovery', async t => {
+  const f = mount(t); await flush(); f.state.edit(f.state.items.value[0]); f.state.form.name = 'my draft'
+  f.expect(STATUS, new Error('timeout'), 'PUT'); await f.state.save()
+  const command = copy(f.state.uncertain.value)
+  f.props.available = false; await flush()
+  f.expect(BASE, listing([view({ rule: { version: 2, revision: 2, input: { name: 'new remote revision' } } })]))
+  f.props.available = true; await flush()
+  assert.equal(f.state.formOpen.value, true); assert.equal(f.state.form.name, 'my draft')
+  assert.equal(f.state.editing.value.rule.revision, 1); assert.deepEqual(f.state.uncertain.value, command)
+  await f.state.save(); assert.equal(f.calls.filter(call => call.options.method === 'PUT').length, 1)
+})
+
+test('interrupted in-flight download save retains its operation and only an explicit GET can confirm it', async t => {
+  const f = mount(t, []); await flush(); fill(f.state)
+  const response = deferred(); f.expect(BASE, response.promise, 'POST')
+  const saving = f.state.save(), operation = f.calls[1].options.body.operationId
+  f.props.available = false; await flush()
+  assert.equal(f.state.uncertain.value.operationId, operation); assert.equal(f.state.formOpen.value, true)
+  f.expect(BASE, listing([view()])); f.props.available = true; await flush()
+  response.resolve(view()); await saving; await flush()
+  assert.equal(f.state.formOpen.value, true); assert.equal(f.state.uncertain.value.operationId, operation)
+  await f.state.save(); assert.equal(f.calls.filter(call => call.options.method === 'POST').length, 1)
+  f.expect(BASE + '/by-operation/' + operation, view()); await f.state.lookup()
+  assert.equal(f.state.formOpen.value, false); assert.equal(f.state.uncertain.value, null)
+})
+
+test('download drafts are cleared for a real account switch or loss of authorization', async t => {
+  const f = mount(t); await flush(); fill(f.state); f.state.manualSource.value = true
+  f.expect(BASE, listing([view({ rule: { accountId: '2' } })])); f.props.accountId = '2'; await flush()
+  assert.equal(f.state.formOpen.value, false); assert.equal(f.state.form.name, ''); assert.equal(f.state.manualSource.value, false)
+  const channelsResponse = deferred(); f.expect('/transfers/download/channels', channelsResponse.promise)
+  f.state.edit(null); f.state.form.name = 'second account draft'; f.props.authorized = false; await flush()
+  channelsResponse.resolve({ items: [], scope: 'READABLE_CHANNELS', partial: false, warnings: [] }); await flush()
+  assert.equal(f.state.formOpen.value, false); assert.equal(f.state.form.name, '')
+})
+
+const discoveredChannels = () => ({ items: [{ id: '-1001', title: '合成频道' }], scope: 'READABLE_CHANNELS', partial: false, warnings: [] })
+
+test('opening a new download rule automatically reads channels once and reuses them on reopen', async t => {
+  const f = mount(t, [], {}, false); await flush()
+  const response = deferred(); f.expect('/transfers/download/channels', response.promise)
+  f.state.edit(null)
+  assert.equal(f.state.channelsLoading.value, true); assert.equal(f.state.working.value, false)
+  assert.equal(f.state.formOpen.value, true); assert.equal(f.state.sourceEntry.value, 'CHANNEL')
+  f.state.form.name = 'typing while channels load'
+  response.resolve(discoveredChannels()); await flush()
+  assert.equal(f.state.channels.value.items.length, 1); assert.equal(f.state.form.source, '')
+  assert.equal(f.state.form.name, 'typing while channels load')
+  f.state.closeForm(); f.state.edit(null); await flush()
+  assert.equal(f.calls.filter(call => call.path.endsWith('/channels')).length, 1)
+  assert.equal(f.maxActive(), 1)
+})
+
+test('channel discovery queues behind the initial list read without blocking the new form', async t => {
+  const initial = deferred(), f = mount(t, initial.promise, {}, false)
+  f.state.edit(null); assert.equal(f.state.formOpen.value, true)
+  f.expect('/transfers/download/channels', discoveredChannels())
+  initial.resolve(listing([])); await flush()
+  assert.equal(f.state.channels.value.items.length, 1); assert.equal(f.maxActive(), 1)
+  assert.equal(f.timers.filter(timer => !timer.cancelled).length, 0, 'No list polling while editing')
+})
+
+test('failed automatic channel discovery keeps the draft and only retries on explicit refresh', async t => {
+  const f = mount(t, [], {}, false); await flush()
+  f.expect('/transfers/download/channels', new Error('offline channel service'))
+  f.state.edit(null); f.state.form.name = 'keep draft'; await flush()
+  assert.match(f.state.channelError.value, /offline channel service/)
+  f.state.ensureChannels(); await flush(); assert.equal(f.calls.length, 2)
+  f.expect('/transfers/download/channels', discoveredChannels()); await f.state.loadChannels()
+  assert.equal(f.state.form.name, 'keep draft'); assert.equal(f.state.channelError.value, '')
+})
+
+test('closing during channel discovery discards the old response and permits a fresh next open', async t => {
+  const f = mount(t, [], {}, false); await flush(); const response = deferred()
+  f.expect('/transfers/download/channels', response.promise); f.state.edit(null)
+  f.state.closeForm(); assert.equal(f.state.formOpen.value, false)
+  response.resolve(discoveredChannels()); await flush(); assert.equal(f.state.channels.value, null)
+  f.expect('/transfers/download/channels', discoveredChannels()); f.state.edit(null); await flush()
+  assert.equal(f.state.formOpen.value, true); assert.equal(f.state.channels.value.items.length, 1)
+})
+
+test('top-level manual channel mode keeps channel semantics and cannot inherit a selected or post source', async t => {
+  const f = mount(t); await flush(); fill(f.state)
+  f.state.selectSourceEntry('MANUAL')
+  assert.equal(f.state.sourceEntry.value, 'MANUAL'); assert.equal(f.state.sourceMode.value, 'CHANNEL')
+  assert.equal(f.state.form.source, ''); assert.equal(f.state.form.tags, input().tags)
+  f.state.form.source = '@manual'; f.state.selectSourceEntry('POST')
+  assert.equal(f.state.sourceEntry.value, 'POST'); assert.equal(f.state.form.source, '')
+  assert.equal(f.state.form.tags, ''); assert.equal(f.state.form.keywords, '')
+  Object.assign(f.state.form, postInput()); f.state.selectSourceEntry('MANUAL')
+  assert.equal(f.state.form.postKey, null); assert.equal(f.state.form.mainMessageId, null)
+  assert.equal(f.state.form.source, ''); assert.deepEqual(f.state.form.types, input().types)
+  f.state.form.source = '@manual'; f.state.selectSourceEntry('CHANNEL')
+  assert.equal(f.state.sourceEntry.value, 'CHANNEL'); assert.equal(f.state.form.source, '')
+})
+
+test('switching to manual entry during automatic discovery never replaces typed source or changes modes', async t => {
+  const f = mount(t, [], {}, false); await flush(); const response = deferred()
+  f.expect('/transfers/download/channels', response.promise); f.state.edit(null)
+  f.state.selectSourceEntry('MANUAL'); f.state.form.source = '@manual'; f.state.form.name = 'manual draft'
+  response.resolve(discoveredChannels()); await flush()
+  assert.equal(f.state.sourceEntry.value, 'MANUAL'); assert.equal(f.state.form.source, '@manual')
+  assert.equal(f.state.form.name, 'manual draft'); assert.equal(f.state.channels.value.items.length, 1)
+})
+
+test('opening a form during a manual list read preserves the draft and never schedules another read', async t => {
+  const f = mount(t); await flush(); const response = deferred()
+  f.expect(BASE, response.promise); const refreshing = f.state.refresh()
+  assert.equal(f.state.pending.value, true); assert.equal(f.state.working.value, false)
+  f.state.edit(null); f.state.form.name = 'stable draft'
+  response.resolve(listing([view()])); await refreshing; await flush()
+  assert.equal(f.calls.length, 2); assert.equal(f.state.form.name, 'stable draft')
+  assert.equal(f.state.formOpen.value, true); assert.equal(f.timers.filter(timer => !timer.cancelled).length, 0)
+  f.state.closeForm(); assert.equal(f.timers.length, 0)
 })
 test('unmount discards late channel discovery and stops every polling timer', async t => {
   const f = mount(t); await flush(); const response = deferred(); f.expect('/transfers/download/channels', response.promise)

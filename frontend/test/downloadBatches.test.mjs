@@ -145,7 +145,7 @@ test('compact history starts with only a bounded GET, never resumes completed or
   assert.equal(f.calls.length, 1)
   assert.equal(f.state.batches.value[0].state, 'COMPLETED')
   assert.match(f.state.description(completed), /已保存 1\/1/)
-  assert.equal(f.timers.at(-1).delay, 10000)
+  assert.equal(f.timers.length, 0, 'Completed history has no automatic refresh')
   assert.match(parsed.descriptor.template.content, /:default-expanded="false"/)
   await f.state.action(completed, 'pause'); await f.state.action(completed, 'resume')
   assert.equal(f.calls.length, 1, 'Repeated completed controls are no-ops')
@@ -253,15 +253,34 @@ test('availability loss invalidates pending reads and restoration issues exactly
   assert.equal(f.state.batches.value.length, 1)
 })
 
+test('batch progress preserves open file details and history position without setting global loading', async t => {
+  const active=batch([summary({state:'RUNNING'})]),f=mount(t,active);await flush()
+  const detail={savedFileSnapshot:true};f.state.detailBatchId.value=BATCH;f.state.detailTaskId.value=TASK;f.state.taskDetail.value=detail
+  const response=deferred();f.expect(STATUS,response.promise);const reading=f.state.readProgress()
+  assert.equal(f.state.loading.value,false);assert.equal(f.state.pending.value,false)
+  response.resolve(batch([summary({state:'RUNNING',downloadedBytes:7})]));await reading
+  assert.equal(f.state.batches.value[0].downloadedBytes,7);assert.equal(f.state.offset.value,1)
+  assert.deepEqual(f.state.taskDetail.value,detail);assert.equal(f.state.detailError.value,'')
+  assert.equal(f.calls.filter(call=>call.path===LIST).length,1)
+})
+
+test('unknown batch operations are never resolved by background progress reads', async t => {
+  const active=batch([summary({state:'RUNNING'})]),f=mount(t,active);await flush()
+  f.state.uncertainIds.value=[BATCH];await f.state.readProgress()
+  assert.equal(f.calls.length,1);assert.deepEqual(f.state.uncertainIds.value,[BATCH])
+  f.state.uncertainIds.value=[];f.expect(STATUS,new Error('temporary progress error'));await f.state.readProgress()
+  assert.equal(f.state.error.value,'');assert.equal(f.state.batches.value[0].state,'RUNNING')
+})
+
 test('a scheduled poll cannot overlap itself while its GET is in flight', async t => {
   const active = batch([summary({ state: 'RUNNING' })]), f = mount(t, active)
   await flush()
   const pending = deferred(), poll = f.timers.at(-1)
-  f.expect(LIST, pending.promise)
+  f.expect(STATUS, pending.promise)
   poll.callback(); poll.callback()
   await flush()
   assert.equal(f.calls.length, 2)
-  pending.resolve({ items: [active], workerWarning: null }); await flush()
+  pending.resolve(active); await flush()
   assert.equal(f.timers.filter(timer => !timer.cancelled).length, 1)
 })
 
@@ -348,7 +367,7 @@ test('inactive batch panel starts no GET/actions and preserves selection while p
   assert.equal(f.calls.length, 1); f.props.active = false; await flush(); assert.ok(f.timers.every(timer => timer.cancelled))
   assert.equal(f.state.batches.value[0].id, BATCH)
   f.expect(LIST, { items: [saved], workerWarning: null }); f.props.active = true; await flush(); assert.equal(f.calls.length, 2)
-  f.destroy(); f.timers.at(-1).callback(); await flush(); assert.equal(f.calls.length, 2, 'An already queued timer cannot open a GET after disposal')
+  f.destroy(); await f.state.readProgress(); assert.equal(f.calls.length, 2, 'Disposed views do not read progress')
 })
 test('batch mutation completed after hiding keeps its receipt and does not begin another GET or POST', async t => {
   const saved = batch(), response = deferred(), f = mount(t, saved); await flush()
@@ -372,7 +391,7 @@ test('hidden unknown batch POST retains its lock and a moved listing cannot remo
 test('reactivation while a batch read is pending merges into one current refresh and never overlaps reads', async t => {
   const response = deferred(), f = mount(t, response.promise); f.props.active = false; await flush(); f.props.active = true; await flush()
   f.expect(LIST, { items: [batch()], workerWarning: null }); response.resolve({ items: [], workerWarning: null }); await flush()
-  assert.equal(f.calls.length, 2); assert.equal(f.state.batches.value.length, 1); assert.equal(f.timers.filter(timer => !timer.cancelled).length, 1)
+  assert.equal(f.calls.length, 2); assert.equal(f.state.batches.value.length, 1); assert.equal(f.timers.filter(timer => !timer.cancelled).length, 0)
 })
 test('authorization errors emit accessError and never perform a verification POST or leak a stale account result', async t => {
   const saved = batch(), f = mount(t, saved); await flush()

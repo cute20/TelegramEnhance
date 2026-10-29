@@ -60,3 +60,12 @@ test('IME Enter and focus moving inside the picker do not commit or discard the 
   f.state.focusout({currentTarget:{contains:()=>true},relatedTarget:{}});assert.equal(f.state.open.value,true)
   f.state.focusout({currentTarget:{contains:()=>false},relatedTarget:null});assert.equal(f.state.open.value,false);assert.equal(f.state.displayValue.value,'个人-精品')
 })
+
+test('channel loading and arrival preserve an open query without silently selecting a channel',async t=>{
+  const f=mount(t,{modelValue:'',channels:[],loading:true})
+  f.state.search('photo');assert.equal(f.state.open.value,true);assert.deepEqual(f.events,[])
+  f.props.channels=items();f.props.loading=false;await vue.nextTick()
+  assert.equal(f.state.open.value,true);assert.equal(f.state.displayValue.value,'photo')
+  assert.deepEqual(f.state.matches.value.map(c=>c.id),['-1002']);assert.deepEqual(f.events,[])
+  f.state.keydown(key('Enter'));assert.equal(f.props.modelValue,'-1002')
+})

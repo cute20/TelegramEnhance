@@ -12,7 +12,6 @@ const props=withDefaults(defineProps<{authorized:boolean;available:boolean;accou
 const emit=defineEmits<{accessError:[cause:ApiError]}>()
 const tasks=ref<UploadTask[]>([]),error=ref(''),workerWarning=ref(''),busy=ref(''),offset=ref(0)
 const hasMore=ref(true),loading=ref(false),loadingMore=ref(false),historyError=ref('')
-let refreshOffset=0
 const retryCheck=ref<UploadRetryCheck|null>(null),retryUncertain=ref(false)
 const takeover=ref<UploadTask|null>(null),takeoverDialog=ref<HTMLDialogElement|null>(null)
 function closeTakeover(){takeoverDialog.value?.close();takeover.value=null}
@@ -25,22 +24,33 @@ async function confirmTakeover(){const task=takeover.value;if(!task||!canOperate
 let retryOperation:{taskId:string;operationId:string;checkId:string}|null=null
 function clearRetry(){retryCheck.value=null;retryUncertain.value=false;retryOperation=null}
 let generation=0,disposed=false,pending=false,refreshQueued=false,timer:ReturnType<typeof setTimeout>|undefined
+let progressEpoch=0,progressPending=false,progressIndex=0
 function isActive(){return props.active!==false}
 function canOperate(){return !disposed&&isActive()&&props.authorized&&props.available&&!!props.accountId}
 function current(context:number,account:string|null){return !disposed&&context===generation&&account===props.accountId}
-function stopTimer(){clearTimeout(timer);timer=undefined}
-function schedule(){stopTimer();if(canOperate()&&!pending&&!busy.value&&!retryUncertain.value)timer=setTimeout(()=>void load(false,true),tasks.value.some(t=>['RUNNING','QUEUED'].includes(t.state))?2000:10000)}
+function stopTimer(){clearTimeout(timer);timer=undefined;progressEpoch++}
+function schedule(){stopTimer();if(canOperate()&&!pending&&!busy.value&&!retryUncertain.value&&!progressPending&&tasks.value.some(t=>['RUNNING','QUEUED'].includes(t.state)))timer=setTimeout(()=>void readProgress(),2000)}
+async function readProgress(){
+  if(!canOperate()||pending||busy.value||retryUncertain.value||progressPending)return
+  const active=tasks.value.filter(task=>['RUNNING','QUEUED'].includes(task.state))
+  const selected=active.find(task=>task.state==='RUNNING')??active[progressIndex++%active.length]
+  if(!selected)return
+  const context=generation,epoch=progressEpoch,account=props.accountId;progressPending=true
+  try{const result=await api<UploadTask>('/transfers/upload/tasks/'+encodeURIComponent(selected.id));if(!current(context,account)||!canOperate()||epoch!==progressEpoch||retryUncertain.value)return;if(!validUploadTask(result)||result.id!==selected.id)return;tasks.value=tasks.value.map(task=>task.id===result.id&&JSON.stringify(task)!==JSON.stringify(result)?result:task)}
+  catch(cause){if(current(context,account)&&epoch===progressEpoch&&cause instanceof ApiError&&[401,403].includes(cause.status))emit('accessError',cause)}
+  finally{progressPending=false;schedule()}
+}
 function finishCycle(){
   if(disposed)return
   if(refreshQueued&&canOperate()&&!pending&&!busy.value&&!retryUncertain.value){void load();return}
   schedule()
 }
-async function load(append=false,polling=false){
+async function load(append=false){
   if(!canOperate())return
   if(append&&(!hasMore.value||pending||busy.value||retryUncertain.value))return
   if(pending||busy.value||retryUncertain.value){refreshQueued=true;return}
   refreshQueued=false;stopTimer();const request=generation,account=props.accountId;pending=true;loading.value=true;loadingMore.value=append
-  const start=append?offset.value:polling?Math.min(refreshOffset,Math.floor(Math.max(0,offset.value-1)/20)*20):0
+  const start=append?offset.value:0
   try{
     const result=await api<{items:UploadTask[];workerWarning:string|null}>('/transfers/upload/tasks?limit=20&offset='+start)
     if(!current(request,account)||retryUncertain.value)return
@@ -49,7 +59,6 @@ async function load(append=false,polling=false){
     tasks.value=mergeTaskHistory(tasks.value,result.items);workerWarning.value=result.workerWarning??'';error.value=''
     if(append)historyError.value=''
     if(append||offset.value===0||newHead){offset.value=start+result.items.length;hasMore.value=result.items.length===20}
-    refreshOffset=start+20<offset.value?start+20:0
   }catch(cause){if(current(request,account)){error.value=cause instanceof Error?cause.message:'读取上传任务未完成';if(append)historyError.value=error.value;if(cause instanceof ApiError&&[401,403].includes(cause.status))emit('accessError',cause)}}
   finally{if(current(request,account)){loading.value=false;loadingMore.value=false}pending=false;finishCycle()}
 }
@@ -80,7 +89,7 @@ async function lookupRetry(task:UploadTask){
   if(!canOperate()||!retryOperation||busy.value||pending)return;stopTimer();const request=++generation,account=props.accountId;busy.value=task.id
   try{const result=await api<{task:UploadTask|null}>(`/transfers/upload/tasks/${encodeURIComponent(task.id)}/retry-operations/${retryOperation.operationId}`);if(!current(request,account))return;if(result.task&&validUploadTask(result.task)&&result.task.id===task.id){tasks.value=tasks.value.map(t=>t.id===task.id?result.task!:t);clearRetry();error.value=''}else error.value='尚未查到本次操作，请稍后再核对；如重试请求，沿用原操作号。'}catch(cause){if(current(request,account))error.value=cause instanceof Error?cause.message:'状态未核实'}finally{if(current(request,account))busy.value='';finishCycle()}
 }
-watch([()=>props.authorized,()=>props.available,()=>props.accountId],()=>{generation++;closeTakeover();clearRetry();stopTimer();tasks.value=[];error.value='';historyError.value='';workerWarning.value='';busy.value='';offset.value=0;hasMore.value=true;refreshOffset=0;loading.value=false;loadingMore.value=false;refreshQueued=true;finishCycle()},{immediate:true})
+watch([()=>props.authorized,()=>props.available,()=>props.accountId],()=>{generation++;closeTakeover();clearRetry();stopTimer();tasks.value=[];error.value='';historyError.value='';workerWarning.value='';busy.value='';offset.value=0;hasMore.value=true;loading.value=false;loadingMore.value=false;refreshQueued=true;finishCycle()},{immediate:true})
 watch([()=>props.active,()=>props.refreshVersion],()=>{stopTimer();if(!isActive()){closeTakeover();return}refreshQueued=true;finishCycle()})
 onBeforeUnmount(()=>{disposed=true;generation++;closeTakeover();stopTimer()})
 </script>

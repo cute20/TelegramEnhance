@@ -125,7 +125,7 @@ test('database history skips finish processing without pretending a file was sav
   const saved=historyTask();assert.equal(taskModule.validTask(saved),true)
   const f=mount(t,'DownloadTasks',[{path:'/transfers/download/tasks?limit=20&offset=0',value:{items:[saved],workerWarning:null}}]);await flush()
   assert.equal(f.state.tasks.value[0].completed,0);assert.equal(f.state.tasks.value[0].skipped,1);assert.equal(f.state.tasks.value[0].items[0].outputPath,null)
-  assert.equal(f.calls.length,1);assert.equal(f.timers.at(-1).delay,10000)
+  assert.equal(f.calls.length,1);assert.equal(f.timers.length,0)
 })
 test('history skips require evidence, zero current byte counts and no invented output path',()=>{
   for(const mutate of [t=>t.items[0].history=null,t=>t.items[0].history.sha256='prefix',t=>t.items[0].outputPath='D:\\new-copy.mp4',t=>t.items[0].writtenBytes=37,t=>t.completed=1,t=>t.skipped=0]){
@@ -154,6 +154,29 @@ test('task center polls active tasks, shows the confirmed state, and never repla
   f.expect('/transfers/download/tasks/' + ID + '/pause', new Error('Synthetic timeout'), 'POST'); await f.state.action(active, 'pause')
   assert.match(f.state.error.value, /不会自动重试/); assert.equal(f.calls.length, 2)
 })
+test('single-task progress updates neither reload history nor disable controls or move the cursor', async t => {
+  const active=task({state:'RUNNING'}),path='/transfers/download/tasks?limit=20&offset=0'
+  const f=mount(t,'DownloadTasks',[{path,value:{items:[active],workerWarning:null}}]);await flush()
+  const response=deferred();f.expect('/transfers/download/tasks/'+ID,response.promise)
+  const reading=f.state.readProgress();assert.equal(f.state.loading.value,false);assert.equal(f.state.busy.value,'')
+  await f.state.readProgress();assert.equal(f.calls.length,2)
+  const updated=task({state:'RUNNING',updatedAt:2,items:[{...active.items[0],downloadedBytes:7}]})
+  response.resolve(updated);await reading
+  assert.equal(f.state.tasks.value[0].items[0].downloadedBytes,7);assert.equal(f.state.offset.value,1)
+  assert.equal(f.state.hasMore.value,false);assert.equal(f.calls.filter(call=>call.path===path).length,1)
+})
+
+test('a late progress response cannot overwrite a user pause and progress failures retain the visible record', async t => {
+  const active=task({state:'RUNNING'}),path='/transfers/download/tasks?limit=20&offset=0'
+  const f=mount(t,'DownloadTasks',[{path,value:{items:[active],workerWarning:null}}]);await flush()
+  f.expect('/transfers/download/tasks/'+ID,new Error('temporary progress error'));await f.state.readProgress()
+  assert.equal(f.state.error.value,'');assert.equal(f.state.tasks.value[0].state,'RUNNING')
+  const response=deferred();f.expect('/transfers/download/tasks/'+ID,response.promise);const reading=f.state.readProgress()
+  f.expect('/transfers/download/tasks/'+ID+'/pause',task({state:'PAUSED'}),'POST');await f.state.action(active,'pause')
+  response.resolve(active);await reading;assert.equal(f.state.tasks.value[0].state,'PAUSED')
+  assert.equal(f.timers.filter(timer=>!timer.cancelled).length,0)
+})
+
 test('task polling cannot restore another account data after a late response or after closing', async t => {
   const pending = deferred(); const path = '/transfers/download/tasks?limit=20&offset=0'
   const f = mount(t, 'DownloadTasks', [{ path, value: pending.promise }]); f.props.available = false; await flush(); pending.resolve({ items: [task()], workerWarning: null }); await flush()
@@ -168,18 +191,20 @@ test('inactive single-download panel starts no read or action and activation ref
   assert.equal(f.state.tasks.value[0].id, ID); assert.ok(f.timers.every(timer => timer.cancelled))
   await f.state.action(saved, 'resume'); assert.equal(f.calls.length, 1)
   f.expect(path, { items: [saved], workerWarning: null }); f.props.active = true; await flush(); assert.equal(f.calls.length, 2)
-  f.destroy(); f.timers.at(-1).callback(); await flush(); assert.equal(f.calls.length, 2, 'An already queued timer cannot open a GET after disposal')
+  f.destroy(); await f.state.readProgress(); assert.equal(f.calls.length, 2, 'Disposed panels do not read progress')
 })
 const historyId = n => '00000000-0000-0000-0000-' + String(n).padStart(12, '0')
 const historyPage = (start, count = 20) => Array.from({ length: count }, (_, i) => task({ id: historyId(start + i) }))
-test('scroll history appends overlapping pages once, retains earlier rows and rotates bounded status reads', async t => {
+test('scroll history appends once while progress reads keep rows, order and history position unchanged', async t => {
   const head = historyPage(1), f = mount(t, 'DownloadTasks', [{ path: '/transfers/download/tasks?limit=20&offset=0', value: { items: head, workerWarning: null } }]); await flush()
   f.expect('/transfers/download/tasks?limit=20&offset=20', { items: historyPage(20, 2), workerWarning: null })
   await f.state.loadMore(); assert.equal(f.state.tasks.value.length, 21); assert.equal(f.state.offset.value, 22); assert.equal(f.state.hasMore.value, false)
   assert.equal(f.state.tasks.value[0].id, historyId(1)); assert.equal(f.state.tasks.value.at(-1).id, historyId(21))
-  f.expect('/transfers/download/tasks?limit=20&offset=0', { items: head, workerWarning: null }); f.timers.at(-1).callback(); await flush()
-  f.expect('/transfers/download/tasks?limit=20&offset=20', { items: historyPage(20, 2), workerWarning: null }); f.timers.at(-1).callback(); await flush()
+  const order = f.state.tasks.value.map(item => item.id)
+  f.expect('/transfers/download/tasks/' + historyId(1), head[0]); f.timers.at(-1).callback(); await flush()
+  f.expect('/transfers/download/tasks/' + historyId(2), head[1]); f.timers.at(-1).callback(); await flush()
   assert.equal(f.state.tasks.value.length, 21); assert.ok(f.calls.every(call => !call.options.method))
+  assert.deepEqual(f.state.tasks.value.map(item => item.id), order); assert.equal(f.state.offset.value, 22)
 })
 test('failed history append keeps rows and cursor, remains explicitly retryable after a successful status refresh', async t => {
   const head = historyPage(1), path = '/transfers/download/tasks?limit=20&offset=0'

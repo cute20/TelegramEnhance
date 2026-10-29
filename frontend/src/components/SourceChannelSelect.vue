@@ -3,7 +3,7 @@ import {computed,nextTick,ref,useId,watch} from 'vue'
 import {filterSourceChannels,type SourceChannel} from '../downloadChannel'
 import AppIcon from './AppIcon.vue'
 
-const props=defineProps<{modelValue:string;channels:SourceChannel[];disabled:boolean}>()
+const props=defineProps<{modelValue:string;channels:SourceChannel[];disabled:boolean;loading?:boolean}>()
 const emit=defineEmits<{'update:modelValue':[value:string]}>()
 const id=useId(),open=ref(false),query=ref(''),activeIndex=ref(-1),listbox=ref<HTMLElement|null>(null)
 const selected=computed(()=>props.channels.find(channel=>channel.id===props.modelValue))
@@ -50,13 +50,13 @@ watch(()=>props.channels,()=>{if(open.value){activeIndex.value=matches.value.len
       <AppIcon name="chevron" />
     </div>
     <div v-if="open" class="source-channel-popup">
-      <div class="source-channel-count" role="status">{{query.trim()?'匹配':'本次列表'}} {{matches.length}} 个频道</div>
+      <div class="source-channel-count" role="status">{{loading?'正在读取频道…':`${query.trim()?'匹配':'本次列表'} ${matches.length} 个频道`}}</div>
       <div :id="id+'-options'" ref="listbox" class="source-channel-options" role="listbox" aria-label="可读频道">
         <button v-for="(channel,index) in matches" :id="id+'-option-'+index" :key="channel.id" type="button" role="option" tabindex="-1" :aria-selected="channel.id===modelValue" :data-active="index===activeIndex" @mousedown.prevent @click="choose(channel)">
           <span>{{channel.title}}</span><AppIcon v-if="channel.id===modelValue" name="check" />
         </button>
       </div>
-      <p v-if="!matches.length" class="source-channel-empty">没有匹配频道，请修改搜索文字。</p>
+      <p v-if="!matches.length&&!loading" class="source-channel-empty">没有匹配频道，请修改搜索文字。</p>
     </div>
   </div>
 </template>
