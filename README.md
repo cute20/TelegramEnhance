@@ -16,6 +16,7 @@
 
 | 环境 | 要求 |
 | --- | --- |
+| 操作系统 | Windows x64，暂不支持 macOS |
 | Java | JDK 21 |
 | 原生运行库 | 匹配的 Microsoft VC++ x64 运行库 |
 | 构建工具 | Maven 3.9 |
