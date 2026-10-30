@@ -20,7 +20,7 @@
 | Java | JDK 21 |
 | 原生运行库 | 匹配的 Microsoft VC++ x64 运行库 |
 | 构建工具 | Maven 3.9 |
-| 前端环境 | Node.js 22.12+、pnpm 11 |
+| 前端环境 | Node.js 22.12+（建议 24 LTS）、pnpm 11.25.0 |
 | Telegram | 可用账号、API ID 和 API Hash |
 | 网络 | 可连接 Telegram，支持直连、SOCKS5 或 HTTP 代理 |
 | 存储 | 用于下载、待上传和上传归档的本地目录 |
@@ -57,7 +57,7 @@
 
 ### 方式一：双击运行（推荐）
 
-配置好上述本地环境及 `JAVA_HOME`、PATH 后，在项目文件夹中：
+配置好上述本地环境及 `JAVA_HOME`、Maven、PATH 后，在项目文件夹中：
 
 1. **首次使用或更新代码后**：双击 `build.cmd`，等待构建完成，确认没有报错。已有后台运行时，先关闭项目再构建。
 2. **日常启动**：双击 `start.cmd`，自动启动后台并打开页面，无需每次构建。首次使用在页面“设置”中连接 Telegram。
@@ -91,11 +91,29 @@ pnpm -v
 
 版本应符合上方环境要求。提示“找不到命令”时，先检查对应工具及 PATH 配置。
 
+找不到 `node` 或 `npm` 时，先安装 [Node.js](https://nodejs.org/en/download)（Windows x64），安装时保留加入 PATH 的选项。重新打开 PowerShell，再安装项目使用的 pnpm：
+
+```powershell
+npm.cmd install --global pnpm@11.25.0
+pnpm.cmd -v
+```
+
+pnpm 仍找不到时，执行 `npm.cmd config get prefix`，将输出的目录加入用户 PATH，再重新打开终端或项目文件夹。构建脚本会先检查所需命令；它不会自动安装环境。请在普通 Windows PowerShell 中检查，编辑器终端内可用的工具不一定在双击脚本时可用。
+
 脚本默认读取环境变量 `JAVA_HOME`，应指向本机 **JDK 21 的安装根目录**，不是 `bin` 目录。配置好后，以下命令都不需要填写 Java 路径。
 
 `-JavaHome` 仅用于临时指定其他 JDK，参数值填写该电脑实际的安装目录，不是固定路径。
 
-#### 3. 首次构建
+#### 3. Maven 配置
+
+本项目使用本机已安装并配置好的 Maven。构建入口为 `scripts/build.ps1`，相关参数在脚本顶部：
+
+- `MavenHome`：指定本机 Maven 安装目录，默认读取 `MAVEN_HOME`；未设置时依次使用 `M2_HOME`、PATH。
+- `MavenSettings`：可选，指定本机的 `settings.xml`；留空时使用 Maven 默认配置。
+
+Maven 的安装、仓库和镜像等由使用者自行配置。
+
+#### 4. 首次构建
 
 ```powershell
 .\scripts\build.ps1
@@ -112,7 +130,7 @@ pnpm -v
 
 运行时两者都要保留。日常启动无需重复构建。
 
-#### 4. 启动项目
+#### 5. 启动项目
 
 ```powershell
 .\scripts\start.ps1
@@ -131,7 +149,7 @@ pnpm -v
 .\scripts\start.ps1 -NoBrowser
 ```
 
-#### 5. 正常退出
+#### 6. 正常退出
 
 在页面“设置”顶部点击“关闭项目”，或执行：
 
@@ -149,7 +167,7 @@ Test-Path '.\data\runtime.json'
 
 输出 `False` 表示运行标识已移除；等待后台退出后，再更新程序文件或重新构建。
 
-#### 6. 修改代码或更新后的重建
+#### 7. 修改代码或更新后的重建
 
 先退出旧后台：
 
@@ -180,7 +198,8 @@ Test-Path '.\data\runtime.json'
 
 | 情况 | 处理方式 |
 | --- | --- |
-| 找不到 `java`、`mvn`、`node` 或 `pnpm` | 检查本地安装与 PATH；重新打开 PowerShell 后再检查。 |
+| 找不到 `java`、`mvn` 或 `node` | 检查本地安装与 PATH；重新打开 PowerShell 后再检查。 |
+| 找不到 `pnpm` | 先安装 Node.js，再执行 `npm.cmd install --global pnpm@11.25.0`；确认 npm 全局命令目录在 PATH 中。 |
 | Java 版本不符 | 检查 `JAVA_HOME` 是否指向本机 JDK 21 的根目录；重新打开 PowerShell 后再检查。 |
 | PowerShell 提示禁止运行脚本 | 改用项目根目录的 `build.cmd` 或 `start.cmd`。 |
 | 依赖下载失败 | 检查网络能否访问 Maven Central、MCHV 和前端依赖仓库，恢复后重新构建。 |
