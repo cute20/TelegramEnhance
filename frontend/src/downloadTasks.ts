@@ -36,6 +36,25 @@ export function downloadAutomationLabel(automation: DownloadAutomation) {
   return `持续规则：${automation.ruleName} · v${automation.ruleVersion} · ${state} · ${window} · 北京时间`
 }
 export interface CreateDownload { operationId: string; sourceId: string; mediaKeys: string[]; includeMain: boolean; targetDirectory: string }
+export function validDownloadItem(value: unknown): value is DownloadItem {
+  if (!value || typeof value !== 'object') return false
+  const item = value as DownloadItem
+  return typeof item.id === 'string'
+    && Number.isSafeInteger(item.size) && item.size > 0 && Number.isSafeInteger(item.writtenBytes) && item.writtenBytes >= 0 && item.writtenBytes <= item.size
+    && Number.isSafeInteger(item.downloadedBytes) && item.downloadedBytes >= 0 && item.downloadedBytes <= item.size
+    && ['QUEUED', 'DOWNLOADING', 'WRITING', 'FINALIZING', 'COMPLETED', 'SKIPPED_HISTORY'].includes(item.state)
+    && (item.state === 'SKIPPED_HISTORY'
+      ? item.outputPath === null && item.downloadedBytes === 0 && item.writtenBytes === 0 && !!item.history
+        && typeof item.history.id === 'string' && !!item.history.id && typeof item.history.taskId === 'string' && !!item.history.taskId
+        && typeof item.history.path === 'string' && !!item.history.path && typeof item.history.sha256 === 'string' && /^[0-9a-f]{64}$/.test(item.history.sha256)
+        && Number.isSafeInteger(item.history.completedAt) && item.history.completedAt >= 0
+      : typeof item.outputPath === 'string' && !!item.outputPath && item.history == null)
+    && (item.state !== 'COMPLETED' || item.writtenBytes === item.size && item.downloadedBytes === item.size)
+    && (item.duplicate == null ? item.manifestPath == null
+      : typeof item.duplicate.itemId === 'string' && !!item.duplicate.itemId
+        && ['SOURCE_MESSAGE', 'FILE_ID', 'CONTENT_SHA'].includes(item.duplicate.reason) && typeof item.duplicate.path === 'string'
+        && (item.manifestPath == null || typeof item.manifestPath === 'string' && !!item.manifestPath) && item.history == null)
+}
 export function validTask(task: DownloadTask | null | undefined): task is DownloadTask {
   return !!task && typeof task.id === 'string' && !!task.id && task.scope === 'OBSERVED_SELECTION'
     && ['QUEUED', 'RUNNING', 'PAUSED', 'FAILED', 'COMPLETED'].includes(task.state)
@@ -46,21 +65,8 @@ export function validTask(task: DownloadTask | null | undefined): task is Downlo
     && Number.isSafeInteger(task.duplicates) && task.duplicates >= 0 && task.duplicates <= task.completed && typeof task.duplicateDirectory === 'string'
     && (task.duplicatePolicy !== 'KEEP_DUPLICATES_V2' || task.skipped === 0)
     && Array.isArray(task.items) && task.items.length === task.total
-    && task.items.every(item => typeof item.id === 'string'
-      && Number.isSafeInteger(item.size) && item.size > 0 && Number.isSafeInteger(item.writtenBytes) && item.writtenBytes >= 0 && item.writtenBytes <= item.size
-      && Number.isSafeInteger(item.downloadedBytes) && item.downloadedBytes >= 0 && item.downloadedBytes <= item.size
-      && ['QUEUED', 'DOWNLOADING', 'WRITING', 'FINALIZING', 'COMPLETED', 'SKIPPED_HISTORY'].includes(item.state)
-      && (item.state === 'SKIPPED_HISTORY'
-        ? item.outputPath === null && item.downloadedBytes === 0 && item.writtenBytes === 0 && !!item.history
-          && typeof item.history.id === 'string' && !!item.history.id && typeof item.history.taskId === 'string' && !!item.history.taskId
-          && typeof item.history.path === 'string' && !!item.history.path && typeof item.history.sha256 === 'string' && /^[0-9a-f]{64}$/.test(item.history.sha256)
-          && Number.isSafeInteger(item.history.completedAt) && item.history.completedAt >= 0
-        : typeof item.outputPath === 'string' && !!item.outputPath && item.history == null)
-      && (item.state !== 'COMPLETED' || item.writtenBytes === item.size && item.downloadedBytes === item.size))
-    && task.items.every(item => item.duplicate == null ? item.manifestPath == null
-      : task.duplicatePolicy === 'KEEP_DUPLICATES_V2' && typeof item.duplicate.itemId === 'string' && !!item.duplicate.itemId
-        && ['SOURCE_MESSAGE','FILE_ID','CONTENT_SHA'].includes(item.duplicate.reason) && typeof item.duplicate.path === 'string'
-        && typeof item.manifestPath === 'string' && !!item.manifestPath && item.history == null)
+    && task.items.every(validDownloadItem)
+    && task.items.every(item => item.duplicate == null || task.duplicatePolicy === 'KEEP_DUPLICATES_V2')
     && Number.isSafeInteger(task.totalBytes) && task.totalBytes === task.items.reduce((sum, item) => sum + item.size, 0)
     && task.completed === task.items.filter(item => item.state === 'COMPLETED' && item.writtenBytes === item.size).length
     && task.skipped === task.items.filter(item => item.state === 'SKIPPED_HISTORY').length

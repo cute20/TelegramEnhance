@@ -47,15 +47,12 @@ public final class DownloadRepository {
                     if (rows.next()) { if (!fingerprint.equals(rows.getString(2))) throw new IllegalArgumentException("同一操作的参数已变化，请重新创建任务"); return task(c, account, rows.getString(1)); }
                 }
             }
-            String rootKey = DownloadPaths.key(root), directory = null;
-            try (var q = c.prepareStatement("SELECT relative_directory FROM download_target_bindings WHERE account_id=? AND root_key=? AND post_key=?")) {
-                q.setString(1, account); q.setString(2, rootKey); q.setString(3, post.key()); try (var rows = q.executeQuery()) { if (rows.next()) directory = rows.getString(1); }
-            }
-            if (directory == null) { directory = DownloadPaths.directory(post); update(c, "INSERT INTO download_target_bindings VALUES(?,?,?,?)", account, rootKey, post.key(), directory); }
+            // Legacy bindings remain untouched for old checkpoints. Never reuse their extra directories for a new task.
+            String directory = DownloadPaths.directory(post);
             String id = UUID.randomUUID().toString(); long stamp = now();
             update(c, "INSERT INTO download_tasks VALUES(?,?,?,?,?,?,?,?,'QUEUED',0,NULL,?,?,?)", id, account, operation, fingerprint, post.key(), encode(post), root.toString(), directory, stamp, stamp, policy);
             for (int i = 0; i < files.size(); i++) {
-                var file = files.get(i); String relative = DownloadPaths.file(file);
+                var file = files.get(i); String relative = DownloadPaths.file(file,root);
                 if (root.resolve(directory).resolve(relative).toString().length() > 240) throw new IllegalArgumentException("保存路径过长，请选择更短的根目录");
                 var history = HISTORY_SKIP.equals(policy) ? history(c, account, file.uniqueId(), file.size()) : null;
                 update(c, "INSERT INTO download_items VALUES(?,?,?,?,?,?,?,?,?,?,0,0,?,NULL,?)", UUID.randomUUID().toString(), id, i, file.media().key(), encode(file), file.uniqueId(), file.size(), relative, UUID.randomUUID().toString(), history == null ? "QUEUED" : "SKIPPED_HISTORY", history == null ? null : history.sha256(), history == null ? null : history.id());
@@ -206,9 +203,10 @@ public final class DownloadRepository {
     }
     private static IllegalStateException invalidBatch(){return new IllegalStateException("批量下载的冻结清单、子任务或完成证据不一致，请核对已有任务");}
     public Task task(String account, String id) { return database.read(c -> task(c, account, id)); }
-    public List<Task> list(String account, int limit, int offset) { return database.read(c -> {
+    public List<Task> list(String account, int limit, int offset) { return list(account,limit,offset,false); }
+    public List<Task> list(String account, int limit, int offset, boolean standalone) { return database.read(c -> {
         var ids = new ArrayList<String>();
-        try (var q = c.prepareStatement("SELECT task_id FROM download_tasks WHERE account_id=? ORDER BY created_at DESC,task_id LIMIT ? OFFSET ?")) {
+        try (var q = c.prepareStatement("SELECT task_id FROM download_tasks t WHERE account_id=?" + (standalone ? " AND NOT EXISTS(SELECT 1 FROM download_rule_tasks b WHERE b.task_id=t.task_id AND b.account_id=t.account_id)" : "") + " ORDER BY created_at DESC,task_id LIMIT ? OFFSET ?")) {
             q.setString(1, account); q.setInt(2, limit); q.setInt(3, offset); try (var r = q.executeQuery()) { while (r.next()) ids.add(r.getString(1)); }
         }
         var tasks = new ArrayList<Task>(); for (var id : ids) tasks.add(task(c, account, id)); return List.copyOf(tasks);
@@ -274,7 +272,8 @@ public final class DownloadRepository {
         if(current.plan()!=null){if(!current.plan().sha256().equals(hash))throw new IllegalArgumentException("下载输出内容已变化");return current.plan();}
         if(current.writtenBytes()!=current.file().size()||!hash.equals(current.sha256()))throw new IllegalArgumentException("下载文件尚未完整校验");
         var duplicate=findDuplicate(c,task.accountId(),current,hash);String relative=Path.of(duplicate==null?task.relativeDirectory():"重复媒体").resolve(current.relativeFile()).toString();
-        String manifest=duplicate==null?null:Path.of("重复媒体","来源-"+current.id()+".json").toString();long stamp=now();
+        // Provenance and duplicate evidence are retained in download_completion_log, without new sidecar files.
+        String manifest=null;long stamp=now();
         update(c,"INSERT INTO download_output_plans VALUES(?,?,?,?,?,?,?)",current.id(),relative,hash,duplicate==null?null:duplicate.itemId(),duplicate==null?"NEW":duplicate.reason(),manifest,stamp);
         return new OutputPlan(relative,hash,duplicate,manifest,stamp);
     });}

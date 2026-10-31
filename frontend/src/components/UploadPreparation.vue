@@ -1,21 +1,44 @@
 <script setup lang="ts">
-import { onBeforeUnmount, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, ref, watch } from 'vue'
 import { api, ApiError } from '../api'
 import { formatMediaBytes } from '../library'
 import { uploadTypes, validUploadPreview, type UploadPreview } from '../uploadPreview'
 import AppIcon from './AppIcon.vue'
 import { validUploadTask, type UploadTask } from '../uploadTasks'
-const props = defineProps<{ authorized: boolean; available: boolean; accountId: string | null }>()
-const emit = defineEmits<{ settings: []; tasks: []; accessError: [cause: ApiError] }>()
+import { ruleArchiveDirectory } from '../rules'
+import type { UploadCreationSelection } from '../transferCreation'
+const props = defineProps<{ authorized: boolean; available: boolean; accountId: string | null; selection?: UploadCreationSelection }>()
+const emit = defineEmits<{ settings: []; tasks: []; accessError: [cause: ApiError]; transitionLocked: [value: boolean]; fieldsLocked: [value: boolean] }>()
 const link = ref(''), sourceDirectory = ref(''), archiveDirectory = ref('')
 const recursive = ref(true), captionMode = ref<'FILENAME' | 'EMPTY'>('FILENAME')
 const preview = ref<UploadPreview | null>(null), busy = ref(false), error = ref(''), verified = ref(false)
 const creating=ref(false),uncertain=ref(false),created=ref<UploadTask|null>(null)
+const transitionLocked=computed(()=>creating.value||uncertain.value)
+const fieldsLocked=computed(()=>busy.value||creating.value||uncertain.value||!!created.value)
 let frozenCreate:{operationId:string;previewId:string}|null=null
 let generation = 0, disposed = false
 function reset() { generation++; preview.value = null; error.value = ''; busy.value = false; verified.value = false;creating.value=false;uncertain.value=false;created.value=null;frozenCreate=null }
 watch([link,sourceDirectory,archiveDirectory,recursive,captionMode], reset)
-watch([() => props.authorized, () => props.available, () => props.accountId], (_value, before) => { reset(); if (before && props.accountId !== before[2]) { link.value = ''; sourceDirectory.value = ''; archiveDirectory.value = '' } })
+function applySelection() {
+  const selection=props.selection
+  if(!selection||creating.value||uncertain.value||created.value)return
+  link.value=selection.link;sourceDirectory.value=selection.sourceDirectory
+  archiveDirectory.value=ruleArchiveDirectory(selection.sourceDirectory)
+  recursive.value=selection.recursive;captionMode.value=selection.captionMode
+}
+watch([()=>props.selection?.link,()=>props.selection?.sourceDirectory,()=>props.selection?.recursive,()=>props.selection?.captionMode],applySelection,{immediate:true,flush:'sync'})
+watch([() => props.authorized, () => props.available, () => props.accountId], (value, before) => {
+  const identityChanged=!before||value[0]!==before[0]||value[2]!==before[2]
+  if(identityChanged){reset();if(before&&value[2]!==before[2]){link.value='';sourceDirectory.value='';archiveDirectory.value=''}return}
+  // A connectivity blip cannot discard an operation that may already have committed.
+  const needsLookup=!!frozenCreate&&!created.value&&(creating.value||uncertain.value)
+  if(needsLookup)uncertain.value=true
+  generation++;busy.value=false;creating.value=false;verified.value=false
+  if(needsLookup){error.value='连接中断，已保留本次创建操作；恢复连接后请核对是否已创建，不会自动重新提交。'}
+  else if(!created.value){preview.value=null;error.value='连接状态已变化，请恢复连接后重新预览。'}
+})
+watch(transitionLocked,value=>emit('transitionLocked',value),{flush:'sync'})
+watch(fieldsLocked,value=>{if(props.selection)emit('fieldsLocked',value)},{immediate:true,flush:'sync'})
 async function prepare(recheck = false) {
   if (busy.value || creating.value || uncertain.value || created.value || !props.authorized || !props.available || !props.accountId || !link.value.trim() || !sourceDirectory.value.trim() || !archiveDirectory.value.trim() || recheck && !preview.value) return
   const request = ++generation, account = props.accountId, old = preview.value
@@ -40,18 +63,19 @@ async function createTask(retry=false){
   try{const result=await api<UploadTask>('/transfers/upload/tasks',{method:'POST',timeout:150000,body:frozenCreate});if(disposed||request!==generation||account!==props.accountId)return;if(!validUploadTask(result))throw new Error('上传任务回执无法确认');created.value=result;uncertain.value=false}
   catch(cause){if(!disposed&&request===generation){uncertain.value=true;error.value=(cause instanceof Error?cause.message:'创建未完成')+' 请先核对任务；重试沿用同一操作号。'}}finally{if(!disposed&&request===generation)creating.value=false}
 }
-async function lookupTask(){if(!frozenCreate||creating.value)return;const request=generation;creating.value=true;try{const result=await api<{task:UploadTask|null}>('/transfers/upload/tasks/by-operation/'+frozenCreate.operationId);if(disposed||request!==generation)return;if(result.task&&validUploadTask(result.task)){created.value=result.task;uncertain.value=false;error.value=''}else error.value='尚未查到任务；请稍后核对，或重试同一创建操作。'}catch{if(!disposed&&request===generation)error.value='任务状态未核实，请到任务中心检查。'}finally{if(!disposed&&request===generation)creating.value=false}}
-onBeforeUnmount(() => { disposed = true; generation++ })
+async function lookupTask(){if(!frozenCreate||creating.value||!props.authorized||!props.available||!props.accountId)return;const request=generation,account=props.accountId;creating.value=true;try{const result=await api<{task:UploadTask|null}>('/transfers/upload/tasks/by-operation/'+frozenCreate.operationId);if(disposed||request!==generation||account!==props.accountId)return;if(result.task&&validUploadTask(result.task)){created.value=result.task;uncertain.value=false;error.value=''}else error.value='尚未查到任务；请稍后核对，或重试同一创建操作。'}catch{if(!disposed&&request===generation)error.value='任务状态未核实，请到任务中心检查。'}finally{if(!disposed&&request===generation)creating.value=false}}
+onBeforeUnmount(() => { disposed = true; generation++;if(transitionLocked.value)emit('transitionLocked',false);if(props.selection&&fieldsLocked.value)emit('fieldsLocked',false) })
 </script>
 <template>
   <section class="upload-preparation" aria-label="上传准备">
-    <p class="upload-intro">将整理好的媒体上传到自己频道主帖的评论区。图片、视频、音频和文档分别分组，不混合发送；预览后保存任务，再到任务中心确认开始。</p>
+    <p v-if="!selection" class="upload-intro">将整理好的媒体上传到自己频道主帖的评论区。图片、视频、音频和文档分别分组，不混合发送；预览后保存任务，再到任务中心确认开始。</p>
     <div v-if="!authorized || !available" class="notice warning"><span>{{ authorized ? '请恢复本机连接后重新预览。' : '请先连接 Telegram。' }}</span><button v-if="!authorized" class="btn" @click="emit('settings')">前往设置</button></div>
     <form @submit.prevent="prepare()">
-      <fieldset :disabled="busy || creating || uncertain || !!created || !authorized || !available"><label for="upload-link">目标频道主帖链接</label><input id="upload-link" v-model="link" class="input" type="url" placeholder="https://t.me/…" autocomplete="off" required />
+      <fieldset :disabled="busy || creating || uncertain || !!created || !authorized || !available"><template v-if="!selection"><label for="upload-link">目标频道主帖链接</label><input id="upload-link" v-model="link" class="input" type="url" placeholder="https://t.me/…" autocomplete="off" required />
         <label for="upload-source">待上传目录</label><input id="upload-source" v-model="sourceDirectory" class="input" placeholder="例如 D:\待上传" autocomplete="off" required />
         <label for="upload-archive">已上传归档目录</label><input id="upload-archive" v-model="archiveDirectory" class="input" placeholder="例如 D:\已上传" autocomplete="off" required /><small>两个目录不能相同或互相包含。预览不会创建归档目录。</small>
         <div class="upload-options"><label><input v-model="recursive" type="checkbox" />包含子目录</label><label for="upload-caption">媒体说明<select id="upload-caption" v-model="captionMode" class="input"><option value="FILENAME">使用原文件名</option><option value="EMPTY">留空</option></select></label></div>
+        </template>
         <button class="btn primary" :disabled="!link.trim() || !sourceDirectory.trim() || !archiveDirectory.trim()"><AppIcon name="search" />{{ busy ? '正在核对目录与目标…' : preview ? '重新生成上传预览' : '生成上传预览' }}</button>
       </fieldset>
     </form>
@@ -63,7 +87,7 @@ onBeforeUnmount(() => { disposed = true; generation++ })
       <p v-if="verified" class="notice success" role="status">目标权限和原目录快照已重新核对；分组未改变，仍未发送文件。</p>
       <section v-for="group in preview.groups" :key="group.number" class="upload-group"><header><strong>第 {{ group.number }} 组 · {{ uploadTypes[group.mediaType] }}</strong><span>{{ group.mode === 'SINGLE' ? '单条发送' : `相册 · ${group.files.length} 个` }}</span></header><ol><li v-for="file in group.files" :key="file.relativePath"><div><strong>{{ file.fileName }}</strong><small>{{ file.relativePath }}</small><small>说明：{{ file.caption || '留空' }}</small></div><span>{{ formatMediaBytes(file.size) }}</span></li></ol></section>
       <details class="upload-text"><summary>目标主帖全文与目录</summary><p>{{ preview.postText }}</p><p>待上传：{{ preview.sourceDirectory }}<br />归档：{{ preview.archiveDirectory }}</p><a :href="preview.postLink" target="_blank" rel="noreferrer">查看 Telegram 主帖 ↗</a></details>
-      <p class="upload-next">同类型内按自然顺序排列，每组最多10个，尾组1个及动图单条处理。保存后分组固定，任务中心确认开始才会发送；收到正式回执后归档。</p>
+      <p v-if="!selection" class="upload-next">同类型内按自然顺序排列，每组最多10个，尾组1个及动图单条处理。保存后分组固定，任务中心确认开始才会发送；收到正式回执后归档。</p>
       <button v-if="!created&&!uncertain" class="btn primary" :disabled="busy||creating||!preview.fileCount" @click="createTask()">{{creating?'正在保存任务…':'保存上传任务（等待开始）'}}</button>
       <div v-if="uncertain" class="upload-options"><button class="btn" :disabled="creating" @click="lookupTask">核对是否已创建</button><button class="btn" :disabled="creating" @click="createTask(true)">重试同一创建操作</button></div>
       <div v-if="created" class="notice success" role="status"><span>上传任务已保存，尚未开始发送。</span><button class="btn" @click="emit('tasks')">查看上传任务</button></div>

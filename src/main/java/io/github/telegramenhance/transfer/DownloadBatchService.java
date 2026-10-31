@@ -68,7 +68,7 @@ public final class DownloadBatchService {
         int count=before.stream().mapToInt(part->part.files().size()).sum();if(count+selected.size()>MAX_MEDIA)throw new IllegalArgumentException("本批超过1000个媒体，请减少主帖或媒体类型后重新准备。");
         var frozen=selected.isEmpty()?List.<FrozenFile>of():files.freeze(post,selected,e.session.generation());guard.run();
         if(frozen.size()!=selected.size()||!frozen.stream().map(file->file.media().key()).toList().equals(selected.stream().map(Media::key).toList())||frozen.stream().anyMatch(file->file.uniqueId()==null||file.uniqueId().isBlank()||file.size()<=0))throw new IllegalArgumentException("原媒体身份未完整核对。");
-        for(var file:frozen)if(e.root.resolve(DownloadPaths.directory(post)).resolve(DownloadPaths.file(file)).toString().length()>240)throw new IllegalArgumentException("保存路径过长，请选择更短的根目录后重新准备。");
+        for(var file:frozen)DownloadPaths.file(file,e.root);
         var collected=new ArrayList<>(old.files());collected.addAll(frozen);var parts=new ArrayList<>(before);parts.set(index,new Part(post,true,complete,cursor,observed,collected));
         synchronized(previews){guard.run();if(previews.get(id)!=e||e.parts!=before)throw new IllegalArgumentException("准备结果已过期。");e.parts=List.copyOf(parts);e.pending=null;e.revision++;e.steps++;e.touched=clock.getAsLong();e.error=null;e.busy=false;return view(e);}
     }

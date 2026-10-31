@@ -9,6 +9,7 @@ import ts from 'typescript'
 import * as library from '../src/library.ts'
 import * as upload from '../src/uploadPreview.ts'
 import * as uploadTasks from '../src/uploadTasks.ts'
+import * as rules from '../src/rules.ts'
 const ID = '00000000-0000-0000-0000-000000000001'
 const LINK = 'https://t.me/synthetic/1'
 const flush = async () => { await vue.nextTick(); await new Promise(setImmediate) }
@@ -21,7 +22,7 @@ function mount(t) {
   const compiled = ts.transpileModule(compileScript(parsed.descriptor,{ id: 'upload-test' }).content,{ compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText
   const props = vue.reactive({ accountId: '1', authorized: true, available: true }), steps = [], calls = [], failures = [], hooks = [], events = []
   const api = async (path, options={}) => { calls.push({ path, options }); const step = steps.shift(); try { assert.ok(step, path); assert.equal(path, step.path); assert.equal(options.method??'GET', step.method??'POST') } catch(e) { failures.push(e); throw e } if (step.value instanceof Error) throw step.value; return step.value }
-  const modules = { vue: { ...vue, onBeforeUnmount: f => hooks.push(f) }, '../api': { api, ApiError: class extends Error {} }, '../taskHistory': taskHistory, '../library': library, '../uploadPreview': upload, '../uploadRetry':uploadRetry,'../uploadTasks':uploadTasks }
+  const modules = { vue: { ...vue, onBeforeUnmount: f => hooks.push(f) }, '../api': { api, ApiError: class extends Error {} }, '../taskHistory': taskHistory, '../library': library, '../uploadPreview': upload, '../uploadRetry':uploadRetry,'../uploadTasks':uploadTasks,'../rules':rules }
   const module = { exports: {} }; new Function('require','module','exports',compiled)(name => name.endsWith('.vue') ? {} : modules[name],module,module.exports)
   const scope = vue.effectScope(); const state = scope.run(() => module.exports.default.setup(props,{ expose() {}, emit: (...args) => events.push(args) }))
   let disposed = false; const destroy = () => { if (disposed) return; disposed = true; hooks.forEach(f => f()); scope.stop() }
@@ -77,6 +78,39 @@ test('uncertain upload creation only retries explicitly with the same operation 
 test('uncertain upload creation can be looked up without sending another POST',async t=>{
   const f=await fields(t);f.expect(result(1));await f.state.prepare();f.expectPath('/transfers/upload/tasks',new Error('timeout'));await f.state.createTask();const operation=f.calls[1].options.body.operationId;f.expectPath('/transfers/upload/tasks/by-operation/'+operation,{task:savedTask()},'GET');await f.state.lookupTask();assert.equal(f.state.created.value.id,ID);assert.equal(f.calls.filter(c=>c.path==='/transfers/upload/tasks').length,1)
 })
+test('upload creation keeps its original operation locked through a same-account disconnect until explicit GET confirms it',async t=>{
+  const f=await fields(t);f.expect(result(1));await f.state.prepare()
+  let release;f.expectPath('/transfers/upload/tasks',new Promise(resolve=>{release=resolve}));const saving=f.state.createTask()
+  const operation=f.calls.at(-1).options.body.operationId,source=f.state.sourceDirectory.value
+  assert.equal(f.state.transitionLocked.value,true)
+  f.props.available=false;await flush()
+  assert.equal(f.state.uncertain.value,true);assert.equal(f.state.creating.value,false);assert.equal(f.state.preview.value.id,ID);assert.equal(f.state.sourceDirectory.value,source)
+  assert.deepEqual(f.events.filter(event=>event[0]==='transitionLocked'),[['transitionLocked',true]],'connectivity must not transiently unlock the outer composer')
+  await f.state.lookupTask();assert.equal(f.calls.length,2,'offline lookup cannot submit a request')
+  f.props.available=true;await flush();release(savedTask());await saving
+  assert.equal(f.state.created.value,null,'late success belongs to the invalidated connection generation');assert.equal(f.state.uncertain.value,true);assert.equal(f.state.transitionLocked.value,true)
+  await f.state.createTask();assert.equal(f.calls.length,2,'recovery cannot silently replace or resubmit the original operation')
+  f.expectPath('/transfers/upload/tasks/by-operation/'+operation,{task:savedTask()},'GET');await f.state.lookupTask()
+  assert.equal(f.state.created.value.id,ID);assert.equal(f.state.uncertain.value,false);assert.equal(f.state.transitionLocked.value,false)
+  assert.deepEqual(f.events.filter(event=>event[0]==='transitionLocked'),[['transitionLocked',true],['transitionLocked',false]])
+  assert.equal(f.calls.filter(call=>call.path==='/transfers/upload/tasks').length,1)
+})
+test('a confirmed upload task freezes its leaf inputs without permanently locking the composer',async t=>{
+  const f=await fields(t);f.expect(result(1));await f.state.prepare();assert.equal(f.state.transitionLocked.value,false)
+  f.expectPath('/transfers/upload/tasks',savedTask());await f.state.createTask()
+  assert.equal(f.state.created.value.state,'READY');assert.equal(f.state.transitionLocked.value,false)
+  f.props.available=false;await flush();f.props.available=true;await flush()
+  assert.equal(f.state.created.value.id,ID);assert.equal(f.state.transitionLocked.value,false);assert.equal(f.state.uncertain.value,false)
+  assert.equal(f.calls.some(call=>call.path.endsWith('/start')),false)
+})
+test('changing upload account clears the old unresolved operation and rejects its late creation reply',async t=>{
+  const f=await fields(t);f.expect(result(1));await f.state.prepare();let release
+  f.expectPath('/transfers/upload/tasks',new Promise(resolve=>{release=resolve}));const saving=f.state.createTask()
+  f.props.accountId='2';await flush();release(savedTask());await saving
+  assert.equal(f.state.created.value,null);assert.equal(f.state.uncertain.value,false);assert.equal(f.state.transitionLocked.value,false)
+  assert.equal(f.state.link.value,'');assert.equal(f.state.sourceDirectory.value,'');assert.equal(f.state.archiveDirectory.value,'')
+  await f.state.lookupTask();assert.equal(f.calls.length,2,'the old operation is not queried under the next account')
+})
 test('upload completion cannot be fabricated from a temporary message or only a formal receipt',()=>{
   const task=savedTask();assert.equal(uploadTasks.validUploadTask(task),true);task.state='COMPLETED';assert.equal(uploadTasks.validUploadTask(task),false);task.confirmed=1;task.groups[0].items[0].formalMessageId='9007199254740999';task.groups[0].items[0].state='SENT';assert.equal(uploadTasks.validUploadTask(task),false);task.archived=1;task.groups[0].items[0].state='ARCHIVED';task.groups[0].items[0].archivePath='D:\\archive\\clip1.mp4';assert.equal(uploadTasks.validUploadTask(task),true)
 })
@@ -86,7 +120,7 @@ function taskUi(t,initial){
   const compiled=ts.transpileModule(compileScript(parsed.descriptor,{id:'upload-task-test'}).content,{compilerOptions:{module:ts.ModuleKind.CommonJS,target:ts.ScriptTarget.ES2022}}).outputText
   const props=vue.reactive({accountId:'1',authorized:true,available:true}),calls=[],hooks=[],failures=[],steps=[{path:'/transfers/upload/tasks?limit=20&offset=0',method:'GET',value:{items:[initial],workerWarning:null}}]
   const api=async(path,options={})=>{calls.push({path,options});const step=steps.shift();try{assert.ok(step,path);assert.equal(path,step.path);assert.equal(options.method??'GET',step.method)}catch(e){failures.push(e);throw e}if(step.value instanceof Error)throw step.value;return step.value}
-  const modules={vue:{...vue,onBeforeUnmount:f=>hooks.push(f)},'../api':{api,ApiError:class extends Error{}},'../taskHistory':taskHistory,'../library':library,'../uploadPreview':upload,'../uploadRetry':uploadRetry,'../uploadTasks':uploadTasks}
+  const modules={vue:{...vue,onBeforeUnmount:f=>hooks.push(f)},'../api':{api,ApiError:class extends Error{}},'../taskHistory':taskHistory,'../library':library,'../uploadPreview':upload,'../uploadRetry':uploadRetry,'../uploadTasks':uploadTasks,'../rules':rules}
   const module={exports:{}};new Function('require','module','exports',compiled)(name=>name.endsWith('.vue')?{}:modules[name],module,module.exports)
   const scope=vue.effectScope();const state=scope.run(()=>module.exports.default.setup(props,{expose(){},emit(){}}))
   t.after(()=>{hooks.forEach(f=>f());scope.stop();assert.deepEqual(failures,[]);assert.equal(steps.length,0)})

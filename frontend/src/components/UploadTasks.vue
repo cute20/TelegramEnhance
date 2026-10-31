@@ -12,6 +12,11 @@ const props=withDefaults(defineProps<{authorized:boolean;available:boolean;accou
 const emit=defineEmits<{accessError:[cause:ApiError]}>()
 const tasks=ref<UploadTask[]>([]),error=ref(''),workerWarning=ref(''),busy=ref(''),offset=ref(0)
 const hasMore=ref(true),loading=ref(false),loadingMore=ref(false),historyError=ref('')
+const groupDisclosures=ref<Record<string,boolean>>({})
+const groupKey=(taskId:string,groupId:string)=>JSON.stringify([taskId,groupId])
+function groupOpen(task:UploadTask,groupId:string){return groupDisclosures.value[groupKey(task.id,groupId)]??task.state!=='COMPLETED'}
+function toggleGroup(taskId:string,groupId:string,event:Event){const details=event.currentTarget as HTMLDetailsElement|null;if(details)groupDisclosures.value[groupKey(taskId,groupId)]=details.open}
+watch(tasks,items=>{for(const task of items)for(const group of task.groups){const key=groupKey(task.id,group.id);if(!(key in groupDisclosures.value))groupDisclosures.value[key]=task.state!=='COMPLETED'}},{flush:'sync'})
 const retryCheck=ref<UploadRetryCheck|null>(null),retryUncertain=ref(false)
 const takeover=ref<UploadTask|null>(null),takeoverDialog=ref<HTMLDialogElement|null>(null)
 function closeTakeover(){takeoverDialog.value?.close();takeover.value=null}
@@ -24,7 +29,7 @@ async function confirmTakeover(){const task=takeover.value;if(!task||!canOperate
 let retryOperation:{taskId:string;operationId:string;checkId:string}|null=null
 function clearRetry(){retryCheck.value=null;retryUncertain.value=false;retryOperation=null}
 let generation=0,disposed=false,pending=false,refreshQueued=false,timer:ReturnType<typeof setTimeout>|undefined
-let progressEpoch=0,progressPending=false,progressIndex=0
+let progressEpoch=0,progressPending=false,progressIndex=0,listEpoch=0
 function isActive(){return props.active!==false}
 function canOperate(){return !disposed&&isActive()&&props.authorized&&props.available&&!!props.accountId}
 function current(context:number,account:string|null){return !disposed&&context===generation&&account===props.accountId}
@@ -38,28 +43,54 @@ async function readProgress(){
   const context=generation,epoch=progressEpoch,account=props.accountId;progressPending=true
   try{const result=await api<UploadTask>('/transfers/upload/tasks/'+encodeURIComponent(selected.id));if(!current(context,account)||!canOperate()||epoch!==progressEpoch||retryUncertain.value)return;if(!validUploadTask(result)||result.id!==selected.id)return;tasks.value=tasks.value.map(task=>task.id===result.id&&JSON.stringify(task)!==JSON.stringify(result)?result:task)}
   catch(cause){if(current(context,account)&&epoch===progressEpoch&&cause instanceof ApiError&&[401,403].includes(cause.status))emit('accessError',cause)}
-  finally{progressPending=false;schedule()}
+  finally{progressPending=false;finishCycle()}
 }
 function finishCycle(){
   if(disposed)return
-  if(refreshQueued&&canOperate()&&!pending&&!busy.value&&!retryUncertain.value){void load();return}
+  if(refreshQueued&&canOperate()&&!pending&&!busy.value&&!retryUncertain.value&&!progressPending){void load();return}
   schedule()
 }
 async function load(append=false){
   if(!canOperate())return
   if(append&&(!hasMore.value||pending||busy.value||retryUncertain.value))return
-  if(pending||busy.value||retryUncertain.value){refreshQueued=true;return}
+  if(pending||busy.value||retryUncertain.value||!append&&progressPending){refreshQueued=true;return}
   refreshQueued=false;stopTimer();const request=generation,account=props.accountId;pending=true;loading.value=true;loadingMore.value=append
-  const start=append?offset.value:0
+  const epoch=listEpoch,start=append?offset.value:0,known=[...tasks.value],initial=offset.value===0&&known.length===0
+  const valid=()=>current(request,account)&&canOperate()&&epoch===listEpoch&&!retryUncertain.value
   try{
-    const result=await api<{items:UploadTask[];workerWarning:string|null}>('/transfers/upload/tasks?limit=20&offset='+start)
-    if(!current(request,account)||retryUncertain.value)return
-    if(!Array.isArray(result.items)||result.items.length>20||new Set(result.items.map(t=>t?.id)).size!==result.items.length||result.items.some(t=>!validUploadTask(t)))throw new Error('上传任务回执无法确认，请刷新。')
-    const newHead=start===0&&result.items.some(item=>!tasks.value.some(old=>old.id===item.id))
-    tasks.value=mergeTaskHistory(tasks.value,result.items);workerWarning.value=result.workerWarning??'';error.value=''
+    const updates=new Map<string,UploadTask>(),warnings=new Set<string>()
+    let firstLength=0,lastLength=0
+    const end=append?start+20:Math.max(20,offset.value,known.length)
+    for(let cursor=start;cursor<end;cursor+=20){
+      if(!valid())return
+      const result=await api<{items:UploadTask[];workerWarning:string|null}>('/transfers/upload/tasks?limit=20&offset='+cursor)
+      if(!valid())return
+      if(!Array.isArray(result.items)||result.items.length>20||new Set(result.items.map(t=>t?.id)).size!==result.items.length||result.items.some(t=>!validUploadTask(t)))throw new Error('上传任务回执无法确认，请刷新。')
+      if(cursor===start)firstLength=result.items.length
+      lastLength=result.items.length
+      for(const item of result.items)updates.set(item.id,item)
+      if(result.workerWarning)warnings.add(result.workerWarning)
+      if(result.items.length<20)break
+    }
+    if(!append){
+      for(const item of known){
+        if(updates.has(item.id))continue
+        if(!valid())return
+        const updated=await api<UploadTask>('/transfers/upload/tasks/'+encodeURIComponent(item.id))
+        if(!valid())return
+        if(!validUploadTask(updated)||updated.id!==item.id)throw new Error('已加载上传任务的状态无法确认，请刷新。')
+        updates.set(item.id,updated)
+      }
+    }
+    if(!valid())return
+    const incoming=[...updates.values()]
+    const newHead=!append&&incoming.some(item=>!known.some(old=>old.id===item.id))
+    tasks.value=mergeTaskHistory(append?tasks.value:known,incoming)
+    workerWarning.value=[...warnings].join('；');error.value=''
     if(append)historyError.value=''
-    if(append||offset.value===0||newHead){offset.value=start+result.items.length;hasMore.value=result.items.length===20}
-  }catch(cause){if(current(request,account)){error.value=cause instanceof Error?cause.message:'读取上传任务未完成';if(append)historyError.value=error.value;if(cause instanceof ApiError&&[401,403].includes(cause.status))emit('accessError',cause)}}
+    if(append||initial){offset.value=start+firstLength;hasMore.value=firstLength===20}
+    else if(newHead)hasMore.value=lastLength===20
+  }catch(cause){if(valid()){error.value=cause instanceof Error?cause.message:'读取上传任务未完成';if(append)historyError.value=error.value;if(cause instanceof ApiError&&[401,403].includes(cause.status))emit('accessError',cause)}}
   finally{if(current(request,account)){loading.value=false;loadingMore.value=false}pending=false;finishCycle()}
 }
 async function action(task:UploadTask,verb:'start'|'pause'|'reconcile'|'cancel'|'accept-document'|'takeover',groupId=''){
@@ -89,18 +120,18 @@ async function lookupRetry(task:UploadTask){
   if(!canOperate()||!retryOperation||busy.value||pending)return;stopTimer();const request=++generation,account=props.accountId;busy.value=task.id
   try{const result=await api<{task:UploadTask|null}>(`/transfers/upload/tasks/${encodeURIComponent(task.id)}/retry-operations/${retryOperation.operationId}`);if(!current(request,account))return;if(result.task&&validUploadTask(result.task)&&result.task.id===task.id){tasks.value=tasks.value.map(t=>t.id===task.id?result.task!:t);clearRetry();error.value=''}else error.value='尚未查到本次操作，请稍后再核对；如重试请求，沿用原操作号。'}catch(cause){if(current(request,account))error.value=cause instanceof Error?cause.message:'状态未核实'}finally{if(current(request,account))busy.value='';finishCycle()}
 }
-watch([()=>props.authorized,()=>props.available,()=>props.accountId],()=>{generation++;closeTakeover();clearRetry();stopTimer();tasks.value=[];error.value='';historyError.value='';workerWarning.value='';busy.value='';offset.value=0;hasMore.value=true;loading.value=false;loadingMore.value=false;refreshQueued=true;finishCycle()},{immediate:true})
-watch([()=>props.active,()=>props.refreshVersion],()=>{stopTimer();if(!isActive()){closeTakeover();return}refreshQueued=true;finishCycle()})
+watch([()=>props.authorized,()=>props.available,()=>props.accountId],()=>{generation++;listEpoch++;closeTakeover();clearRetry();stopTimer();groupDisclosures.value={};tasks.value=[];error.value='';historyError.value='';workerWarning.value='';busy.value='';offset.value=0;hasMore.value=true;loading.value=false;loadingMore.value=false;refreshQueued=true;finishCycle()},{immediate:true})
+watch([()=>props.active,()=>props.refreshVersion],()=>{listEpoch++;stopTimer();if(!isActive()){loading.value=false;loadingMore.value=false;closeTakeover();return}refreshQueued=true;finishCycle()})
 onBeforeUnmount(()=>{disposed=true;generation++;closeTakeover();stopTimer()})
 </script>
 <template>
   <section class="upload-tasks" aria-label="上传任务"><header class="upload-toolbar"><div><h2>上传任务</h2></div><button class="btn" :disabled="!isActive()||loading||!!busy||retryUncertain" @click="load()">刷新上传任务</button></header>
     <div v-if="error" class="notice danger" role="alert">{{error}}</div><div v-if="workerWarning" class="notice warning">{{workerWarning}}</div>
     <p v-if="!tasks.length" class="upload-empty">暂无上传任务。先在“新建传输→上传准备”预览并保存任务。</p>
-    <CompactRecord v-for="task in tasks" :key="task.id" class="upload-task" :title="task.postTitle" :description="`${task.channelTitle} · ${task.total} 个文件 · 回执 ${task.confirmed} · 已归档 ${task.archived}${task.automation?' · '+task.automation.name:''}`" :status="task.stopRequested&&task.state==='RUNNING'?'当前组继续核对，之后暂停':uploadTaskLabels[task.state]!" :tone="task.state==='COMPLETED'?'success':['NEEDS_REVIEW','SENT_PENDING_ARCHIVE'].includes(task.state)?'warning':['RUNNING','QUEUED'].includes(task.state)?'active':'neutral'" :timestamp="task.updatedAt" :default-expanded="!['COMPLETED','CANCELLED'].includes(task.state)" :alert="task.error"><div class="upload-task-body"><small>{{task.channelTitle}} · {{task.discussionTitle}}</small><h3>{{task.postTitle}}</h3>
+    <CompactRecord v-for="task in tasks" :key="task.id" class="upload-task" :title="task.postTitle" :description="`${task.channelTitle} · ${task.total} 个文件 · 回执 ${task.confirmed} · 已归档 ${task.archived}${task.automation?' · '+task.automation.name:''}`" :status="task.stopRequested&&task.state==='RUNNING'?'当前组继续核对，之后暂停':uploadTaskLabels[task.state]!" :tone="task.state==='COMPLETED'?'success':['NEEDS_REVIEW','SENT_PENDING_ARCHIVE'].includes(task.state)?'warning':['RUNNING','QUEUED'].includes(task.state)?'active':'neutral'" :timestamp="task.updatedAt" :active="active" :default-expanded="false" :alert="task.error"><div class="upload-task-body"><small>{{task.channelTitle}} · {{task.discussionTitle}}</small><h3>{{task.postTitle}}</h3>
       <div v-if="task.automation" class="upload-rule-context"><strong>自动规则：{{task.automation.name}} · v{{task.automation.version}}</strong><p>保存的时段：{{task.automation.windowMode==='ALL_DAY'?'全天':`${task.automation.start}—${task.automation.end}`}} · 北京时间</p><p>{{task.automation.reason}}</p><button v-if="!task.automation.manualTakeover&&!['RUNNING','COMPLETED','CANCELLED'].includes(task.state)" class="btn" :disabled="!!busy||retryUncertain" @click="prepareTakeover(task)">转为手动处理</button></div><p class="upload-count">{{task.total}} 个文件 · 正式回执 {{task.confirmed}} · 已归档 {{task.archived}}</p><p>待上传：<code>{{task.sourceDirectory}}</code><br/>归档至：<code>{{task.archiveDirectory}}</code></p><a :href="task.postLink" target="_blank" rel="noreferrer">核对 Telegram 目标主帖 ↗</a>
       <div v-if="task.error" class="notice warning" role="status">{{task.error}}</div>
-      <section v-for="group in task.groups" :key="group.id" class="upload-task-group"><strong>第 {{group.number}} 组 · {{uploadTypes[group.mediaType as UploadType]??group.mediaType}} · {{group.items.length}} 个</strong><span>{{uploadTaskLabels[group.state]}}</span><p v-if="group.hasRetries">本组有失败成员的独立重试记录；原计划分组保留，实际送达可能分为单条或新相册。</p><p v-if="group.error&&group.error!==task.error" class="notice warning">{{group.error}}</p><details :open="task.state!=='COMPLETED'"><summary>文件清单与回执（{{group.items.length}}）</summary><ul><li v-for="item in group.items" :key="item.id"><div><strong>{{item.fileName}}</strong><small>{{formatMediaBytes(item.size)}} · {{uploadTaskLabels[item.state]}}</small><small v-if="item.formalMessageId">正式消息：{{item.formalMessageId}}</small><code v-if="item.state==='ARCHIVED'">{{item.archivePath}}</code><small v-if="item.error" class="upload-file-error">{{item.error}}</small></div></li></ul></details><button v-if="documentAcceptancePath(task,group.id)" class="btn" :disabled="!!busy" @click="action(task,'accept-document',group.id)">接受按文件送达并归档（不重发）</button></section>
+      <section v-for="group in task.groups" :key="group.id" class="upload-task-group"><strong>第 {{group.number}} 组 · {{uploadTypes[group.mediaType as UploadType]??group.mediaType}} · {{group.items.length}} 个</strong><span>{{uploadTaskLabels[group.state]}}</span><p v-if="group.hasRetries">本组有失败成员的独立重试记录；原计划分组保留，实际送达可能分为单条或新相册。</p><p v-if="group.error&&group.error!==task.error" class="notice warning">{{group.error}}</p><details :open="groupOpen(task,group.id)" @toggle="toggleGroup(task.id,group.id,$event)"><summary>文件清单与回执（{{group.items.length}}）</summary><ul><li v-for="item in group.items" :key="item.id"><div><strong>{{item.fileName}}</strong><small>{{formatMediaBytes(item.size)}} · {{uploadTaskLabels[item.state]}}</small><small v-if="item.formalMessageId">正式消息：{{item.formalMessageId}}</small><code v-if="item.state==='ARCHIVED'">{{item.archivePath}}</code><small v-if="item.error" class="upload-file-error">{{item.error}}</small></div></li></ul></details><button v-if="documentAcceptancePath(task,group.id)" class="btn" :disabled="!!busy" @click="action(task,'accept-document',group.id)">接受按文件送达并归档（不重发）</button></section>
       <p v-if="task.state==='NEEDS_REVIEW'" class="upload-retry-note">这组已有发送记录，不能整组重传。请先核对：成功成员保留，仅明确失败且Telegram允许的成员可重试。</p>
 <section v-if="retryCheck?.taskId===task.id" class="upload-retry-panel" aria-label="失败成员核对">
 <strong>第 {{task.groups.find(g=>g.id===retryCheck!.groupId)?.number}} 组核对结果</strong>

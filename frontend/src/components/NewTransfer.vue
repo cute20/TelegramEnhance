@@ -11,27 +11,30 @@ import { validTask, type CreateDownload, type DownloadTask } from '../downloadTa
 import UploadPreparation from './UploadPreparation.vue'
 import DownloadChannelPreview from './DownloadChannelPreview.vue'
 import type { TaskCategory } from '../taskCategories'
+import type { DownloadCreationSelection, UploadCreationSelection } from '../transferCreation'
 
-const props = defineProps<{ authorized: boolean; available: boolean; accountId: string | null; previewOnly?: boolean; browseSource?: { sourceMode?: 'CHANNEL' | 'POST'; source: string; tags: string; keywords: string } }>()
-const emit = defineEmits<{ close: []; settings: []; tasks: [category: TaskCategory]; accessError: [cause: ApiError] }>()
+const props = defineProps<{ authorized: boolean; available: boolean; accountId: string | null; embedded?:boolean; initialDirection?:'download'|'upload'; selection?:DownloadCreationSelection; uploadSelection?:UploadCreationSelection; previewOnly?: boolean; browseSource?: { sourceMode?: 'CHANNEL' | 'POST'; source: string; tags: string; keywords: string } }>()
+const emit = defineEmits<{ close: []; settings: []; tasks: [category: TaskCategory]; accessError: [cause: ApiError]; locked:[value:boolean]; fieldsLocked:[value:boolean] }>()
 const dialog = ref<HTMLDialogElement | null>(null)
-const direction = ref<'download' | 'upload'>('download')
-const downloadSourceKind = ref<'post'|'channel'>(props.previewOnly && props.browseSource?.sourceMode !== 'POST' ? 'channel' : 'post')
+const direction = ref<'download' | 'upload'>(props.initialDirection??'download')
+const downloadSourceKind = ref<'post'|'channel'>(props.selection ? props.selection.entry==='POST'?'post':'channel' : props.previewOnly && props.browseSource?.sourceMode !== 'POST' ? 'channel' : 'post')
 const channelDownloadLocked=ref(false)
-const link = ref(props.previewOnly && props.browseSource?.sourceMode === 'POST' ? props.browseSource.source : '')
+const channelTransitionLocked=ref(false),uploadTransitionLocked=ref(false)
+const channelFieldsLocked=ref(false),uploadFieldsLocked=ref(false)
+const link = ref(props.selection?.entry==='POST'?props.selection.source:props.previewOnly && props.browseSource?.sourceMode === 'POST' ? props.browseSource.source : '')
 const preview = ref<DownloadPreview | null>(null)
 const collectedMedia = ref<Media[]>([])
 const originPages = ref<Record<string, number>>({})
 const mediaView = ref<'list' | 'cards'>('list')
 const autoPaused = ref(false)
 const autoEpoch = ref(0)
-const selectedTypes = ref<Media['type'][]>(props.previewOnly ? mediaTypes.map(item => item.type) : ['VIDEO'])
+const selectedTypes = ref<Media['type'][]>(props.selection?[...props.selection.types]:props.previewOnly ? mediaTypes.map(item => item.type) : ['VIDEO'])
 const allTypesSelected = computed(() => mediaTypes.every(item => selectedTypes.value.includes(item.type)))
-const includeMain = ref(!!props.previewOnly)
+const includeMain = ref(props.selection?.includeMain??!!props.previewOnly)
 const busy = ref(false)
 const error = ref('')
 const needsPreview = ref(false)
-const targetDirectory = ref('')
+const targetDirectory = ref(props.selection?.targetDirectory??'')
 const excludedKeys = ref<string[]>([])
 const manualSelection = ref<string[] | null>(null)
 const creating = ref(false), createUncertain = ref(false)
@@ -40,6 +43,12 @@ const createdTask = ref<DownloadTask | null>(null)
 let frozenRequest: CreateDownload | null = null
 const downloadLocked = computed(() => creating.value || createUncertain.value || !!createdTask.value || channelDownloadLocked.value)
 const canAccess = computed(() => props.authorized && props.available && !!props.accountId)
+watch([creating,createUncertain,channelTransitionLocked,uploadTransitionLocked],()=>{
+  if(props.embedded)emit('locked',creating.value||createUncertain.value||channelTransitionLocked.value||uploadTransitionLocked.value)
+},{immediate:true,flush:'sync'})
+watch([busy,downloadLocked,channelFieldsLocked,uploadFieldsLocked],()=>{
+  if(props.selection||props.uploadSelection)emit('fieldsLocked',direction.value==='upload'?uploadFieldsLocked.value:busy.value||downloadLocked.value||channelFieldsLocked.value)
+},{immediate:true,flush:'sync'})
 const items = computed(() => selectedPreviewMedia(preview.value?.comments ? {
   ...preview.value, comments: { ...preview.value.comments, media: collectedMedia.value },
 } : preview.value, selectedTypes.value, includeMain.value))
@@ -140,7 +149,7 @@ async function readPreview(next = false) {
 }
 function resetPreview() { generation++; busy.value = false; preview.value = null; collectedMedia.value = []; originPages.value = {}; error.value = ''; needsPreview.value = false; resetDownload(); continueBrowsing() }
 function backToChannel() {
-  if (!props.previewOnly || props.browseSource?.sourceMode === 'POST') return
+  if (downloadLocked.value || !(props.selection&&props.selection.entry!=='POST')&&(!props.previewOnly||props.browseSource?.sourceMode==='POST')) return
   resetPreview()
   downloadSourceKind.value = 'channel'
 }
@@ -148,49 +157,71 @@ async function openChannelPost(value:string){if(downloadLocked.value||busy.value
 watch(direction, resetPreview)
 watch(downloadSourceKind, resetPreview)
 watch(link, resetPreview)
-watch([() => props.authorized, () => props.available, () => props.accountId], (_value, previous) => {
+watch([()=>props.selection?.entry,()=>props.selection?.source],()=>{
+  if(!props.selection||downloadLocked.value)return
   resetPreview()
-  if (previous && props.accountId !== previous[2]) link.value = ''
+  downloadSourceKind.value=props.selection.entry==='POST'?'post':'channel'
+  link.value=props.selection.entry==='POST'?props.selection.source:''
+},{flush:'sync'})
+watch([()=>props.selection?.tags,()=>props.selection?.keywords],()=>{
+  if(!props.selection||props.selection.entry==='POST'||downloadLocked.value)return
+  resetPreview();downloadSourceKind.value='channel'
+},{flush:'sync'})
+watch([()=>JSON.stringify(props.selection?.types),()=>props.selection?.includeMain,()=>props.selection?.targetDirectory],()=>{
+  if(!props.selection||downloadLocked.value||busy.value)return
+  selectedTypes.value=[...props.selection.types];includeMain.value=props.selection.includeMain;targetDirectory.value=props.selection.targetDirectory
+},{flush:'sync'})
+watch([() => props.authorized, () => props.available, () => props.accountId], (value, previous) => {
+  const identityChanged=!previous||value[0]!==previous[0]||value[2]!==previous[2]
+  if(identityChanged){resetPreview();if(previous&&props.accountId!==previous[2])link.value='';return}
+  generation++;busy.value=false;continueBrowsing()
+  if(frozenRequest&&(creating.value||createUncertain.value||createdTask.value)){
+    if(!createdTask.value){createUncertain.value=true;creating.value=false;createError.value='连接中断，已保留创建请求；恢复连接后请核对任务，不会自动重复创建。'}
+    return
+  }
+  preview.value=null;collectedMedia.value=[];originPages.value={};needsPreview.value=false;error.value=''
 })
-onMounted(() => { dialog.value?.showModal(); if (props.previewOnly && downloadSourceKind.value === 'post') void readPreview() })
-onBeforeUnmount(() => { disposed = true; generation++; dialog.value?.close() })
+onMounted(() => { if(!props.embedded)dialog.value?.showModal(); if (props.previewOnly && downloadSourceKind.value === 'post') void readPreview() })
+onBeforeUnmount(() => { disposed = true; generation++; if(props.selection||props.uploadSelection)emit('fieldsLocked',false); if(!props.embedded)dialog.value?.close() })
 </script>
 
 <template>
-  <dialog ref="dialog" class="transfer-dialog" aria-labelledby="transfer-heading" @cancel.prevent="emit('close')">
-    <header class="transfer-heading"><div><span v-if="!previewOnly" class="eyebrow">TRANSFER</span><h2 id="transfer-heading">{{ previewOnly ? '浏览帖子' : '新建传输' }}</h2></div><button class="icon-btn" :aria-label="previewOnly ? '关闭帖子浏览' : '关闭新建传输'" @click="emit('close')"><AppIcon name="close" /></button></header>
-    <div v-if="!previewOnly" class="transfer-direction"><button type="button" :class="{ selected: direction === 'download' }" :aria-pressed="direction === 'download'" :disabled="busy || downloadLocked" @click="direction = 'download'">下载</button><button type="button" :class="{ selected: direction === 'upload' }" :aria-pressed="direction === 'upload'" :disabled="busy || downloadLocked" @click="direction = 'upload'">上传准备</button></div>
-    <UploadPreparation v-if="!previewOnly && direction === 'upload'" :authorized="authorized" :available="available" :account-id="accountId" @settings="emit('settings')" @tasks="emit('tasks', 'upload')" @access-error="emit('accessError', $event)" />
+  <component :is="embedded?'section':'dialog'" ref="dialog" class="transfer-dialog" :class="{embedded}" :aria-labelledby="embedded?undefined:'transfer-heading'" @cancel.prevent="emit('close')">
+    <header v-if="!embedded" class="transfer-heading"><div><span v-if="!previewOnly" class="eyebrow">TRANSFER</span><h2 id="transfer-heading">{{ previewOnly ? '浏览帖子' : '新建传输' }}</h2></div><button class="icon-btn" :aria-label="previewOnly ? '关闭帖子浏览' : '关闭新建传输'" @click="emit('close')"><AppIcon name="close" /></button></header>
+    <div v-if="!previewOnly&&!embedded" class="transfer-direction"><button type="button" :class="{ selected: direction === 'download' }" :aria-pressed="direction === 'download'" :disabled="busy || downloadLocked" @click="direction = 'download'">下载</button><button type="button" :class="{ selected: direction === 'upload' }" :aria-pressed="direction === 'upload'" :disabled="busy || downloadLocked" @click="direction = 'upload'">上传准备</button></div>
+    <UploadPreparation v-if="!previewOnly && direction === 'upload'" :selection="uploadSelection" :authorized="authorized" :available="available" :account-id="accountId" @fields-locked="uploadFieldsLocked=$event" @transition-locked="uploadTransitionLocked=$event" @settings="emit('settings')" @tasks="emit('tasks', 'upload')" @access-error="emit('accessError', $event)" />
     <template v-else>
-    <div v-if="!previewOnly" class="download-source-kind" role="group" aria-label="下载来源方式"><button type="button" :aria-pressed="downloadSourceKind==='post'" :class="{selected:downloadSourceKind==='post'}" :disabled="busy||downloadLocked" @click="downloadSourceKind='post'">主帖链接</button><button type="button" :aria-pressed="downloadSourceKind==='channel'" :class="{selected:downloadSourceKind==='channel'}" :disabled="busy||downloadLocked" @click="downloadSourceKind='channel'">频道扫描预览</button></div>
-    <button v-if="previewOnly && browseSource?.sourceMode !== 'POST' && downloadSourceKind==='post'" class="btn browse-back" @click="backToChannel">返回帖子列表</button>
-    <DownloadChannelPreview v-show="downloadSourceKind==='channel'" :active="downloadSourceKind==='channel'" :authorized="authorized" :available="available" :account-id="accountId" :read-only="previewOnly" :initial-source="previewOnly && browseSource?.sourceMode !== 'POST' ? browseSource : undefined" @open-post="openChannelPost" @locked="channelDownloadLocked=$event" @tasks="emit('tasks', 'batches')" @access-error="emit('accessError',$event)" />
+    <div v-if="!previewOnly&&!selection" class="download-source-kind" role="group" aria-label="下载来源方式"><button type="button" :aria-pressed="downloadSourceKind==='post'" :class="{selected:downloadSourceKind==='post'}" :disabled="busy||downloadLocked" @click="downloadSourceKind='post'">主帖链接</button><button type="button" :aria-pressed="downloadSourceKind==='channel'" :class="{selected:downloadSourceKind==='channel'}" :disabled="busy||downloadLocked" @click="downloadSourceKind='channel'">频道扫描预览</button></div>
+    <button v-if="(selection&&selection.entry!=='POST'||previewOnly&&browseSource?.sourceMode!=='POST')&&downloadSourceKind==='post'" class="btn browse-back" :disabled="downloadLocked" @click="backToChannel">返回帖子列表</button>
+    <DownloadChannelPreview v-show="downloadSourceKind==='channel'" :selection="selection" :active="downloadSourceKind==='channel'" :authorized="authorized" :available="available" :account-id="accountId" :read-only="previewOnly" :initial-source="previewOnly && browseSource?.sourceMode !== 'POST' ? browseSource : undefined" @open-post="openChannelPost" @locked="channelDownloadLocked=$event" @fields-locked="channelFieldsLocked=$event" @transition-locked="channelTransitionLocked=$event" @tasks="emit('tasks', 'batches')" @access-error="emit('accessError',$event)" />
     <template v-if="downloadSourceKind==='post'">
-    <p v-if="!previewOnly" class="transfer-intro">先预览频道主帖及评论媒体。支持当前账号可访问的外部频道，不要求管理员权限，也不会加入“我的资源库”。</p>
-    <p v-if="!previewOnly" class="transfer-limit"><AppIcon name="info" />预览后勾选已加载媒体、填写保存目录，再创建一次性下载任务；不会自动下载未加载内容。</p>
+    <p v-if="!previewOnly&&!selection" class="transfer-intro">先预览频道主帖及评论媒体。支持当前账号可访问的外部频道，不要求管理员权限，也不会加入“我的资源库”。</p>
+    <p v-if="!previewOnly&&!selection" class="transfer-limit"><AppIcon name="info" />预览后勾选已加载媒体、填写保存目录，再创建一次性下载任务；不会自动下载未加载内容。</p>
     <div v-if="!canAccess" class="notice warning" role="status"><span>{{ authorized ? '本机连接暂不可用，请恢复连接后重新预览。' : '请先连接 Telegram，再预览下载来源。' }}</span><button v-if="!authorized" class="btn" @click="emit('settings')">前往设置</button></div>
-    <form class="transfer-source" @submit.prevent="readPreview()"><label for="transfer-link">频道主帖链接</label><div><input id="transfer-link" v-model="link" class="input" type="url" placeholder="https://t.me/…" autocomplete="off" spellcheck="false" :disabled="busy || !canAccess || downloadLocked" :readonly="previewOnly" required /><button class="btn primary" :disabled="busy || !canAccess || downloadLocked || !link.trim()"><AppIcon name="search" />{{ busy ? '正在读取…' : previewOnly ? '刷新帖子' : preview || needsPreview ? '重新预览来源' : '预览下载来源' }}</button></div><small>读取这一条主帖，评论随滚动继续加载；不会自动加入频道或保存到资源库。</small></form>
+    <form v-if="!selection" class="transfer-source" @submit.prevent="readPreview()"><label for="transfer-link">频道主帖链接</label><div><input id="transfer-link" v-model="link" class="input" type="url" placeholder="https://t.me/…" autocomplete="off" spellcheck="false" :disabled="busy || !canAccess || downloadLocked" :readonly="previewOnly" required /><button class="btn primary" :disabled="busy || !canAccess || downloadLocked || !link.trim()"><AppIcon name="search" />{{ busy ? '正在读取…' : previewOnly ? '刷新帖子' : preview || needsPreview ? '重新预览来源' : '预览下载来源' }}</button></div><small>读取这一条主帖，评论随滚动继续加载；不会自动加入频道或保存到资源库。</small></form>
+    <div v-else class="download-select-tools"><button class="btn primary" :disabled="busy||!canAccess||downloadLocked||!link.trim()" @click="readPreview()"><AppIcon name="search" />{{busy?'正在读取…':preview||needsPreview?'重新预览来源':'预览下载来源'}}</button></div>
     <div v-if="error" class="notice danger" role="alert">{{ error }}</div>
     <template v-if="preview">
       <div class="transfer-context"><div><small>{{ preview.post.channelTitle }}</small><strong>{{ preview.post.title }}</strong></div><span class="status-pill" :class="preview.post.mainCoverage === 'COMPLETE' ? 'green' : 'neutral'">{{ preview.post.mainCoverage === 'COMPLETE' ? '主帖范围已核全' : '主帖范围待核实' }}</span></div>
       <div v-if="preview.warnings.length" class="transfer-warnings" role="status"><p v-for="warning in preview.warnings" :key="warning">{{ warning }}</p></div>
-      <fieldset class="transfer-filters" :disabled="busy || downloadLocked"><legend>评论媒体类型 · 可多选</legend><div class="filter-chips"><button type="button" :class="{ selected: allTypesSelected }" :aria-pressed="allTypesSelected" @click="toggleAllTypes">全部</button><button v-for="item in mediaTypes" :key="item.type" type="button" :class="{ selected: selectedTypes.includes(item.type) }" :aria-pressed="selectedTypes.includes(item.type)" @click="toggleType(item.type)">{{ item.label }}</button></div><label class="transfer-include"><input v-model="includeMain" type="checkbox" />包含主帖自身全部媒体</label></fieldset>
+      <fieldset v-if="!selection" class="transfer-filters" :disabled="busy || downloadLocked"><legend>评论媒体类型 · 可多选</legend><div class="filter-chips"><button type="button" :class="{ selected: allTypesSelected }" :aria-pressed="allTypesSelected" @click="toggleAllTypes">全部</button><button v-for="item in mediaTypes" :key="item.type" type="button" :class="{ selected: selectedTypes.includes(item.type) }" :aria-pressed="selectedTypes.includes(item.type)" @click="toggleType(item.type)">{{ item.label }}</button></div><label class="transfer-include"><input v-model="includeMain" type="checkbox" />包含主帖自身全部媒体</label></fieldset>
       <div class="transfer-page-bar"><span>{{ preview.comments ? `本次已读取 ${preview.observedMessages} 条评论消息` : '当前未取得可读取的评论线程' }}</span><strong>{{ preview.exhausted ? '评论历史已到边界' : preview.canContinue ? '向下滚动继续读取' : '评论范围尚未核全' }}</strong></div>
       <div class="transfer-browse-bar"><p class="transfer-count">已展示评论媒体 {{ commentMatches }} 个<span v-if="includeMain"> · 主帖媒体 {{ mainMatches }} 个</span><small>筛选作用于已读范围，仅加载小封面，不下载原媒体。</small></p><MediaViewSwitch v-model="mediaView" /></div>
-      <section v-if="!previewOnly" class="download-create" aria-label="创建下载任务"><div class="download-select-tools"><span>已勾选 {{ selectedDownloadKeys.length }} 个 · 每次最多100个</span><button class="btn" :disabled="downloadLocked" @click="manualSelection = null; excludedKeys = []">全选已加载</button><button class="btn" :disabled="downloadLocked" @click="manualSelection = []">清空选择</button></div><label for="download-directory">保存根目录</label><input id="download-directory" v-model="targetDirectory" class="input" placeholder="例如 D:\TelegramDownloads" autocomplete="off" :disabled="downloadLocked" /><p>任务仅包含本次勾选的媒体；重复媒体也会下载，校验后单独放入指定目录下的“重复媒体”文件夹，并保存来源清单。</p><button v-if="!createdTask && !createUncertain" class="btn primary" :disabled="busy || creating || !targetDirectory.trim() || !selectedDownloadKeys.length || selectedDownloadKeys.length > 100 || !canAccess" @click="createDownload()">{{ creating ? '正在准备下载任务…' : `创建并开始下载（${selectedDownloadKeys.length}）` }}</button><div v-if="createError" class="notice warning" role="alert">{{ createError }}</div><div v-if="createUncertain" class="download-select-tools"><button class="btn" :disabled="creating" @click="lookupDownload">核对下载任务</button><button class="btn" :disabled="creating" @click="createDownload(true)">重试相同创建请求</button></div><div v-if="createdTask" class="notice success" role="status"><span>下载任务已保存，包含 {{ createdTask.total }} 个文件。<template v-if="createdTask.skipped">历史已下载，跳过 {{ createdTask.skipped }} 个。</template></span><button class="btn" @click="emit('tasks', 'download')">查看任务</button></div></section>
+      <section v-if="!previewOnly" class="download-create" aria-label="创建下载任务"><div class="download-select-tools"><span>已勾选 {{ selectedDownloadKeys.length }} 个 · 每次最多100个</span><button class="btn" :disabled="downloadLocked" @click="manualSelection = null; excludedKeys = []">全选已加载</button><button class="btn" :disabled="downloadLocked" @click="manualSelection = []">清空选择</button></div><template v-if="!selection"><label for="download-directory">保存根目录</label><input id="download-directory" v-model="targetDirectory" class="input" placeholder="例如 D:\TelegramDownloads" autocomplete="off" :disabled="downloadLocked" /></template><p>任务仅包含本次勾选的媒体；重复媒体也会下载，校验后单独放入指定目录下的“重复媒体”文件夹。</p><button v-if="!createdTask && !createUncertain" class="btn primary" :disabled="busy || creating || !targetDirectory.trim() || !selectedDownloadKeys.length || selectedDownloadKeys.length > 100 || !canAccess" @click="createDownload()">{{ creating ? '正在准备下载任务…' : `创建并开始下载（${selectedDownloadKeys.length}）` }}</button><div v-if="createError" class="notice warning" role="alert">{{ createError }}</div><div v-if="createUncertain" class="download-select-tools"><button class="btn" :disabled="creating" @click="lookupDownload">核对下载任务</button><button class="btn" :disabled="creating" @click="createDownload(true)">重试相同创建请求</button></div><div v-if="createdTask" class="notice success" role="status"><span>下载任务已保存，包含 {{ createdTask.total }} 个文件。<template v-if="createdTask.skipped">历史已下载，跳过 {{ createdTask.skipped }} 个。</template></span><button class="btn" @click="emit('tasks', 'download')">查看任务</button></div></section>
       <MediaCollection :items="items" :layout="mediaView" :empty-text="emptyText" :post-key="preview.post.key" :account-id="accountId" :download-preview-id="preview.id" :origins="originPages" :version="0" :authorized="authorized" :available="canAccess && !needsPreview" :selectable="!previewOnly" :selected-keys="selectedDownloadKeys" :selection-disabled="downloadLocked" @toggle-media="toggleDownload" />
       <InfiniteLoad :has-more="preview.canContinue" :busy="busy" :blocked="needsPreview || autoPaused || downloadLocked || !canAccess || !selectedTypes.length" :version="preview.pageNumber + ':' + autoEpoch" :context="preview.id + ':' + mediaView + ':' + selectedTypes.join(',') + ':' + includeMain" @load="loadMore" />
       <div v-if="autoPaused" class="notice warning" role="status"><span>本次连续预览达到200批或20分钟，已暂停，尚未表示读完。</span><button class="btn" @click="continueBrowsing">继续滚动加载</button></div>
       <details class="transfer-text"><summary>主帖全文</summary><p>{{ preview.post.text || '主帖没有文字' }}</p></details>
     </template>
-    <footer class="transfer-footer"><span>预览不会写入业务索引；关闭或重启后请重新预览。</span><button type="button" class="btn" @click="emit('close')">关闭预览</button></footer>
+    <footer class="transfer-footer"><span v-if="!embedded">预览不会写入业务索引；关闭或重启后请重新预览。</span><button type="button" class="btn" :disabled="embedded&&(creating||createUncertain||channelTransitionLocked||uploadTransitionLocked)" @click="emit('close')">{{embedded?'取消':'关闭预览'}}</button></footer>
     </template>
-    <footer v-else class="transfer-footer"><span>{{ previewOnly ? '仅浏览规则来源，不创建下载任务。' : '扫描和准备清单只读；确认“创建并开始批量下载”后才下载原媒体。' }}</span><button type="button" class="btn" @click="emit('close')">关闭预览</button></footer>
+    <footer v-else class="transfer-footer"><span v-if="!embedded">{{ previewOnly ? '仅浏览规则来源，不创建下载任务。' : '扫描和准备清单只读；确认“创建并开始批量下载”后才下载原媒体。' }}</span><button type="button" class="btn" :disabled="embedded&&(creating||createUncertain||channelTransitionLocked||uploadTransitionLocked)" @click="emit('close')">{{embedded?'取消':'关闭预览'}}</button></footer>
     </template>
-  </dialog>
+  </component>
 </template>
 
 <style scoped>
+.transfer-dialog.embedded{width:auto;max-width:none;max-height:none;overflow:visible;border:0;border-radius:0;padding:0;box-shadow:none;margin:0;background:transparent}
 .download-source-kind{display:flex;gap:6px;margin:18px 0}.download-source-kind button{padding:8px 13px;border:1px solid #dfe8ef;border-radius:5px;background:white;color:#8199ad;font-size:11px}.download-source-kind button.selected{background:#203f56;color:white;border-color:#203f56}
 .transfer-direction>button{display:flex;gap:7px;align-items:center;padding:7px 12px;border:1px solid #dfe8f0;border-radius:5px;background:#fff;color:#829bae;font-size:12px;cursor:pointer}.transfer-direction>button:disabled{opacity:.5;cursor:default}
 .download-create{padding:14px;background:#f6f9fc;border:1px solid #e0eaf2;border-radius:6px;margin:15px 0}.download-select-tools{display:flex;align-items:center;gap:8px;flex-wrap:wrap;font-size:10px;color:#879faf;margin-bottom:12px}.download-select-tools .btn{min-height:26px;font-size:9px;padding:4px 7px}.download-create>label{display:block;font-size:10px;margin:10px 0 7px}.download-create>p{font-size:9px;line-height:1.9;color:#96aab9;margin:8px 0 12px}.download-create>.btn{font-size:10px}.download-create .notice{margin-top:12px}

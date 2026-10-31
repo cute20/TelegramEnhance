@@ -96,8 +96,8 @@ class ApiError extends Error { constructor(message, status) { super(message); th
 function mount(t, initial = view(), overrides = {}, cachedChannels = true) {
   const props = vue.reactive({ authorized: true, available: true, accountId: '1', ...overrides })
   const accessible = props.authorized && props.available && props.accountId
-  const steps = accessible ? [{ path: BASE, value: initial instanceof Promise || initial instanceof Error ? initial : listing(Array.isArray(initial) ? initial : [initial]) }] : []
-  const calls = [], failures = [], hooks = [], timers = [], events = []
+  const steps = accessible && !props.createOnly ? [{ path: BASE, value: initial instanceof Promise || initial instanceof Error ? initial : listing(Array.isArray(initial) ? initial : [initial]) }] : []
+  const calls = [], failures = [], hooks = [], mountedHooks = [], timers = [], events = []
   let active = 0, maxActive = 0
   const api = async (path, options = {}) => {
     calls.push({ path, options }); active++; maxActive = Math.max(maxActive, active)
@@ -109,7 +109,7 @@ function mount(t, initial = view(), overrides = {}, cachedChannels = true) {
       return await expected.value
     } finally { active-- }
   }
-  const modules = { vue: { ...vue, onBeforeUnmount: hook => hooks.push(hook) }, '../api': { api, ApiError }, '../downloadRules': rules,
+  const modules = { vue: { ...vue, onMounted: hook => mountedHooks.push(hook), onBeforeUnmount: hook => hooks.push(hook) }, '../api': { api, ApiError }, '../downloadRules': rules,
     '../downloadChannel': channels, '../downloadTasks': tasks, '../rules': ruleModule }
   const module = { exports: {} }
   new Function('require', 'module', 'exports', 'setTimeout', 'clearTimeout', compiled)(name => {
@@ -121,10 +121,11 @@ function mount(t, initial = view(), overrides = {}, cachedChannels = true) {
   // Most behavior tests reuse a successfully loaded channel list. Discovery
   // tests opt out to exercise the actual first-open automatic request.
   if (cachedChannels) state.channels.value = { items: [{ id: '-1001', title: '合成频道' }], scope: 'READABLE_CHANNELS', partial: false, warnings: [] }
-  let dead = false
+  let dead = false, didMount = false
+  const mounted = () => { if (!didMount && !dead) { didMount = true; mountedHooks.forEach(hook => hook()) } }
   const destroy = () => { if (!dead) { dead = true; hooks.forEach(hook => hook()); scope.stop() } }
   t.after(() => { destroy(); assert.deepEqual(failures, []); assert.equal(steps.length, 0) })
-  return { state, props, calls, timers, events, destroy, maxActive: () => maxActive,
+  return { state, props, calls, timers, events, destroy, mounted, maxActive: () => maxActive,
     expect: (path, value, method = 'GET', body) => steps.push({ path, value, method, body }) }
 }
 const fill = state => { state.edit(null); Object.assign(state.form, input()) }
@@ -494,4 +495,77 @@ test('progress distinguishes directory boundary, unread/unresolved work, explici
   assert.match(text, /待读取\/核对 2（其中异常 1）/); assert.match(text, /已保存 1/); assert.doesNotMatch(text, /100%|全部完成/)
   assert.match(f.state.rangeSummary(value), /本轮主帖目录已到边界；评论和待核实范围仍分别处理/)
   assert.match(f.state.rangeSummary(view({ rule: { input: postInput() } })), /范围固定为这条主帖/)
+})
+
+test('embedded creation opens the same download form and discovers channels without reading the management list', async t => {
+  const f = mount(t, [], { createOnly: true, embedded: true }, false)
+  assert.equal(f.calls.length, 0); assert.equal(f.state.formOpen.value, false)
+  f.expect('/transfers/download/channels', discoveredChannels()); f.mounted(); await flush()
+  assert.equal(f.state.formOpen.value, true); assert.equal(f.state.editing.value, null)
+  assert.equal(f.state.sourceEntry.value, 'CHANNEL'); assert.deepEqual(f.state.form.types, ['VIDEO'])
+  assert.equal(f.state.channels.value.items.length, 1); assert.deepEqual(f.state.items.value, [])
+  await f.state.refresh(); f.props.refreshVersion = 1; await flush()
+  assert.deepEqual(f.calls.map(call => call.path), ['/transfers/download/channels'])
+  assert.equal(f.events.some(event => event[0] === 'saved'), false)
+  f.state.closeForm(); assert.equal(f.state.formOpen.value, false)
+  assert.deepEqual(f.events.at(-1), ['close'])
+})
+
+test('embedded creation saves one paused rule and releases its lock before notifying the unified composer', async t => {
+  const f = mount(t, [], { createOnly: true, embedded: true }); f.mounted(); await flush()
+  Object.assign(f.state.form, input())
+  f.expect(BASE, view(), 'POST'); await f.state.save()
+  assert.equal(f.calls.length, 1); assert.equal(f.calls[0].options.method, 'POST')
+  assert.match(f.calls[0].options.body.operationId, /^[0-9a-f-]{36}$/)
+  assert.equal(f.state.items.value[0].rule.enabled, false); assert.equal(f.state.formOpen.value, false)
+  assert.deepEqual(f.events.slice(-2), [['locked', false], ['saved', 'download']])
+  assert.equal(f.calls.some(call => call.path.includes('/enabled') || call.path.includes('/transfers/')), false)
+})
+
+test('embedded unknown create cannot close or resubmit and only a confirmed paused GET emits saved', async t => {
+  const f = mount(t, [], { createOnly: true, embedded: true }); f.mounted(); await flush()
+  Object.assign(f.state.form, input())
+  f.expect(BASE, new Error('synthetic save timeout'), 'POST'); await f.state.save()
+  const operation = f.state.uncertain.value.operationId
+  assert.equal(f.state.formOpen.value, true); assert.deepEqual(f.events.at(-1), ['locked', true])
+  f.state.closeForm(); await f.state.save()
+  assert.equal(f.state.formOpen.value, true); assert.equal(f.calls.length, 1)
+  assert.equal(f.events.some(event => event[0] === 'close' || event[0] === 'saved'), false)
+  f.expect(BASE + '/by-operation/' + operation, null); await f.state.lookup()
+  assert.equal(f.state.uncertain.value.operationId, operation); assert.equal(f.state.formOpen.value, true)
+  f.expect(BASE + '/by-operation/' + operation, view()); await f.state.lookup()
+  assert.equal(f.state.uncertain.value, null); assert.equal(f.state.items.value[0].rule.enabled, false)
+  assert.deepEqual(f.events.slice(-2), [['locked', false], ['saved', 'download']])
+  assert.equal(f.calls.filter(call => call.options.method === 'POST').length, 1)
+  assert.ok(f.calls.slice(1).every(call => call.path === BASE + '/by-operation/' + operation && !call.options.method))
+})
+
+test('embedded creation preserves its draft and original operation through service interruption without list GET or replay', async t => {
+  const f = mount(t, [], { createOnly: true, embedded: true }); f.mounted(); await flush()
+  f.state.selectSourceEntry('MANUAL'); Object.assign(f.state.form, input(), { name: 'recover this unsaved selection', types: ['PHOTO', 'DOCUMENT'], includeMain: true })
+  const draft = copy(f.state.form), response = deferred()
+  f.expect(BASE, response.promise, 'POST'); const saving = f.state.save()
+  const operation = f.calls[0].options.body.operationId
+  f.props.available = false; await flush()
+  assert.equal(f.state.formOpen.value, true); assert.deepEqual(f.state.form, draft)
+  assert.equal(f.state.sourceEntry.value, 'MANUAL'); assert.equal(f.state.uncertain.value.operationId, operation)
+  f.state.closeForm(); assert.equal(f.state.formOpen.value, true)
+  f.props.available = true; await flush(); assert.equal(f.calls.length, 1)
+  response.resolve(view({ rule: { input: draft } })); await saving; await flush()
+  assert.equal(f.state.uncertain.value.operationId, operation); assert.deepEqual(f.state.form, draft)
+  assert.equal(f.events.some(event => event[0] === 'saved'), false)
+  await f.state.save(); assert.equal(f.calls.length, 1)
+  f.expect(BASE + '/by-operation/' + operation, view({ rule: { input: draft } })); await f.state.lookup()
+  assert.equal(f.state.items.value[0].rule.enabled, false); assert.deepEqual(f.events.at(-1), ['saved', 'download'])
+  assert.equal(f.calls.filter(call => call.options.method === 'POST').length, 1)
+})
+
+test('embedded creation never accepts an unexpectedly enabled receipt as a confirmed save', async t => {
+  const f = mount(t, [], { createOnly: true, embedded: true }); f.mounted(); await flush()
+  Object.assign(f.state.form, input()); f.expect(BASE, enabled(), 'POST'); await f.state.save()
+  assert.equal(f.state.formOpen.value, true); assert.ok(f.state.uncertain.value)
+  assert.equal(f.state.items.value.length, 0); assert.deepEqual(f.events.at(-1), ['locked', true])
+  assert.equal(f.events.some(event => event[0] === 'saved'), false)
+  f.state.closeForm(); assert.equal(f.state.formOpen.value, true)
+  assert.equal(f.calls.length, 1)
 })

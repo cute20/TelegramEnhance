@@ -2,7 +2,7 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
 import AppIcon from './components/AppIcon.vue'
 import LibraryWorkspace from './components/LibraryWorkspace.vue'
-import NewTransfer from './components/NewTransfer.vue'
+import TransferComposer from './components/TransferComposer.vue'
 import TransferTasks from './components/TransferTasks.vue'
 import RuleWorkspace from './components/RuleWorkspace.vue'
 import ThumbnailCacheSettings from './components/ThumbnailCacheSettings.vue'
@@ -37,8 +37,25 @@ const proxyTestCurrent = ref(false)
 const confirmation = ref<'logout' | null>(null)
 const dialog = ref<HTMLDialogElement | null>(null)
 const newTransferOpen = ref(false)
+const transferDirection = ref<'download'|'upload'>('download'),transferMode=ref<'ONCE'|'RULE'>('ONCE')
+const ruleCategory=ref<'download'|'upload'>('download'),ruleRefresh=ref(0)
+function openTransfer(direction:'download'|'upload'='download',mode:'ONCE'|'RULE'='ONCE') {
+  if(!canOperate.value||!['download','upload'].includes(direction)||!['ONCE','RULE'].includes(mode))return
+  transferDirection.value=direction;transferMode.value=mode;newTransferOpen.value=true
+}
+function openRule(direction:'download'|'upload'){openTransfer(direction,'RULE')}
+function ruleSaved(direction:'download'|'upload'){
+  if(!['download','upload'].includes(direction))return
+  newTransferOpen.value=false;ruleCategory.value=direction;ruleRefresh.value++;page.value='rules'
+}
 const taskRefresh = ref(0)
 const taskCategory = ref<TaskCategory>('download')
+function navigate(next: Page) {
+  if (!navigation.some(item => item.id === next) || page.value === next) return
+  page.value = next
+  settingsReadGeneration++
+  if (next === 'settings') void refreshSettingsPage()
+}
 function openTasks(category: TaskCategory = 'download') {
   if (!validTaskCategory(category)) return
   taskCategory.value = category; taskRefresh.value++; newTransferOpen.value = false; page.value = 'tasks'
@@ -48,6 +65,7 @@ let pollTimer: number | undefined
 let clockTimer: number | undefined
 let disposed = false
 let statusRequestPending = false
+let settingsReadGeneration = 0, settingsVersion = 0, settingsReadPending = false, settingsReadQueued = false
 
 const authLabels: Record<string, string> = {
   DISCONNECTED: '尚未连接', STARTING: '正在启动', WAIT_PHONE: '等待手机号', WAIT_CODE: '等待验证码',
@@ -115,11 +133,33 @@ function applyTelegram(status: TelegramStatus) {
   telegram.value = status
 }
 function applySettings(settings: Settings) {
+  settingsVersion++
   savedSettings.value = settings
   Object.assign(form, {
     apiId: settings.apiId ? String(settings.apiId) : '', apiHash: '', proxyType: settings.proxy.type,
     host: settings.proxy.host ?? '', port: settings.proxy.port ? String(settings.proxy.port) : '', username: settings.proxy.username ?? '', password: '',
   })
+}
+async function refreshSettingsPage() {
+  if (disposed || exited.value || accessInvalid.value || loading.value || busy.value || !hasAppToken || page.value !== 'settings') return
+  if (settingsReadPending) { settingsReadQueued = true; return }
+  const request = settingsReadGeneration, version = settingsVersion, wasDirty = dirty.value
+  settingsReadPending = true; settingsReadQueued = false
+  const current = () => !disposed && !exited.value && !accessInvalid.value && page.value === 'settings'
+    && request === settingsReadGeneration && version === settingsVersion && !busy.value
+  try {
+    const results = await Promise.allSettled([api<Settings>('/settings'), api<Diagnostics>('/diagnostics')])
+    if (!current()) return
+    const [settings, runtime] = results
+    if (runtime.status === 'fulfilled') diagnostics.value = runtime.value
+    // A navigation read must never replace a draft or a newer save response.
+    if (settings.status === 'fulfilled' && !wasDirty && !dirty.value) applySettings(settings.value)
+    const failed = results.find(result => result.status === 'rejected')
+    if (failed?.status === 'rejected') reportError(failed.reason)
+  } finally {
+    settingsReadPending = false
+    if (settingsReadQueued) { settingsReadQueued = false; void refreshSettingsPage() }
+  }
 }
 function stopPolling() { window.clearTimeout(pollTimer); pollTimer = undefined }
 function schedulePoll() {
@@ -265,7 +305,7 @@ onBeforeUnmount(() => { disposed = true; stopPolling(); window.clearInterval(clo
       <div class="brand"><span class="brand-mark"><AppIcon name="telegram" /></span><div><span class="brand-name">Telegram 资源台</span><small>RESOURCE WORKBENCH</small></div></div>
       <p class="nav-caption">工作空间</p>
       <nav>
-        <button v-for="item in navigation" :key="item.id" :class="['nav-item', { active: page === item.id }]" :aria-current="page === item.id ? 'page' : undefined" :aria-label="item.label" @click="page = item.id">
+        <button v-for="item in navigation" :key="item.id" :class="['nav-item', { active: page === item.id }]" :aria-current="page === item.id ? 'page' : undefined" :aria-label="item.label" @click="navigate(item.id)">
           <AppIcon :name="item.icon" /><span>{{ item.label }}</span>
         </button>
       </nav>
@@ -275,7 +315,7 @@ onBeforeUnmount(() => { disposed = true; stopPolling(); window.clearInterval(clo
       </div>
     </aside>
     <div class="workspace">
-      <header class="topbar"><div class="breadcrumb"><span>工作空间</span><AppIcon name="chevron" /><strong>{{ currentPage.label }}</strong></div><div class="top-actions"><button class="btn new-transfer" :disabled="!canOperate" @click="newTransferOpen = true"><AppIcon name="plus" />新建传输</button></div></header>
+      <header class="topbar"><div class="breadcrumb"><span>工作空间</span><AppIcon name="chevron" /><strong>{{ currentPage.label }}</strong></div><div class="top-actions"><button class="btn new-transfer" :disabled="!canOperate" @click="openTransfer()"><AppIcon name="plus" />新建传输</button></div></header>
       <main id="main" tabindex="-1">
         <div class="page-heading"><div><div class="eyebrow">{{ page === 'settings' ? 'PREFERENCES' : 'WORKSPACE' }}</div><h1>{{ currentPage.label }}</h1><p v-if="page === 'settings'">配置本机连接，安全地接入你的 Telegram 账号。</p></div><button v-if="page === 'settings'" type="button" class="btn close-project" :disabled="!canOperate" @click="exitProject"><AppIcon name="power" />{{ busy === 'exit' ? '正在关闭…' : '关闭项目' }}</button></div>
         <div v-if="exited" class="notice success service-notice" role="status"><AppIcon name="check" /><div><strong>已请求关闭项目</strong><p>后台正在保存并退出，Telegram 会话保留。再次使用时，请重新运行项目启动脚本。</p></div></div>
@@ -341,15 +381,15 @@ onBeforeUnmount(() => { disposed = true; stopPolling(); window.clearInterval(clo
             </aside>
           </div>
         </template>
-        <LibraryWorkspace v-else-if="page === 'library'" :authorized="telegram?.authState === 'READY'" :available="serviceReachable && !loading && !accessInvalid && !exited" :account-id="telegram?.userId ?? null" @settings="page = 'settings'" @access-error="reportError" />
-        <RuleWorkspace @tasks="openTasks" v-else-if="page === 'rules'" :authorized="telegram?.authState === 'READY'" :available="serviceReachable && !loading && !accessInvalid && !exited" :account-id="telegram?.userId ?? null" @access-error="reportError" />
-        <section v-else-if="page !== 'tasks'" class="empty-state"><span class="empty-state-icon"><AppIcon :name="currentPage.icon" /></span><h2>{{ currentPage.label }}暂不可用</h2><p>请在设置中检查本机服务与 Telegram 连接状态。</p><button class="btn primary" @click="page = 'settings'">返回设置<AppIcon name="arrow" /></button></section>
+        <LibraryWorkspace v-else-if="page === 'library'" :authorized="telegram?.authState === 'READY'" :available="serviceReachable && !loading && !accessInvalid && !exited" :account-id="telegram?.userId ?? null" @settings="navigate('settings')" @access-error="reportError" />
+        <RuleWorkspace @tasks="openTasks" v-else-if="page === 'rules'" :category="ruleCategory" :refresh-version="ruleRefresh" :authorized="telegram?.authState === 'READY'" :available="serviceReachable && !loading && !accessInvalid && !exited" :account-id="telegram?.userId ?? null" @create="openRule" @access-error="reportError" />
+        <section v-else-if="page !== 'tasks'" class="empty-state"><span class="empty-state-icon"><AppIcon :name="currentPage.icon" /></span><h2>{{ currentPage.label }}暂不可用</h2><p>请在设置中检查本机服务与 Telegram 连接状态。</p><button class="btn primary" @click="navigate('settings')">返回设置<AppIcon name="arrow" /></button></section>
         <TransferTasks v-show="page === 'tasks'" :active="page === 'tasks'" v-model:category="taskCategory" :refresh-version="taskRefresh" :authorized="telegram?.authState === 'READY'" :available="serviceReachable && !loading && !accessInvalid && !exited" :account-id="telegram?.userId ?? null" @access-error="reportError" />
       </main>
       <footer class="statusbar"><span><span :class="['connection-dot', { online: connected && telegram?.connectionState === 'READY' }]" />{{ connectionLabel }}</span><span>本机单账号<span class="footer-divider">|</span>会话与媒体目录分开管理</span></footer>
     </div>
   </div>
-  <NewTransfer v-if="newTransferOpen" :authorized="telegram?.authState === 'READY'" :available="serviceReachable && !loading && !accessInvalid && !exited" :account-id="telegram?.userId ?? null" @close="newTransferOpen = false" @settings="newTransferOpen = false; page = 'settings'" @tasks="openTasks" @access-error="reportError" />
+  <TransferComposer v-if="newTransferOpen" :initial-direction="transferDirection" :initial-mode="transferMode" :authorized="telegram?.authState === 'READY'" :available="serviceReachable && !loading && !accessInvalid && !exited" :account-id="telegram?.userId ?? null" @close="newTransferOpen = false" @settings="newTransferOpen = false; navigate('settings')" @saved="ruleSaved" @tasks="openTasks" @access-error="reportError" />
   <dialog ref="dialog" class="confirmation-dialog" aria-labelledby="confirmation-heading" @cancel="confirmation = null">
     <div class="dialog-heading"><span class="dialog-icon"><AppIcon name="shield" /></span><h2 id="confirmation-heading">注销本机 Telegram 会话？</h2></div>
     <p>这会让当前设备的 Telegram 会话失效。下次连接需要重新输入手机号、验证码及必要的两步验证。</p>

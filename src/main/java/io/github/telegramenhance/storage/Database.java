@@ -20,7 +20,7 @@ import org.springframework.stereotype.Component;
 /** One process owns one connection. Callbacks must contain only short local SQL work. */
 @Component
 public final class Database implements AutoCloseable {
-    public static final int SCHEMA_VERSION = 15;
+    public static final int SCHEMA_VERSION = 16;
     private static final int BUSY_TIMEOUT_MS = 5_000;
     private final Path databasePath;
     private final Connection connection;
@@ -506,10 +506,41 @@ public final class Database implements AutoCloseable {
                         """);
                     statement.execute("CREATE INDEX download_rule_media_task ON download_rule_media(task_id,item_id)");
                 }
+                if (oldVersion < 16) allowDuplicatePlansWithoutManifests(sql);
                 statement.execute("PRAGMA user_version=" + SCHEMA_VERSION);
             }
             return null;
         });
+    }
+
+    private static void allowDuplicatePlansWithoutManifests(Connection sql) throws SQLException {
+        var schemaObjects = new java.util.ArrayList<String>();
+        try (var query = sql.prepareStatement("SELECT sql FROM sqlite_master WHERE tbl_name='download_output_plans' AND type IN ('index','trigger') AND sql IS NOT NULL ORDER BY type,name");
+             var rows = query.executeQuery()) {
+            while (rows.next()) schemaObjects.add(rows.getString(1));
+        }
+        try (var statement = sql.createStatement()) {
+            statement.execute("""
+                CREATE TABLE download_output_plans_v16 (
+                    item_id TEXT PRIMARY KEY NOT NULL REFERENCES download_items(item_id),relative_path TEXT NOT NULL,
+                    sha256 TEXT NOT NULL CHECK(length(sha256)=64 AND sha256 NOT GLOB '*[^0-9a-f]*'),
+                    duplicate_of TEXT REFERENCES download_completion_log(item_id),reason TEXT NOT NULL,
+                    manifest_relative TEXT,planned_at INTEGER NOT NULL,
+                    CHECK((duplicate_of IS NULL AND manifest_relative IS NULL AND reason='NEW')
+                       OR (duplicate_of IS NOT NULL AND reason IN ('SOURCE_MESSAGE','FILE_ID','CONTENT_SHA'))))
+                """);
+            // Keep row identities as well as every frozen value; existing sidecars remain part of old plans.
+            statement.execute("""
+                INSERT INTO download_output_plans_v16(rowid,item_id,relative_path,sha256,duplicate_of,reason,manifest_relative,planned_at)
+                SELECT rowid,item_id,relative_path,sha256,duplicate_of,reason,manifest_relative,planned_at FROM download_output_plans
+                """);
+            statement.execute("DROP TABLE download_output_plans");
+            statement.execute("ALTER TABLE download_output_plans_v16 RENAME TO download_output_plans");
+            for (String object : schemaObjects) statement.execute(object);
+            try (var violations = statement.executeQuery("PRAGMA foreign_key_check")) {
+                if (violations.next()) throw new SQLException("下载输出计划迁移后外键核对失败，已回滚升级");
+            }
+        }
     }
 
     private int intPragma(String pragma) throws SQLException {

@@ -100,7 +100,7 @@ export function validBatchTaskDetail(value: unknown, batch: DownloadBatchStatus,
   const member = batch.tasks.find(item => item.id === taskId)
   const root = normalizePath(batch.snapshot.targetDirectory), target = normalizePath(task?.targetDirectory)
   return !!member && validTask(task) && task.id === taskId && task.title === member.title && typeof task.channelTitle === 'string'
-    && root !== null && target !== null && target.startsWith(root + '/')
+    && root !== null && target !== null && (target === root || target.startsWith(root + '/'))
     && normalizePath(task.duplicateDirectory) === root + '/重复媒体' && task.total === member.total && task.totalBytes === member.totalBytes
     && (member.state !== 'COMPLETED' || task.state === 'COMPLETED' && task.completed === member.completed && task.skipped === member.skipped && task.duplicates === member.duplicates)
 }

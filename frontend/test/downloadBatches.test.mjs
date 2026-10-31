@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import test from 'node:test'
 import * as vue from 'vue'
-import { parse, compileScript } from 'vue/compiler-sfc'
+import { parse, compileScript, compileTemplate } from 'vue/compiler-sfc'
 import ts from 'typescript'
 import * as library from '../src/library.ts'
 import * as taskModule from '../src/downloadTasks.ts'
@@ -93,12 +93,18 @@ test('frozen membership, root and completed facts cannot change, while native ca
   assert.equal(batchModule.validBatchStatus(batch([summary({ title: 'Other post' })]), previous), false)
 })
 
-test('child file detail belongs to a known frozen member and its descendant output directory, not necessarily the root or old channel title', () => {
+test('child file detail accepts the selected root or an old frozen descendant while preserving member and path boundaries', () => {
   const saved = batch()
   assert.equal(batchModule.validBatchTaskDetail(fullTask(), saved, TASK), true)
   assert.equal(batchModule.validBatchTaskDetail(fullTask(undefined, { targetDirectory: 'd:/BATCH/频道/主帖', duplicateDirectory: 'd:/BATCH/重复媒体/' }), saved, TASK), true)
-  for (const change of [{ id: id(101) }, { targetDirectory: ROOT }, { targetDirectory: ROOT + '-other\\post' },
-    { targetDirectory: ROOT + '\\..\\foreign' }, { targetDirectory: '\\\\server\\batch\\post' }, { duplicateDirectory: ROOT + '\\other' }, { title: 'Another post' }]) {
+  const flat = fullTask(undefined, { targetDirectory: ROOT }); flat.items[0].outputPath = ROOT + '\\synthetic.txt'
+  assert.equal(batchModule.validBatchTaskDetail(flat, saved, TASK), true)
+  for (const targetDirectory of ['d:/BATCH', 'd:/BATCH/', 'D:\\batch\\']) {
+    assert.equal(batchModule.validBatchTaskDetail({ ...flat, targetDirectory, duplicateDirectory: 'd:/BATCH/重复媒体/' }, saved, TASK), true)
+  }
+  for (const change of [{ id: id(101) }, { targetDirectory: ROOT + '-other\\post' }, { targetDirectory: ROOT + '2' },
+    { targetDirectory: 'C:\\batch' }, { targetDirectory: ROOT + '\\..\\foreign' }, { targetDirectory: ROOT + '\\sub\\..' },
+    { targetDirectory: '\\\\server\\batch\\post' }, { duplicateDirectory: ROOT + '\\other' }, { title: 'Another post' }]) {
     assert.equal(batchModule.validBatchTaskDetail(fullTask(undefined, change), saved, TASK), false)
   }
   assert.equal(batchModule.validBatchTaskDetail(fullTask(), saved, id(999)), false)
@@ -138,6 +144,23 @@ function mount(t, initial = batch(), propsOverride = {}) {
   t.after(() => { destroy(); assert.deepEqual(failures, []); assert.equal(steps.length, 0) })
   return { state, props, calls, timers, events, destroy, expect: (path, value, method = 'GET') => steps.push({ path, value, method }) }
 }
+function renderBatchRecords(f){
+  const template=compileTemplate({source:parsed.descriptor.template.content,filename:'DownloadBatches.vue',id:'DownloadBatches',compilerOptions:{mode:'function',expressionPlugins:['typescript']}})
+  assert.deepEqual(template.errors,[])
+  const code=ts.transpileModule(template.code,{compilerOptions:{module:ts.ModuleKind.CommonJS,target:ts.ScriptTarget.ES2022}}).outputText
+  const render=new Function('Vue',code)({...vue,resolveComponent:name=>name}),records=[]
+  function visit(node){if(!node||typeof node!=='object')return;if(node.type==='CompactRecord')records.push(node);if(Array.isArray(node.children))node.children.forEach(visit)}
+  visit(render(vue.proxyRefs({...f.state,...f.props}),[]));return records
+}
+test('batch records pass activity and default closed without discarding cached child selection or unknown state',async t=>{
+  const saved=batch(),f=mount(t,saved,{active:true});await flush()
+  f.expect('/transfers/download/tasks/'+TASK,fullTask());await f.state.showTask(saved,TASK)
+  let records=renderBatchRecords(f);assert.equal(records[0].props.active,true);assert.equal(records[0].props['default-expanded'],false)
+  f.props.active=false;await flush();records=renderBatchRecords(f);assert.equal(records[0].props.active,false);assert.equal(f.state.detailTaskId.value,TASK);assert.ok(f.state.taskDetail.value)
+  const fresh=batch([summary({id:id(102),state:'RUNNING'})],{id:id(2),createdAt:30,updatedAt:30})
+  f.expect(LIST,{items:[fresh,saved],workerWarning:null});f.expect('/transfers/download/tasks/'+TASK,fullTask());f.props.active=true;await flush()
+  records=renderBatchRecords(f);assert.equal(records.length,2);assert.equal(records[0].key,fresh.id);assert.ok(records.every(record=>record.props.active===true&&record.props['default-expanded']===false));assert.equal(f.state.detailTaskId.value,TASK)
+})
 
 test('compact history starts with only a bounded GET, never resumes completed or paused tasks on view', async t => {
   const completed = batch([done()]), f = mount(t, completed)
@@ -319,7 +342,21 @@ test('unmount stops polling and discards late child file details', async t => {
   assert.equal(f.timers.filter(timer => !timer.cancelled).length, 0)
 })
 
-test('child detail is fetched only on demand and a new child summary invalidates stale file detail without another GET', async t => {
+test('flat batch child GET accepts saved duplicate media without a source JSON instead of rejecting the selected root', async t => {
+  const member = done({ duplicates: 1 }), saved = batch([member]), detail = fullTask(member, { targetDirectory: ROOT, duplicates: 1 })
+  detail.items[0].outputPath = ROOT + '\\重复媒体\\synthetic.txt'
+  detail.items[0].duplicate = { itemId: 'original-item', reason: 'CONTENT_SHA', sourceLink: 'https://t.me/synthetic/1', path: 'D:\\older\\synthetic.txt' }
+  detail.items[0].manifestPath = null
+  const f = mount(t, saved); await flush()
+  f.expect('/transfers/download/tasks/' + TASK, detail); await f.state.showTask(saved, TASK)
+  assert.equal(f.state.taskDetail.value.targetDirectory, ROOT)
+  assert.equal(f.state.taskDetail.value.items[0].outputPath, ROOT + '\\重复媒体\\synthetic.txt')
+  assert.equal(f.state.taskDetail.value.items[0].manifestPath, null)
+  assert.equal(f.state.taskDetail.value.duplicates, 1); assert.equal(f.state.detailError.value, '')
+  assert.equal(f.calls.length, 2); assert.ok(f.calls.every(call => call.method === 'GET'))
+})
+
+test('an opened child detail is safely refreshed with the batch without clearing the visible files in flight', async t => {
   const saved = batch(), f = mount(t, saved); await flush()
   assert.equal(f.calls.length, 1)
   f.expect('/transfers/download/tasks/' + TASK, fullTask())
@@ -327,11 +364,13 @@ test('child detail is fetched only on demand and a new child summary invalidates
   assert.equal(f.state.taskDetail.value.targetDirectory, ROOT + '\\频道\\主帖')
   const changed = batch([summary({ state: 'RUNNING', downloadedBytes: 37, updatedAt: 21 })], { updatedAt: 21 })
   f.expect(LIST, { items: [changed], workerWarning: 'Synthetic worker warning' })
-  await f.state.load()
-  assert.equal(f.state.taskDetail.value, null)
-  assert.match(f.state.detailError.value, /状态已更新/)
+  const response=deferred();f.expect('/transfers/download/tasks/'+TASK,response.promise)
+  const refreshing=f.state.load();await flush();assert.equal(f.state.taskDetail.value.state,'PAUSED')
+  response.resolve(fullTask(changed.tasks[0],{updatedAt:21}));await refreshing
+  assert.equal(f.state.taskDetail.value.state,'RUNNING');assert.equal(f.state.taskDetail.value.updatedAt,21)
+  assert.equal(f.state.detailTaskId.value,TASK);assert.equal(f.state.detailError.value,'')
   assert.equal(f.state.workerWarning.value, 'Synthetic worker warning')
-  assert.equal(f.calls.length, 3)
+  assert.equal(f.calls.length, 4)
 })
 
 test('foreign child file response and a child outside the batch never appear as current file details', async t => {
@@ -345,11 +384,8 @@ test('foreign child file response and a child outside the batch never appear as 
 })
 
 test('ten-batch history appends without clearing rows and never shares a child between memberships', async t => {
-  const f = mount(t, batch()); await flush()
-  await f.state.loadMore()
-  assert.equal(f.calls.length, 1)
   const ten = Array.from({ length: 10 }, (_, i) => batch([summary({ id: id(100 + i) })], { id: id(1 + i) }))
-  f.expect(LIST, { items: ten, workerWarning: null }); await f.state.load()
+  const f = mount(t, Promise.resolve({ items:ten,workerWarning:null }));await flush()
   f.expect('/transfers/download/batches?limit=10&offset=10', { items: [], workerWarning: null })
   f.state.loadMore(); await flush()
   assert.equal(f.state.offset.value, 10); assert.equal(f.state.batches.value.length, 10); assert.equal(f.state.hasMore.value, false)
@@ -382,9 +418,9 @@ test('hidden unknown batch POST retains its lock and a moved listing cannot remo
   f.expect(STATUS + '/resume', response.promise, 'POST'); const action = f.state.action(saved, 'resume')
   f.props.active = false; await flush(); response.resolve(Promise.reject(new Error('timeout'))); await action
   assert.deepEqual(f.state.uncertainIds.value, [BATCH]); assert.equal(f.calls.length, 2)
-  f.expect(LIST, { items: [], workerWarning: null }); f.props.active = true; await flush()
+  f.expect(LIST, { items: [], workerWarning: null }); f.expect(STATUS,saved);f.props.active = true; await flush()
   assert.equal(f.state.batches.value[0].id, BATCH); assert.match(f.state.error.value, /尚未确认/)
-  await f.state.action(saved, 'resume'); assert.equal(f.calls.length, 3)
+  await f.state.action(saved, 'resume'); assert.equal(f.calls.length, 4)
   f.expect(STATUS, saved); await f.state.checkBatch(saved); assert.deepEqual(f.state.uncertainIds.value, [])
   assert.equal(f.calls.filter(call => call.method === 'POST').length, 1)
 })
@@ -401,4 +437,30 @@ test('authorization errors emit accessError and never perform a verification POS
   assert.deepEqual(f.events, [['accessError', error]])
   assert.equal(f.calls.length, 2)
   assert.deepEqual(f.state.uncertainIds.value, [BATCH])
+})
+
+test('batch return refreshes every loaded page plus the open child while preserving EOF and selection, without following new history',async t=>{
+  const first=Array.from({length:10},(_,i)=>batch([summary({id:id(100+i)})],{id:id(1+i)})),last=batch([summary({id:id(110)})],{id:id(11)})
+  const f=mount(t,Promise.resolve({items:first,workerWarning:null}),{active:true,refreshVersion:0});await flush()
+  f.expect('/transfers/download/batches?limit=10&offset=10',{items:[last],workerWarning:null});await f.state.loadMore()
+  f.expect('/transfers/download/tasks/'+id(110),fullTask(last.tasks[0]));await f.state.showTask(last,id(110))
+  const order=f.state.batches.value.map(batch=>batch.id);f.props.active=false;await flush()
+  const response=deferred(),updated=batch([done({id:id(110)})],{id:id(11),updatedAt:30})
+  f.expect(LIST,response.promise);f.expect('/transfers/download/batches?limit=10&offset=10',{items:[updated],workerWarning:null});f.expect('/transfers/download/tasks/'+id(110),fullTask(updated.tasks[0],{updatedAt:30}))
+  f.props.active=true;f.props.refreshVersion++;await flush();assert.equal(f.state.taskDetail.value.state,'PAUSED');assert.equal(f.state.batches.value.length,11)
+  response.resolve({items:first,workerWarning:null});await flush()
+  assert.deepEqual(f.state.batches.value.map(batch=>batch.id),order);assert.equal(f.state.batches.value.at(-1).state,'COMPLETED')
+  assert.equal(f.state.taskDetail.value.state,'COMPLETED');assert.equal(f.state.detailTaskId.value,id(110));assert.equal(f.state.offset.value,11);assert.equal(f.state.hasMore.value,false)
+  assert.equal(f.calls.length,6);assert.ok(f.calls.every(call=>call.method==='GET'))
+})
+test('failed loaded batch tail refresh retains old records and detail and never retries or replays a mutation automatically',async t=>{
+  const first=Array.from({length:10},(_,i)=>batch([summary({id:id(100+i)})],{id:id(1+i)})),last=batch([summary({id:id(110)})],{id:id(11)})
+  const f=mount(t,Promise.resolve({items:first,workerWarning:null}),{active:true});await flush()
+  f.expect('/transfers/download/batches?limit=10&offset=10',{items:[last],workerWarning:null});await f.state.loadMore()
+  f.expect('/transfers/download/tasks/'+TASK,fullTask());await f.state.showTask(first[0],TASK)
+  const before=JSON.stringify(f.state.batches.value),detail=f.state.taskDetail.value
+  f.props.active=false;await flush();f.expect(LIST,{items:first,workerWarning:null});f.expect('/transfers/download/batches?limit=10&offset=10',new Error('batch tail offline'));f.props.active=true;await flush()
+  assert.equal(JSON.stringify(f.state.batches.value),before);assert.equal(f.state.taskDetail.value,detail);assert.equal(f.state.detailTaskId.value,TASK)
+  assert.match(f.state.error.value,/batch tail offline/);assert.equal(f.state.offset.value,11);assert.equal(f.state.hasMore.value,false)
+  const count=f.calls.length;await flush();assert.equal(f.calls.length,count);assert.ok(f.calls.every(call=>call.method==='GET'))
 })

@@ -3,19 +3,22 @@ import {computed,onBeforeUnmount,ref,watch} from 'vue'
 import {api,ApiError} from '../api'
 import {mediaTypes} from '../downloadPreview'
 import {validBatch,validBatchReceipt,type BatchPreview,type BatchReceipt,type BatchCreate} from '../downloadBatch'
-const props=defineProps<{scanId:string;scanRevision:number;postKeys:string[];accountId:string|null;active:boolean;authorized:boolean;available:boolean}>()
-const emit=defineEmits<{tasks:[];accessError:[cause:ApiError];locked:[value:boolean]}>()
-const types=ref(['VIDEO']),includeMain=ref(false),directory=ref(''),preview=ref<BatchPreview|null>(null),created=ref<BatchReceipt|null>(null)
+import type {DownloadCreationSelection} from '../transferCreation'
+const props=defineProps<{scanId:string;scanRevision:number;postKeys:string[];accountId:string|null;active:boolean;authorized:boolean;available:boolean;selection?:DownloadCreationSelection}>()
+const emit=defineEmits<{tasks:[];accessError:[cause:ApiError];locked:[value:boolean];transitionLocked:[value:boolean];fieldsLocked:[value:boolean]}>()
+const types=ref<string[]>(props.selection?[...props.selection.types]:['VIDEO']),includeMain=ref(props.selection?.includeMain??false),directory=ref(props.selection?.targetDirectory??''),preview=ref<BatchPreview|null>(null),created=ref<BatchReceipt|null>(null)
 const busy=ref(''),running=ref(false),needsCheck=ref(false),uncertain=ref(false),error=ref(''),notice=ref('')
 const locked=computed(()=>!!busy.value||running.value||uncertain.value||!!created.value)
-let generation=0,disposed=false,command:BatchCreate|null=null
+const transitionLocked=computed(()=>busy.value==='create'||busy.value==='lookup'||uncertain.value)
+const fieldsLocked=computed(()=>locked.value||!!preview.value)
+let generation=0,disposed=false,applyingSelection=false,command:BatchCreate|null=null
 const ready=()=>props.active&&props.authorized&&props.available&&!!props.accountId
 const alive=(g:number,account:string|null)=>!disposed&&g===generation&&props.accountId===account&&ready()
 const bytes=(value:number)=>value<1024?value+' B':value<1024*1024?(value/1024).toFixed(1)+' KB':(value/1024/1024).toFixed(1)+' MB'
 function fail(cause:unknown){error.value=cause instanceof Error?cause.message:'批量准备未完成。';if(cause instanceof ApiError&&[401,403].includes(cause.status))emit('accessError',cause)}
 function toggleType(type:string){if(locked.value)return;const next=types.value.includes(type)?types.value.filter(value=>value!==type):[...types.value,type];types.value=next.length?next:mediaTypes.map(value=>value.type)}
 function reset(){generation++;busy.value='';running.value=false;needsCheck.value=false;preview.value=null;created.value=null;uncertain.value=false;command=null;error.value='';notice.value=''}
-async function begin(){if(!ready()||locked.value||!props.postKeys.length||!directory.value.trim())return;reset();const g=generation,account=props.accountId;busy.value='start'
+async function begin(){if(!ready()||locked.value||!props.postKeys.length||!directory.value.trim()||!types.value.length)return;reset();const g=generation,account=props.accountId;busy.value='start'
   try{const value=await api<BatchPreview>('/transfers/download/batches/preview',{method:'POST',body:{scanId:props.scanId,revision:props.scanRevision,postKeys:[...props.postKeys],types:[...types.value],includeMain:includeMain.value,targetDirectory:directory.value.trim()}});if(!alive(g,account))return;if(!validBatch(value,account))throw new Error('批量清单身份无法确认。');preview.value=value;busy.value='';await proceed()}
   catch(cause){if(alive(g,account))fail(cause)}finally{if(alive(g,account))busy.value=''}
 }
@@ -37,16 +40,30 @@ async function create(retry=false){if(!ready()||busy.value||running.value||creat
 async function lookup(){if(!ready()||busy.value||!command||!preview.value)return;const g=generation,account=props.accountId,before=preview.value;busy.value='lookup'
   try{const value=await api<{batch:BatchReceipt|null}>('/transfers/download/batches/by-operation/'+command.operationId);if(!alive(g,account))return;if(!value||!('batch'in value)||value.batch!==null&&!validBatchReceipt(value.batch,before,command))throw new Error('批量任务核对回执无效。');if(value.batch){created.value=value.batch;uncertain.value=false;error.value=''}else notice.value='尚未找到此操作的任务，可显式重试相同创建请求。'}catch(cause){if(alive(g,account))fail(cause)}finally{if(alive(g,account))busy.value=''}
 }
-watch([types,includeMain,directory],reset,{flush:'sync'})
-watch([()=>props.scanId,()=>JSON.stringify(props.postKeys),()=>props.accountId,()=>props.authorized,()=>props.available],reset)
+watch([types,includeMain,directory],()=>{if(!applyingSelection)reset()},{flush:'sync'})
+watch([()=>JSON.stringify(props.selection?.types),()=>props.selection?.includeMain,()=>props.selection?.targetDirectory],()=>{
+  if(!props.selection||fieldsLocked.value||command)return
+  reset();applyingSelection=true;types.value=[...props.selection.types];includeMain.value=props.selection.includeMain;directory.value=props.selection.targetDirectory;applyingSelection=false
+},{flush:'sync'})
+watch([()=>props.scanId,()=>JSON.stringify(props.postKeys),()=>props.accountId,()=>props.authorized],reset)
+watch(()=>props.available,()=>{
+  const needsLookup=!!command&&!created.value&&(busy.value==='create'||busy.value==='lookup'||uncertain.value)
+  if(needsLookup)uncertain.value=true
+  generation++;running.value=false;busy.value=''
+  if(needsLookup){error.value='连接中断，已保留批量创建操作；恢复连接后请核对批量任务，不会自动重新提交。'}
+  else if(preview.value&&!created.value){needsCheck.value=true;notice.value='连接状态已变化，已保留准备结果；请恢复连接后核对准备位置。'}
+})
 watch(()=>props.active,active=>{if(!active){generation++;running.value=false;if(busy.value==='step')needsCheck.value=true;if(busy.value==='create')uncertain.value=true;busy.value=''}else if(ready()&&needsCheck.value&&preview.value)void check()})
 watch(locked,value=>emit('locked',value),{flush:'sync',immediate:true})
-onBeforeUnmount(()=>{disposed=true;generation++;running.value=false;emit('locked',false)})
+watch(transitionLocked,value=>emit('transitionLocked',value),{flush:'sync'})
+watch(fieldsLocked,value=>{if(props.selection)emit('fieldsLocked',value)},{flush:'sync',immediate:true})
+onBeforeUnmount(()=>{disposed=true;generation++;running.value=false;emit('locked',false);if(props.selection)emit('fieldsLocked',false);if(transitionLocked.value)emit('transitionLocked',false)})
 </script>
 <template>
   <section class="batch-download" aria-label="批量下载准备"><h3>批量下载 · 已选 {{postKeys.length}} 条主帖</h3><p>先统计所选主帖的评论媒体和精确大小，再核对并创建下载任务。每批最多20帖、1000个媒体。</p>
-    <fieldset :disabled="locked"><legend>评论媒体类型 · 可多选</legend><div class="batch-types"><button type="button" :aria-pressed="types.length===5" :class="{selected:types.length===5}" @click="types=mediaTypes.map(value=>value.type)">全部</button><button v-for="type in mediaTypes" :key="type.type" type="button" :aria-pressed="types.includes(type.type)" :class="{selected:types.includes(type.type)}" @click="toggleType(type.type)">{{type.label}}</button></div><label class="batch-main"><input v-model="includeMain" type="checkbox" /> 包含主帖自身全部媒体</label><label class="batch-directory">保存根目录<input v-model="directory" class="input" placeholder="例如 D:\TelegramDownloads" autocomplete="off" /></label></fieldset>
-    <div class="batch-actions"><button class="btn" :disabled="locked||!ready()||!directory.trim()" @click="begin">{{busy==='start'?'正在准备…':'准备批量下载清单'}}</button><button v-if="running" class="btn" @click="stop">停止后续统计</button><button v-if="preview?.canContinue&&!running&&!needsCheck" class="btn" :disabled="locked||!ready()" @click="proceed">继续准备</button><button v-if="preview&&!created&&!uncertain" class="btn" :disabled="!!busy||running||!ready()" @click="check">核对准备位置</button></div>
+    <fieldset v-if="!selection" :disabled="locked"><legend>评论媒体类型 · 可多选</legend><div class="batch-types"><button type="button" :aria-pressed="types.length===5" :class="{selected:types.length===5}" @click="types=mediaTypes.map(value=>value.type)">全部</button><button v-for="type in mediaTypes" :key="type.type" type="button" :aria-pressed="types.includes(type.type)" :class="{selected:types.includes(type.type)}" @click="toggleType(type.type)">{{type.label}}</button></div><label class="batch-main"><input v-model="includeMain" type="checkbox" /> 包含主帖自身全部媒体</label><label class="batch-directory">保存根目录<input v-model="directory" class="input" placeholder="例如 D:\TelegramDownloads" autocomplete="off" /></label></fieldset>
+    <p v-if="!types.length" class="notice warning" role="status">频道批量下载需至少选择一种评论媒体类型。</p>
+    <div class="batch-actions"><button class="btn" :disabled="locked||!ready()||!directory.trim()||!types.length" @click="begin">{{busy==='start'?'正在准备…':'准备批量下载清单'}}</button><button v-if="running" class="btn" @click="stop">停止后续统计</button><button v-if="preview?.canContinue&&!running&&!needsCheck" class="btn" :disabled="locked||!ready()" @click="proceed">继续准备</button><button v-if="preview&&!created&&!uncertain" class="btn" :disabled="!!busy||running||!ready()" @click="check">核对准备位置</button></div>
     <p v-if="error" class="notice danger" role="alert">{{error}}</p><p v-if="notice" class="notice" role="status">{{notice}}</p>
     <template v-if="preview"><div class="batch-summary" role="status"><strong>{{preview.total}} 个媒体 · {{bytes(preview.totalBytes)}}</strong><span>{{preview.exhausted?'所选主帖清单已准备完成':running?'正在逐帖统计评论…':'尚未读完，未创建下载任务'}}</span></div><ul class="batch-posts"><li v-for="post in preview.posts" :key="post.key"><span>{{post.title}}</span><small>{{post.state==='READY'?'已准备':post.state==='PENDING'?'等待统计':'读取评论中'}} · 主帖 {{post.mainMedia}} / 评论 {{post.commentMedia}} · {{bytes(post.bytes)}}</small></li></ul>
       <p v-for="warning in preview.warnings" :key="warning">{{warning}}</p>

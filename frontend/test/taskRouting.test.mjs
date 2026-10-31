@@ -12,6 +12,7 @@ import * as downloadTasks from '../src/downloadTasks.ts'
 import * as uploadTasks from '../src/uploadTasks.ts'
 import * as uploadPreview from '../src/uploadPreview.ts'
 import * as rules from '../src/rules.ts'
+import * as creation from '../src/transferCreation.ts'
 import * as downloadBatchStatus from '../src/downloadBatchStatus.ts'
 
 const compiled = new Map()
@@ -30,12 +31,12 @@ function mount(t, name, initialProps = {}) {
   }
   const props = vue.reactive({ authorized: false, available: false, accountId: '1', ...initialProps }), hooks = [], events = [], calls = [], timers = []
   const api = { hasAppToken: false, clearAppToken() {}, ApiError: class extends Error {}, api: async (...args) => { calls.push(args); throw new Error('Navigation must not invoke API') } }
-  const runtimeVue = { ...vue, onMounted() {}, onBeforeUnmount: hook => hooks.push(hook), withCtx: fn => fn,
+  const runtimeVue = { ...vue, onMounted() {}, onBeforeUnmount: hook => hooks.push(hook), withCtx: fn => fn, resolveDynamicComponent: value => value,
     withDirectives: (node, directives) => { node.testDirectives = directives; return node } }
   const stubs = new Map()
   const modules = { vue: runtimeVue, '../api': api, './api': api, '../taskCategories': categories, './taskCategories': categories,
     '../taskHistory': taskHistory, '../library': library, '../downloadPreview': preview, '../downloadTasks': downloadTasks, '../uploadTasks': uploadTasks,
-    '../uploadPreview': uploadPreview, '../rules': rules, '../downloadBatchStatus': downloadBatchStatus }
+    '../uploadPreview': uploadPreview, '../rules': rules, '../downloadBatchStatus': downloadBatchStatus, '../transferCreation':creation }
   const requireModule = name => {
     if (name.endsWith('.vue')) { const title = name.split('/').at(-1).replace('.vue', ''); if (!stubs.has(title)) stubs.set(title, { __name: title }); return { __esModule: true, default: stubs.get(title) } }
     assert.ok(Object.hasOwn(modules, name), name); return modules[name]
@@ -143,4 +144,80 @@ test('rule workspace forwards continuous-download tasks to download and upload j
     job: { taskId: 'task', state: 'FAILED', ruleVersion: 1, total: 1, confirmed: 0, archived: 0, manualTakeover: false, error: '合成错误' } }]
   const link = nodes(f.render()).find(node => node.type === 'button' && text(node) === '到任务中心处理')
   assert.ok(link); link.props.onClick(); assert.deepEqual(f.events.at(-1), ['tasks', 'upload'])
+})
+
+test('global transfer and rule-page create shortcuts share one composer with explicit presets',async t=>{
+  const f=mount(t,'App');f.state.loading.value=false;f.state.serviceReachable.value=true;f.state.accessInvalid.value=false
+  f.state.openTransfer();await flush();let composer=component(f.render(),'TransferComposer')
+  assert.ok(composer);assert.equal(composer.props['initial-direction'],'download');assert.equal(composer.props['initial-mode'],'ONCE')
+  f.state.newTransferOpen.value=false;f.state.page.value='rules';await flush()
+  component(f.render(),'RuleWorkspace').props.onCreate('upload');await flush();composer=component(f.render(),'TransferComposer')
+  assert.equal(composer.props['initial-direction'],'upload');assert.equal(composer.props['initial-mode'],'RULE')
+  composer.props.onSaved('upload');await flush();assert.equal(f.state.newTransferOpen.value,false);assert.equal(f.state.page.value,'rules');assert.equal(f.state.ruleCategory.value,'upload');assert.equal(f.state.ruleRefresh.value,1)
+})
+test('all four creation modes reuse existing bodies in one modal shell',async t=>{
+  const f=mount(t,'TransferComposer')
+  let tree=f.render();assert.ok(component(tree,'RuleFormDialog'));assert.equal(component(tree,'RuleFormDialog').props['stable-size'],true);assert.equal(component(tree,'NewTransfer').props.embedded,true)
+  assert.equal(component(tree,'NewTransfer').props['initial-direction'],'download')
+  f.state.selectDirection('upload');await flush();assert.equal(component(f.render(),'NewTransfer').props['initial-direction'],'upload')
+  f.state.selectMode('RULE');await flush();tree=f.render();assert.equal(component(tree,'NewTransfer'),undefined);assert.equal(component(tree,'RuleWorkspace').props['create-only'],true);assert.equal(component(tree,'RuleWorkspace').props.embedded,true)
+  f.state.selectDirection('download');await flush();tree=f.render();assert.equal(component(tree,'DownloadRules').props['create-only'],true);assert.equal(component(tree,'RuleWorkspace'),undefined)
+  assert.equal(nodes(tree).filter(node=>node.type?.__name==='RuleFormDialog').length,1)
+})
+test('creation locks prevent mode changes and close until a confirmed save or explicit lookup',async t=>{
+  const f=mount(t,'TransferComposer',{initialDirection:'download',initialMode:'RULE'})
+  component(f.render(),'DownloadRules').props.onLocked(true);await flush()
+  f.state.selectDirection('upload');f.state.selectMode('ONCE');f.state.close();assert.equal(f.state.direction.value,'download');assert.equal(f.state.mode.value,'RULE');assert.deepEqual(f.events,[])
+  component(f.render(),'DownloadRules').props.onSaved('download');assert.equal(f.state.locked.value,false);assert.deepEqual(f.events,[['saved','download']])
+})
+test('embedded once upload has no second dialog and only mutation state locks the outer shell',async t=>{
+  const f=mount(t,'NewTransfer',{embedded:true,initialDirection:'upload'})
+  assert.equal(f.state.direction.value,'upload');assert.equal(nodes(f.render()).filter(node=>node.type==='dialog').length,0)
+  const upload=component(f.render(),'UploadPreparation');upload.props.onTransitionLocked(true);await flush();assert.deepEqual(f.events.at(-1),['locked',true])
+  upload.props.onTransitionLocked(false);await flush();assert.deepEqual(f.events.at(-1),['locked',false])
+  f.state.createdTask.value={total:1};await flush();assert.deepEqual(f.events.at(-1),['locked',false])
+})
+test('rule management new buttons request presets instead of opening divergent creation dialogs',async t=>{
+  const f=mount(t,'RuleWorkspace')
+  component(f.render(),'DownloadRules').props.onCreate('download');assert.deepEqual(f.events.at(-1),['create','download'])
+  const uploadButton=nodes(f.render()).find(node=>node.type==='button'&&text(node)==='新建上传规则');assert.ok(uploadButton);uploadButton.props.onClick();assert.deepEqual(f.events.at(-1),['create','upload'])
+})
+
+test('composer protects availability drafts but remounts creation state when authorization or account changes',async t=>{
+  const f=mount(t,'TransferComposer',{authorized:true,available:true,initialDirection:'upload',initialMode:'RULE'})
+  const before=component(f.render(),'RuleWorkspace').key;f.state.locked.value=true;f.props.available=false;await flush()
+  assert.equal(component(f.render(),'RuleWorkspace').key,before);assert.equal(f.state.locked.value,true)
+  f.props.authorized=false;await flush();assert.notEqual(component(f.render(),'RuleWorkspace').key,before);assert.equal(f.state.locked.value,false);assert.match(text(nodes(f.render()).find(node=>node.props?.role==='status')),/请先连接 Telegram/)
+  f.props.authorized=true;f.props.accountId='2';await flush();assert.notEqual(component(f.render(),'RuleWorkspace').key,before);assert.equal(f.state.direction.value,'upload')
+})
+
+test('execution mode switches keep the same common download fields and carry their values to each action',async t=>{
+  const f=mount(t,'TransferComposer',{authorized:true,available:true})
+  const draft={...creation.emptyDownloadSelection(),entry:'POST',source:'https://t.me/example/1',types:['DOCUMENT'],includeMain:true,targetDirectory:'D:\\chosen'}
+  let fields=component(f.render(),'DownloadCreationFields');fields.props['onUpdate:modelValue'](draft);await flush()
+  const fieldKey=component(f.render(),'DownloadCreationFields').key
+  assert.deepEqual(component(f.render(),'NewTransfer').props.selection,draft)
+  f.state.selectMode('RULE');await flush()
+  assert.equal(component(f.render(),'DownloadCreationFields').key,fieldKey)
+  assert.deepEqual(component(f.render(),'DownloadRules').props.selection,draft)
+  f.state.selectMode('ONCE');await flush()
+  assert.deepEqual(component(f.render(),'DownloadCreationFields').props.modelValue,draft)
+  assert.deepEqual(component(f.render(),'NewTransfer').props.selection,draft)
+  f.props.available=false;await flush();assert.deepEqual(f.state.downloadSelection.value,draft)
+})
+
+test('upload uses the same persistent common fields and holds input changes during a frozen once operation',async t=>{
+  const f=mount(t,'TransferComposer',{authorized:true,available:true,initialDirection:'upload'})
+  const draft={link:'https://t.me/example/1',sourceDirectory:'D:\\source',recursive:false,captionMode:'EMPTY'}
+  component(f.render(),'UploadCreationFields').props['onUpdate:modelValue'](draft);await flush()
+  assert.deepEqual(component(f.render(),'NewTransfer').props['upload-selection'],draft)
+  component(f.render(),'NewTransfer').props.onFieldsLocked(true);await flush()
+  assert.equal(component(f.render(),'UploadCreationFields').props.disabled,true)
+  f.state.selectMode('ONCE');f.state.selectDirection('upload');assert.equal(f.state.fieldsLocked.value,true)
+  f.state.selectMode('RULE');await flush();assert.equal(f.state.fieldsLocked.value,false)
+  assert.deepEqual(component(f.render(),'RuleWorkspace').props.selection,draft)
+  assert.equal(component(f.render(),'UploadCreationFields').props.disabled,false)
+  f.state.selectDirection('download');await flush();f.state.selectDirection('upload');await flush()
+  assert.deepEqual(component(f.render(),'UploadCreationFields').props.modelValue,draft)
+  f.props.accountId='2';await flush();assert.deepEqual(f.state.uploadSelection.value,creation.emptyUploadSelection())
 })

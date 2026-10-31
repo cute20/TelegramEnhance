@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import test from 'node:test'
 import * as vue from 'vue'
-import { parse, compileScript } from 'vue/compiler-sfc'
+import { parse, compileScript, compileTemplate } from 'vue/compiler-sfc'
 import ts from 'typescript'
 import * as uploadTasks from '../src/uploadTasks.ts'
 import * as uploadPreview from '../src/uploadPreview.ts'
@@ -42,6 +42,32 @@ function mount(t,{props:overrides={},steps:initial=[]}={}){
   t.after(()=>{destroy();assert.deepEqual(failures,[]);assert.equal(steps.length,0)})
   return {state,props,calls,timers,events,destroy,get maxRequests(){return maxRequests},expect:(path,value,method='GET')=>steps.push({path,value,method})}
 }
+
+function renderRecords(f){
+  const source=readFileSync(new URL('../src/components/UploadTasks.vue',import.meta.url),'utf8')
+  const parsed=parse(source,{filename:'UploadTasks.vue'})
+  const template=compileTemplate({source:parsed.descriptor.template.content,filename:'UploadTasks.vue',id:'UploadTasks',compilerOptions:{mode:'function',expressionPlugins:['typescript']}})
+  assert.deepEqual(template.errors,[])
+  const code=ts.transpileModule(template.code,{compilerOptions:{module:ts.ModuleKind.CommonJS,target:ts.ScriptTarget.ES2022}}).outputText
+  const render=new Function('Vue',code)({...vue,resolveComponent:name=>name})
+  const root=render(vue.proxyRefs({...f.state,...f.props}),[]),records=[]
+  function visit(node){if(!node||typeof node!=='object')return;if(node.type==='CompactRecord')records.push(node);if(Array.isArray(node.children))node.children.forEach(visit)}
+  visit(root);return records
+}
+
+test('upload records pass panel activity and always start closed, including newly returned running tasks',async t=>{
+  const value=task({state:'RUNNING'}),f=mount(t,{steps:[{path:LIST,value:list([value])}]});await flush()
+  let records=renderRecords(f)
+  assert.equal(records.length,1);assert.equal(records[0].props.active,true);assert.equal(records[0].props['default-expanded'],false)
+  assert.match(records[0].props.description,/已归档 0/)
+  f.props.active=false;await flush();records=renderRecords(f)
+  assert.equal(records[0].props.active,false);assert.equal(records[0].props['default-expanded'],false)
+  const fresh=task({id:'new-running-task',state:'RUNNING',createdAt:2})
+  f.expect(LIST,list([fresh,value]));f.props.active=true;await flush();records=renderRecords(f)
+  assert.equal(records.length,2)
+  assert.ok(records.every(record=>record.props.active===true&&record.props['default-expanded']===false))
+  assert.equal(records[0].key,fresh.id)
+})
 
 test('inactive upload panel does not load, poll, page or issue mutations, and first activation only reads',async t=>{
   const value=task(),f=mount(t,{props:{active:false}});await flush()
@@ -97,12 +123,73 @@ test('activation during POST queues one GET until the original response is appli
   assert.equal(f.calls.length,3);assert.equal(f.maxRequests,1);assert.equal(f.state.tasks.value[0].state,'QUEUED')
 })
 
-test('switching upload panels preserves appended history while refreshing the head',async t=>{
+test('switching upload panels refreshes the full appended range while preserving rows and paging',async t=>{
   const head=Array.from({length:20},(_,i)=>task({id:'00000000-0000-0000-0000-'+String(i+1).padStart(12,'0')})),value=task({id:'00000000-0000-0000-0000-000000000021'}),f=mount(t,{steps:[{path:LIST,value:list(head)}]});await flush()
   f.expect('/transfers/upload/tasks?limit=20&offset=20',list([value]));await f.state.loadMore();assert.equal(f.state.offset.value,21);assert.equal(f.state.tasks.value.length,21)
   f.props.active=false;f.props.refreshVersion++;await flush();assert.equal(f.calls.length,2)
-  f.expect(LIST,list(head));f.props.active=true;await flush()
-  assert.equal(f.state.offset.value,21);assert.equal(f.state.tasks.value.length,21);assert.equal(f.calls.length,3)
+  const order=f.state.tasks.value.map(item=>item.id)
+  f.expect(LIST,list(head));f.expect('/transfers/upload/tasks?limit=20&offset=20',list([{...value,updatedAt:2}]))
+  f.props.active=true;await flush()
+  assert.equal(f.state.offset.value,21);assert.equal(f.state.tasks.value.length,21);assert.equal(f.calls.length,4)
+  assert.equal(f.state.tasks.value.at(-1).updatedAt,2);assert.equal(f.state.hasMore.value,false)
+  assert.deepEqual(f.state.tasks.value.map(item=>item.id),order);assert.equal(f.maxRequests,1)
+})
+
+test('return refresh keeps upload file disclosures open or user-closed when task completion changes',async t=>{
+  const value=task({state:'RUNNING'}),completed=task({state:'COMPLETED',confirmed:1,archived:1,updatedAt:2})
+  completed.groups[0].state='ARCHIVED'
+  Object.assign(completed.groups[0].items[0],{state:'ARCHIVED',formalMessageId:'99',archivePath:'D:\\archive\\sample.txt'})
+  const f=mount(t,{steps:[{path:LIST,value:list([value])}]});await flush()
+  assert.equal(f.state.groupOpen(f.state.tasks.value[0],'group'),true)
+  f.props.active=false;await flush();f.expect(LIST,list([completed]));f.props.active=true;await flush()
+  assert.equal(f.state.tasks.value[0].state,'COMPLETED')
+  assert.equal(f.state.groupOpen(f.state.tasks.value[0],'group'),true,'completion must not collapse already-open file details')
+  f.state.toggleGroup(ID,'group',{currentTarget:{open:false}})
+  f.expect(LIST,list([{...completed,updatedAt:3}]));f.props.refreshVersion++;await flush()
+  assert.equal(f.state.groupOpen(f.state.tasks.value[0],'group'),false,'refresh must keep a user-closed file disclosure closed')
+})
+const historyId=n=>'00000000-0000-0000-0000-'+String(n).padStart(12,'0')
+const history=(start,count=20)=>Array.from({length:count},(_,index)=>task({id:historyId(start+index)}))
+test('return after EOF reads the loaded range, supplements its displaced tail, and puts a new head first using history ordering',async t=>{
+  const first=history(1),second=history(21),f=mount(t,{steps:[{path:LIST,value:list(first)}]});await flush()
+  f.expect('/transfers/upload/tasks?limit=20&offset=20',list(second));await f.state.loadMore()
+  f.expect('/transfers/upload/tasks?limit=20&offset=40',list([]));await f.state.loadMore()
+  assert.equal(f.state.offset.value,40);assert.equal(f.state.hasMore.value,false)
+  const order=f.state.tasks.value.map(item=>item.id),updated=[...first,...second].map(item=>({...item,updatedAt:2})),newest=task({id:historyId(101),createdAt:2})
+  f.props.active=false;await flush()
+  f.expect(LIST,list([newest,...updated.slice(0,19)]));f.expect('/transfers/upload/tasks?limit=20&offset=20',list(updated.slice(19,39)))
+  f.expect('/transfers/upload/tasks/'+historyId(40),updated[39]);f.props.active=true;f.props.refreshVersion++;await flush()
+  assert.equal(f.state.offset.value,40);assert.equal(f.state.hasMore.value,true);assert.equal(f.state.tasks.value.length,41)
+  assert.equal(f.state.tasks.value[0].id,newest.id)
+  assert.deepEqual(f.state.tasks.value.slice(1).map(item=>item.id),order);assert.ok(f.state.tasks.value.slice(1).every(item=>item.updatedAt===2))
+  assert.equal(f.maxRequests,1);assert.ok(f.calls.every(call=>(call.options.method??'GET')==='GET'))
+})
+test('failed later refresh page leaves every visible upload row and cursor intact and does not retry until the user refreshes',async t=>{
+  const first=history(1),second=history(21),f=mount(t,{steps:[{path:LIST,value:list(first)}]});await flush()
+  f.expect('/transfers/upload/tasks?limit=20&offset=20',list(second));await f.state.loadMore()
+  const order=f.state.tasks.value.map(item=>item.id),updated=first.map(item=>({...item,updatedAt:2}))
+  f.expect(LIST,list(updated));f.expect('/transfers/upload/tasks?limit=20&offset=20',new Error('tail offline'))
+  f.props.refreshVersion++;await flush();await flush()
+  assert.equal(f.calls.length,4);assert.equal(f.state.offset.value,40);assert.equal(f.state.hasMore.value,true)
+  assert.deepEqual(f.state.tasks.value.map(item=>item.id),order);assert.ok(f.state.tasks.value.every(item=>item.updatedAt===1));assert.match(f.state.error.value,/tail offline/)
+  f.expect(LIST,list(updated));f.expect('/transfers/upload/tasks?limit=20&offset=20',list(second.map(item=>({...item,updatedAt:2}))))
+  await f.state.load();assert.ok(f.state.tasks.value.every(item=>item.updatedAt===2));assert.equal(f.calls.length,6)
+})
+test('hidden refresh result cannot overwrite retained records or continue reading remaining history pages',async t=>{
+  const first=history(1),second=history(21),f=mount(t,{steps:[{path:LIST,value:list(first)}]});await flush()
+  f.expect('/transfers/upload/tasks?limit=20&offset=20',list(second));await f.state.loadMore()
+  const response=deferred();f.expect(LIST,response.promise);f.props.refreshVersion++;await flush()
+  f.props.active=false;await flush();response.resolve(list(first.map(item=>({...item,updatedAt:9}))));await flush()
+  assert.equal(f.calls.length,3);assert.ok(f.state.tasks.value.every(item=>item.updatedAt===1));assert.equal(f.state.offset.value,40)
+  f.expect(LIST,list(first.map(item=>({...item,updatedAt:2}))));f.expect('/transfers/upload/tasks?limit=20&offset=20',list(second.map(item=>({...item,updatedAt:2}))))
+  f.props.active=true;await flush();assert.equal(f.calls.length,5);assert.ok(f.state.tasks.value.every(item=>item.updatedAt===2));assert.equal(f.maxRequests,1)
+})
+test('return refresh waits for an older local-progress GET and never lets that stale progress overwrite the refreshed record',async t=>{
+  const value=task({state:'RUNNING'}),f=mount(t,{steps:[{path:LIST,value:list([value])}]});await flush()
+  const response=deferred();f.expect('/transfers/upload/tasks/'+ID,response.promise);const progress=f.state.readProgress()
+  f.props.active=false;await flush();f.props.active=true;f.props.refreshVersion++;await flush();assert.equal(f.calls.length,2)
+  f.expect(LIST,list([task({state:'PAUSED',updatedAt:2})]));response.resolve(value);await progress;await flush()
+  assert.equal(f.calls.length,3);assert.equal(f.state.tasks.value[0].state,'PAUSED');assert.equal(f.state.tasks.value[0].updatedAt,2);assert.equal(f.maxRequests,1)
 })
 
 test('late GET after account change is discarded and only the next active account is fetched',async t=>{

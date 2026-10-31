@@ -55,6 +55,12 @@ public final class DownloadTaskService {
         String account = telegram.accountId(); var items = repository.list(account, limit, offset).stream().map(repository::view).toList();
         if (!account.equals(telegram.accountId())) throw new IllegalArgumentException("账号已变化，请刷新任务"); return new Listing(items, engine.warning());
     }
+    public Listing standalone(int limit,int offset) {
+        if(limit<1||limit>50||offset<0)throw new IllegalArgumentException("任务分页参数无效");
+        String account=telegram.accountId();long generation=telegram.sessionGeneration();
+        var items=repository.list(account,limit,offset,true).stream().map(repository::view).toList();
+        current(account,generation);return new Listing(items,engine.warning());
+    }
     public TaskView task(String id) { validateId(id); String account = telegram.accountId(); var task = repository.view(repository.task(account, id)); if (!account.equals(telegram.accountId())) throw new IllegalArgumentException("账号已变化"); return task; }
     public TaskView pause(String id) { validateId(id); String account = telegram.accountId(); long generation=telegram.sessionGeneration(); boolean bound=rules!=null&&rules.manualPause(account,id,()->current(account,generation)); var task = repository.view(bound?repository.task(account,id):repository.pause(account, id)); if (!account.equals(telegram.accountId())) throw new IllegalArgumentException("账号已变化，请刷新任务"); return task; }
     public TaskView resume(String id) { validateId(id); String account = telegram.accountId(); long generation=telegram.sessionGeneration(); boolean bound=rules!=null&&rules.manualResume(account,id,()->current(account,generation)); var task = repository.view(bound?repository.task(account,id):repository.resume(account, id)); if (!account.equals(telegram.accountId())) throw new IllegalArgumentException("账号已变化，请刷新任务"); return task; }

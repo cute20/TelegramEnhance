@@ -12,16 +12,17 @@ const ID='00000000-0000-0000-0000-000000000001'
 const input=()=>({name:'sample',link:'https://t.me/synthetic/1',sourceDirectory:'D:\\source',archiveDirectory:'D:\\archive',recursive:true,captionMode:'FILENAME',window:{mode:'ALL_DAY',start:null,end:null,timezone:'Asia/Shanghai'},executionMode:'OBSERVE_ONLY'})
 const result=()=>({mode:'OBSERVE_ONLY',state:'PAUSED',scanning:false,nextAllowedAt:1,rule:{id:ID,accountId:'1',version:1,revision:1,enabled:false,nextScanAt:0,createdAt:1,updatedAt:1,input:input(),observation:null}})
 const flush=async()=>{await vue.nextTick();await new Promise(setImmediate)}
-function mount(t){
+function mount(t,initialProps={}){
   const {descriptor}=parse(readFileSync(new URL('../src/components/RuleWorkspace.vue',import.meta.url),'utf8'),{filename:'RuleWorkspace.vue'})
   const code=ts.transpileModule(compileScript(descriptor,{id:'rules-test'}).content,{compilerOptions:{module:ts.ModuleKind.CommonJS,target:ts.ScriptTarget.ES2022}}).outputText
-  const props=vue.reactive({authorized:true,available:true,accountId:'1'}),calls=[],steps=[{path:'/rules',method:'GET',value:{mode:'OBSERVE_ONLY',items:[]}}],errors=[],hooks=[]
+  const props=vue.reactive({authorized:true,available:true,accountId:'1',...initialProps}),calls=[],steps=props.createOnly?[]:[{path:'/rules',method:'GET',value:{mode:'OBSERVE_ONLY',items:[]}}],errors=[],hooks=[],mounted=[],events=[]
   const api=async(path,options={})=>{calls.push({path,options});const step=steps.shift();try{assert.ok(step,path);assert.equal(path,step.path);assert.equal(options.method??'GET',step.method??'POST')}catch(e){errors.push(e);throw e}if(step.value instanceof Error)throw step.value;return await step.value}
-  const modules={vue:{...vue,onBeforeUnmount:f=>hooks.push(f)},'../api':{api,ApiError:class extends Error{}},'../uploadTasks':uploadTasks,'../rules':rules,'../uploadPreview':upload,'../library':library},module={exports:{}}
+  const modules={vue:{...vue,onMounted:f=>mounted.push(f),onBeforeUnmount:f=>hooks.push(f)},'../api':{api,ApiError:class extends Error{}},'../uploadTasks':uploadTasks,'../rules':rules,'../uploadPreview':upload,'../library':library},module={exports:{}}
   new Function('require','module','exports',code)(name=>modules[name],module,module.exports)
-  const scope=vue.effectScope(),state=scope.run(()=>module.exports.default.setup(props,{expose(){},emit(){}}))
+  const scope=vue.effectScope(),state=scope.run(()=>module.exports.default.setup(props,{expose(){},emit:(...event)=>events.push(event)}))
+  mounted.forEach(f=>f())
   t.after(()=>{hooks.forEach(f=>f());scope.stop();assert.deepEqual(errors,[]);assert.equal(steps.length,0)})
-  return {state,props,calls,expect:(path,value,method='POST')=>steps.push({path,value,method})}
+  return {state,props,calls,events,expect:(path,value,method='POST')=>steps.push({path,value,method})}
 }
 test('upload rules update only on an explicit refresh and retain the open draft',async t=>{
   const f=mount(t);await flush();f.state.edit(null);f.state.form.name='stable upload draft'
@@ -104,3 +105,60 @@ test('unknown automatic activation response is closed and never automatically po
 test('changing account discards a late activation preview and cannot enable it',async t=>{const f=mount(t);await flush();let resolve;f.expect('/rules/'+ID+'/preview',new Promise(r=>resolve=r));const pending=f.state.prepareActivation(automatic());f.props.authorized=false;await flush();resolve(activationPreview());await pending;assert.equal(f.state.activation.value,null);await f.state.confirmActivation();assert.equal(f.calls.length,2)})
 test('an automatic rule can be paused while scanning without an enable preview',async t=>{const f=mount(t);await flush();const current=automatic();current.rule.enabled=true;current.scanning=true;f.expect('/rules/'+ID+'/enabled',automatic());await f.state.act(current,'enabled');assert.deepEqual(f.calls[1].options.body,{revision:1,enabled:false});assert.equal(f.calls.length,2)})
 test('automatic result must agree with saved mode and editing old observation clears previous automatic mode',async t=>{const a=automatic();assert.equal(rules.validRule(a,'1'),true);a.rule.input.executionMode='OBSERVE_ONLY';assert.equal(rules.validRule(a,'1'),false);const f=mount(t);await flush();f.state.edit(automatic());assert.equal(f.state.form.executionMode,'AUTO_UPLOAD');f.state.edit(result());assert.equal(f.state.form.executionMode,'OBSERVE_ONLY')})
+
+test('embedded upload-rule creation opens the existing form without reading management lists',async t=>{
+  const f=mount(t,{createOnly:true,embedded:true,category:'download',refreshVersion:0});await flush()
+  assert.equal(f.state.formOpen.value,true);assert.equal(f.state.editing.value,null)
+  assert.equal(f.state.selectedCategory.value,'upload');assert.equal(f.state.form.executionMode,'AUTO_UPLOAD')
+  await f.state.refresh();f.props.refreshVersion++;f.props.category='upload';await flush()
+  assert.equal(f.calls.length,0);assert.deepEqual(f.events,[['locked',false]])
+  f.state.closeForm();assert.equal(f.state.formOpen.value,false);assert.deepEqual(f.events.at(-1),['close'])
+})
+test('embedded upload-rule save emits completion only after its paused receipt and unlock',async t=>{
+  const f=mount(t,{createOnly:true,embedded:true});await flush();Object.assign(f.state.form,automatic().rule.input)
+  let release;f.expect('/rules',new Promise(resolve=>release=resolve));const saving=f.state.save()
+  assert.equal(f.state.busy.value,'save');assert.deepEqual(f.events.at(-1),['locked',true])
+  f.state.closeForm();assert.equal(f.state.formOpen.value,true);assert.equal(f.events.some(event=>event[0]==='close'),false)
+  release(automatic());await saving
+  assert.equal(f.state.busy.value,'');assert.equal(f.state.formOpen.value,false)
+  assert.equal(f.state.items.value[0].rule.enabled,false)
+  assert.deepEqual(f.events.slice(-2),[['locked',false],['saved','upload']])
+  assert.equal(f.calls.length,1);assert.equal(f.calls[0].options.method,'POST')
+  assert.equal(f.calls[0].options.body.input.executionMode,'AUTO_UPLOAD')
+  assert.equal(f.calls.some(call=>call.path.includes('/enabled')||call.path.includes('/transfers/')),false)
+})
+test('unknown embedded upload-rule save stays open and locked until the original operation GET confirms it',async t=>{
+  const f=mount(t,{createOnly:true,embedded:true});await flush();Object.assign(f.state.form,automatic().rule.input)
+  f.expect('/rules',new Error('timeout'));await f.state.save()
+  const operation=f.calls[0].options.body.operationId,draft=JSON.parse(JSON.stringify(f.state.form))
+  assert.equal(f.state.uncertain.value,true);assert.deepEqual(f.events.at(-1),['locked',true])
+  f.state.closeForm();f.state.edit(null);await f.state.save()
+  assert.equal(f.state.formOpen.value,true);assert.deepEqual(f.state.form,draft)
+  assert.equal(f.calls.length,1);assert.equal(f.events.some(event=>event[0]==='close'||event[0]==='saved'),false)
+  f.props.available=false;await flush();f.props.available=true;await flush()
+  assert.equal(f.calls.length,1);assert.equal(f.state.uncertain.value,true);assert.deepEqual(f.state.form,draft)
+  f.expect('/rules/by-operation/'+operation,automatic(),'GET');await f.state.lookup()
+  assert.equal(f.state.uncertain.value,false);assert.equal(f.state.items.value[0].rule.enabled,false)
+  assert.deepEqual(f.events.slice(-2),[['locked',false],['saved','upload']])
+  assert.equal(f.calls.filter(call=>call.options.method==='POST').length,1)
+})
+test('an embedded upload-rule mode mismatch cannot emit saved or close the unresolved form',async t=>{
+  const f=mount(t,{createOnly:true,embedded:true});await flush();Object.assign(f.state.form,automatic().rule.input)
+  f.expect('/rules',result());await f.state.save()
+  const operation=f.calls[0].options.body.operationId
+  assert.equal(f.state.uncertain.value,true);f.state.closeForm();assert.equal(f.state.formOpen.value,true)
+  f.expect('/rules/by-operation/'+operation,result(),'GET');await f.state.lookup()
+  assert.equal(f.state.uncertain.value,true);assert.equal(f.events.some(event=>event[0]==='saved'),false)
+  f.expect('/rules/by-operation/'+operation,automatic(),'GET');await f.state.lookup()
+  assert.deepEqual(f.events.at(-1),['saved','upload']);assert.equal(f.calls.filter(call=>call.options.method==='POST').length,1)
+})
+test('management category and refresh presets select saved uploads through readonly reads',async t=>{
+  const f=mount(t,{category:'upload',refreshVersion:0});await flush()
+  assert.equal(f.state.selectedCategory.value,'upload');assert.equal(f.events.length,0)
+  f.props.category='download';await flush();assert.equal(f.state.selectedCategory.value,'download')
+  f.expect('/rules',{mode:'RULES',items:[automatic()]},'GET');f.props.refreshVersion++;await flush()
+  assert.equal(f.state.items.value.length,1);assert.equal(f.calls.length,2)
+  assert.equal(f.calls.every(call=>(call.options.method??'GET')==='GET'),true)
+  f.props.category='upload';await flush();f.state.selectCategory('download');await flush();assert.equal(f.state.selectedCategory.value,'download')
+  f.expect('/rules',{mode:'RULES',items:[automatic()]},'GET');f.props.refreshVersion++;await flush();assert.equal(f.state.selectedCategory.value,'upload')
+})

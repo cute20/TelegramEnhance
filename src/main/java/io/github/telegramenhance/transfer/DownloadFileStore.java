@@ -36,7 +36,7 @@ public final class DownloadFileStore {
         Path root = paths.root(task.targetRoot());
         if (!DownloadPaths.key(root).equals(DownloadPaths.key(Path.of(task.targetRoot())))) throw new IOException("Bound root changed");
         Files.createDirectories(root); root = root.toRealPath();
-        if (relative.isAbsolute() || relative.normalize().startsWith("..")) throw new IOException("Invalid relative directory");
+        if (relative.isAbsolute() || relative.getRoot()!=null || relative.normalize().startsWith("..")) throw new IOException("Invalid relative directory");
         Path current = root;
         for (Path part : relative) {
             Path child = current.resolve(part);
@@ -114,12 +114,13 @@ public final class DownloadFileStore {
     }
     private Path output(Task task,String value)throws IOException{
         Path relative=Path.of(value);
-        if(relative.isAbsolute()||!relative.normalize().equals(relative)||relative.startsWith("..")||relative.getParent()==null)throw new IOException("Invalid planned output path");
-        return target(directory(task,relative.getParent()),relative.getFileName().toString());
+        if(value.isBlank()||relative.isAbsolute()||relative.getRoot()!=null||!relative.normalize().equals(relative)||relative.startsWith(".."))throw new IOException("Invalid planned output path");
+        return target(directory(task,relative.getParent()==null?Path.of(""):relative.getParent()),relative.getFileName().toString());
     }
     private record SourceRecord(int version,String taskId,String itemId,String sourceLink,String sourceChatId,String sourceMessageId,String postLink,String uniqueId,long size,String sha256,String savedFile,String reason,String duplicateOf,String previousSavedPath,long plannedAt) { }
     private void writeManifest(Task task,Item item,OutputPlan plan,Runnable check)throws IOException{
-        if(plan==null||plan.duplicate()==null)return;
+        // Existing frozen plans may still require their legacy sidecar during finalization recovery.
+        if(plan==null||plan.duplicate()==null||plan.manifestRelative()==null)return;
         check.run();Path target=output(task,plan.manifestRelative());var ref=item.file().media().message();var duplicate=plan.duplicate();
         String postLink=task.post().mainMessages().stream().map(r->r.link()).filter(s->s!=null&&!s.isBlank()).findFirst().orElse(null);
         byte[] bytes=JsonMapper.builder().build().writeValueAsString(new SourceRecord(1,task.id(),item.id(),ref.link(),ref.chatId(),ref.messageId(),postLink,item.file().uniqueId(),item.file().size(),plan.sha256(),Path.of(task.targetRoot()).resolve(plan.relativePath()).toString(),duplicate.reason(),duplicate.itemId(),duplicate.path(),plan.plannedAt())).getBytes(StandardCharsets.UTF_8);

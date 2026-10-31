@@ -70,7 +70,11 @@ class DownloadEngineTest {
             var first=f.task();f.start();f.await(first.id(),"COMPLETED");
             var next=f.repository.create("1",UUID.randomUUID().toString(),"keep-copy",DownloadPersistenceTest.post("title"),f.root,List.of(DownloadPersistenceTest.file(37,"test.bin")));
             var view=f.repository.view(f.await(next.id(),"COMPLETED"));assertEquals(1,view.completed());assertEquals(1,view.duplicates());assertEquals(0,view.skipped());
-            assertArrayEquals(new byte[37],Files.readAllBytes(Path.of(view.items().getFirst().outputPath())));assertTrue(Files.exists(Path.of(view.items().getFirst().manifestPath())));
+            var item=view.items().getFirst();Path output=Path.of(item.outputPath());
+            assertArrayEquals(new byte[37],Files.readAllBytes(output));assertNull(item.manifestPath());
+            try(var entries=Files.list(output.getParent())){assertEquals(List.of(output),entries.toList());}
+            f.database.read(c->{try(var q=c.prepareStatement("SELECT size,sha256,source_key,duplicate_of,manifest_path,output_path FROM download_completion_log WHERE item_id=?")){
+                q.setString(1,item.id());try(var r=q.executeQuery()){assertTrue(r.next());assertEquals(37,r.getLong("size"));assertEquals(64,r.getString("sha256").length());assertEquals("1:-1001:100:0",r.getString("source_key"));assertNotNull(r.getString("duplicate_of"));assertNull(r.getString("manifest_path"));assertEquals(output.toString(),r.getString("output_path"));}}return null;});
             verify(f.reader,times(2)).resolve(any(),any(),anyLong());verify(f.reader,times(2)).chunk(anyString(),anyLong(),anyInt(),anyString(),anyLong(),anyLong(),anyInt());
         }
     }

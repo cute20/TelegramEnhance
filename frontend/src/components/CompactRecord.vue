@@ -1,10 +1,11 @@
 <script setup lang="ts">
-import {computed,ref} from 'vue'
+import {computed,ref,watch} from 'vue'
 import AppIcon from './AppIcon.vue'
-const props=defineProps<{title:string;description:string;status:string;tone?:'neutral'|'success'|'warning'|'active';timestamp?:number;timeLabel?:string;defaultExpanded?:boolean;alert?:string|null}>()
-const expanded=ref(!!props.defaultExpanded)
+const props=defineProps<{title:string;description:string;status:string;tone?:'neutral'|'success'|'warning'|'active';timestamp?:number;timeLabel?:string;defaultExpanded?:boolean;alert?:string|null;active?:boolean}>()
+const expanded=ref(props.active!==false&&!!props.defaultExpanded)
 const timeText=computed(()=>props.timestamp&&Number.isFinite(props.timestamp)?new Intl.DateTimeFormat('zh-CN',{timeZone:'Asia/Shanghai',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'}).format(props.timestamp):'')
-function toggled(event:Event){expanded.value=(event.currentTarget as HTMLDetailsElement).open}
+function toggled(event:Event){const details=event.currentTarget as HTMLDetailsElement;if(props.active===false)details.open=false;expanded.value=details.open}
+watch(()=>props.active,active=>{if(active===false)expanded.value=false},{flush:'sync'})
 </script>
 <template>
   <article class="compact-record">

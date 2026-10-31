@@ -22,7 +22,7 @@ class DownloadRuleMigrationTest {
             s.execute("PRAGMA journal_mode=WAL");s.execute("PRAGMA wal_autocheckpoint=0");s.execute("INSERT INTO app_settings VALUES('latest-wal','preserved',8)");
             assertTrue(Files.size(Path.of(paths.database()+"-wal"))>0);
             try(var db=new Database(paths)){
-                assertEquals(15,db.diagnostics().get("schemaVersion"));assertEquals("ok",db.diagnostics().get("integrity"));assertEquals("opaque-current-user-ciphertext",value(db,"SELECT setting_value FROM app_settings WHERE setting_key='protected-key'"));assertEquals("preserved",value(db,"SELECT setting_value FROM app_settings WHERE setting_key='latest-wal'"));
+                assertEquals(Database.SCHEMA_VERSION,db.diagnostics().get("schemaVersion"));assertEquals("ok",db.diagnostics().get("integrity"));assertEquals("opaque-current-user-ciphertext",value(db,"SELECT setting_value FROM app_settings WHERE setting_key='protected-key'"));assertEquals("preserved",value(db,"SELECT setting_value FROM app_settings WHERE setting_key='latest-wal'"));
                 for(String table:java.util.List.of("download_rules","download_rule_versions","download_rule_scans","download_rule_posts","download_rule_media","download_rule_tasks"))assertEquals("0",value(db,"SELECT COUNT(*) FROM "+table));
                 try(var backup=DriverManager.getConnection("jdbc:sqlite:"+db.diagnostics().get("lastMigrationBackup"))){assertEquals("14",scalar(backup,"PRAGMA user_version"));assertEquals("ok",scalar(backup,"PRAGMA quick_check"));assertEquals("preserved",scalar(backup,"SELECT setting_value FROM app_settings WHERE setting_key='latest-wal'"));assertEquals("0",scalar(backup,"SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='download_rules'"));}
             }
@@ -39,7 +39,7 @@ class DownloadRuleMigrationTest {
         var paths=new AppPaths(directory);try(var ignored=new Database(paths)){}
         try(var c=DriverManager.getConnection("jdbc:sqlite:"+paths.database());var s=c.createStatement()){s.execute("ALTER TABLE download_rule_tasks RENAME COLUMN held TO missing_hold");}
         assertThrows(IllegalStateException.class,()->new Database(paths));try(var files=Files.list(paths.backups())){assertEquals(0,files.count());}
-        try(var c=DriverManager.getConnection("jdbc:sqlite:"+paths.database())){assertEquals("15",scalar(c,"PRAGMA user_version"));}
+        try(var c=DriverManager.getConnection("jdbc:sqlite:"+paths.database())){assertEquals(Integer.toString(Database.SCHEMA_VERSION),scalar(c,"PRAGMA user_version"));}
     }
     static String value(Database db,String sql){return db.read(c->scalar(c,sql));}
     static String scalar(Connection c,String sql)throws java.sql.SQLException{try(var s=c.createStatement();var r=s.executeQuery(sql)){assertTrue(r.next());return r.getString(1);}}
