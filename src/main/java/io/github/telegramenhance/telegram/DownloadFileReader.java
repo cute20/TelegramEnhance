@@ -30,7 +30,9 @@ public final class DownloadFileReader {
         var files = new ArrayList<FrozenFile>();
         for (var media : selected) {
             check(post.accountId(), session);var frozen=resolve(post,media,session,deadline).file();var current=frozen.media();var ref=current.message();
-            if(ref.link()==null||ref.link().isBlank()){
+            if("BOT".equals(media.source())&&(frozen.size()!=media.size()||!Objects.equals(frozen.fileName(),media.fileName())))
+                throw new IllegalArgumentException("源文件已变化，请刷新机器人回复并重新核对所选媒体");
+            if(!"BOT".equals(media.source())&&(ref.link()==null||ref.link().isBlank())){
                 String link=messageLink(post.accountId(),session,ref,deadline);
                 if(link!=null)frozen=new FrozenFile(new Media(current.key(),new MessageRef(ref.chatId(),ref.messageId(),link),current.source(),current.type(),current.fileName(),current.size(),current.caption()),frozen.uniqueId(),frozen.size(),frozen.fileName());
             }files.add(frozen);
@@ -54,22 +56,39 @@ public final class DownloadFileReader {
         check(post.accountId(), session); var ref = selected.message();
         if (ref == null) throw new IllegalArgumentException("下载媒体身份无效");
         long chatId = Long.parseLong(ref.chatId()), messageId = Long.parseLong(ref.messageId());
-        boolean main = "MAIN".equals(selected.source());
-        if (main ? !post.channelId().equals(ref.chatId()) || post.mainMessages().stream().noneMatch(m -> same(m, ref))
+        boolean bot = "BOT".equals(selected.source()), main = "MAIN".equals(selected.source());
+        long botId = bot ? botIdentity(post, ref) : 0;
+        if (!bot && (main ? !post.channelId().equals(ref.chatId()) || post.mainMessages().stream().noneMatch(m -> same(m, ref))
                 : !"COMMENT".equals(selected.source()) || !Objects.equals(post.discussionChatId(), ref.chatId())
-                    || Objects.equals(post.discussionRootMessageId(), ref.messageId()) || post.discussionRoots().stream().anyMatch(m -> same(m, ref))) {
+                    || Objects.equals(post.discussionRootMessageId(), ref.messageId()) || post.discussionRoots().stream().anyMatch(m -> same(m, ref)))) {
             throw new IllegalArgumentException("媒体不属于当前主帖下载范围");
         }
         var chat = call(post.accountId(), session, new TdApi.GetChat(chatId), deadline);
         if (chat == null || chat.id != chatId || chat.hasProtectedContent) throw new IllegalArgumentException("来源不可访问或限制保存内容");
-        var message = call(post.accountId(), session, new TdApi.GetMessage(chatId, messageId), deadline);
-        var properties = call(post.accountId(), session, new TdApi.GetMessageProperties(chatId, messageId), deadline);
-        if (message == null || message.id != messageId || message.chatId != chatId || message.isChannelPost != main
-                || properties == null || !properties.canBeSaved || message.selfDestructType != null || message.selfDestructIn > 0 || message.ephemeralContent != null
-                || main && !Long.toString(message.mediaAlbumId).equals(post.albumId() == null ? "0" : post.albumId())) {
-            throw new IllegalArgumentException("源消息不可保存或身份已变化，请重新核对");
+        if (bot) {
+            if (!(chat.type instanceof TdApi.ChatTypePrivate type) || type.userId != botId) throw new IllegalArgumentException("机器人下载来源不是原私聊");
+            var user = call(post.accountId(), session, new TdApi.GetUser(botId), deadline);
+            if (user == null || user.id != botId || !(user.type instanceof TdApi.UserTypeBot)) throw new IllegalArgumentException("机器人身份已变化，请重新预览");
         }
-        if (!main && message.topicId instanceof TdApi.MessageTopicThread thread
+        var message = call(post.accountId(), session, new TdApi.GetMessage(chatId, messageId), deadline);
+        if (message == null || message.id != messageId || message.chatId != chatId)
+            throw sourceFailure(selected, "原机器人消息已不可读取或消息身份不符，请重新读取本次资源");
+        if (message.isChannelPost != main || main && !Long.toString(message.mediaAlbumId).equals(post.albumId() == null ? "0" : post.albumId()))
+            throw sourceFailure(selected, "所选消息已不属于原机器人私聊，请重新读取本次资源");
+        if (message.selfDestructType != null || message.selfDestructIn > 0)
+            throw sourceFailure(selected, "该消息为阅后即焚内容，不支持下载");
+        if (message.ephemeralContent != null)
+            throw sourceFailure(selected, "该消息包含仅当前用户可见的替代内容，当前尚不支持下载");
+        // Bot replies use the explicitly observed private-message scope and the original-file transfer result.
+        // Keep the existing save-property gate for channel posts and discussion media.
+        if (!bot) {
+            var properties = call(post.accountId(), session, new TdApi.GetMessageProperties(chatId, messageId), deadline);
+            if (properties == null || !properties.canBeSaved)
+                throw new IllegalArgumentException("源消息不可保存或身份已变化，请重新核对");
+        }
+        if (bot && (message.isOutgoing || !(message.senderId instanceof TdApi.MessageSenderUser sender) || sender.userId != botId))
+            throw new IllegalArgumentException("源媒体不是原机器人发来的消息");
+        if (!bot && !main && message.topicId instanceof TdApi.MessageTopicThread thread
                 && !Long.toString(thread.messageThreadId).equals(post.discussionRootMessageId())
                 && post.discussionRoots().stream().noneMatch(root -> root.messageId().equals(Long.toString(thread.messageThreadId)))) {
             throw new IllegalArgumentException("源消息不属于原评论线程");
@@ -95,6 +114,25 @@ public final class DownloadFileReader {
             throw new IllegalArgumentException("未取得可校验的原文件大小和稳定身份，未开始下载");
         }
         return new Resolved(new FrozenFile(media, file.remote.uniqueId, file.size, media.fileName()), file.id);
+    }
+    private static IllegalArgumentException sourceFailure(Media selected, String botReason) {
+        if (!"BOT".equals(selected.source())) return new IllegalArgumentException("源消息不可保存或身份已变化，请重新核对");
+        String name = selected.fileName() == null ? "所选媒体" : selected.fileName().replaceAll("\\p{Cntrl}", " ").strip();
+        if (name.isEmpty()) name = "所选媒体";
+        if (name.length() > 160) name = name.substring(0, 160) + "…";
+        return new IllegalArgumentException("文件“" + name + "”：" + botReason);
+    }
+    private static long botIdentity(Post post, MessageRef ref) {
+        String[] key = post.key() == null ? new String[0] : post.key().split(":", -1);
+        if (key.length != 4 || !"bot".equals(key[0]) || !positiveId(key[1]) || !positiveId(key[2]) || !positiveId(key[3])
+                || !key[2].equals(post.channelId()) || !key[3].equals(post.mainMessageId()) || !post.channelId().equals(ref.chatId())
+                || !positiveId(ref.messageId()) || post.mainMessages().stream().noneMatch(message -> same(message, ref)))
+            throw new IllegalArgumentException("媒体不属于本次已观察的机器人下载范围");
+        try { return Long.parseLong(key[1]); } catch (NumberFormatException invalid) { throw new IllegalArgumentException("机器人身份无效"); }
+    }
+    private static boolean positiveId(String value) {
+        if (value == null || !value.matches("[1-9][0-9]{0,18}")) return false;
+        try { return Long.parseLong(value) > 0; } catch (NumberFormatException invalid) { return false; }
     }
     public Status status(String accountId, long session, int id, String uniqueId, long size) {
         var file = checked(accountId, session, id, uniqueId, size);

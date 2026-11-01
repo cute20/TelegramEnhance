@@ -30,6 +30,24 @@ class DownloadFileReaderTest {
             assertTrue(f.calls.stream().noneMatch(q -> q instanceof TdApi.DownloadFile || q instanceof TdApi.ReadFilePart));
         }
     }
+    @Test void discussionMediaKeepsTheSavePermissionGateWhileValidCommentsCanFreeze() {
+        for (boolean permitted : List.of(false, true)) {
+            var f = new Fixture(); f.properties.canBeSaved = permitted;
+            f.message.isChannelPost = false; f.message.topicId = new TdApi.MessageTopicThread(99);
+            var selected = new Media(f.media.key(), f.media.message(), "COMMENT", f.media.type(), f.media.fileName(), f.media.size(), "");
+            var main = new MessageRef("-1009", "200", null); var root = new MessageRef("-1001", "99", null);
+            var post = new Post("1:-1009:200", "1", "-1009", "channel", "200", "title", "", null,
+                    List.of(main), List.of(), "-1001", "99", List.of(root), true, "COMPLETE", List.of());
+            if (permitted) {
+                var frozen = f.reader.freeze(post, List.of(selected), 1).getFirst();
+                assertEquals("COMMENT", frozen.media().source()); assertEquals(selected.message().messageId(), frozen.media().message().messageId());
+                assertEquals("unique", frozen.uniqueId()); assertEquals(11, frozen.size());
+            } else assertThrows(IllegalArgumentException.class, () -> f.reader.freeze(post, List.of(selected), 1));
+            assertTrue(f.calls.stream().anyMatch(q -> q instanceof TdApi.GetMessageProperties));
+            assertTrue(f.calls.stream().noneMatch(q -> q instanceof TdApi.GetFile || q instanceof TdApi.DownloadFile
+                    || q instanceof TdApi.ReadFilePart || q instanceof TdApi.CancelDownloadFile || q instanceof TdApi.DeleteFile));
+        }
+    }
     @Test void resumingCannotSilentlyReplaceTheFrozenRemoteVersion() {
         var f = new Fixture(); var frozen = f.reader.freeze(f.post, List.of(f.media), 1).getFirst(); f.file.remote.uniqueId = "changed";
         assertThrows(IllegalArgumentException.class, () -> f.reader.resolve(f.post, frozen, 1));
