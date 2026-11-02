@@ -50,7 +50,8 @@ public final class DownloadEngine implements AutoCloseable {
         };
         try {
             for (var item : task.items()) {
-                if (item.state().equals("COMPLETED") || item.state().equals("SKIPPED_HISTORY")) continue;
+                if (item.state().equals("COMPLETED")) continue;
+                if (item.state().equals("SKIPPED_HISTORY")) { check.run();files.cleanupSkipped(task,item);continue; }
                 check.run();
                 // Window/enable changes apply to the next media, not its already-started byte stream.
                 if (rules != null) rules.beforeItem(task);

@@ -146,3 +146,34 @@ test('task sidebar return keeps the same unkeyed mounted component and category 
   assert.equal(returned.type, initial.type); assert.equal(returned.key, initial.key); assert.equal(returned.props.active, true)
   assert.equal(returned.props.category, 'upload'); assert.equal(f.state.taskRefresh.value, nonce); assert.deepEqual(f.calls, [])
 })
+
+test('settings keep their mounted preference component and drafts across navigation while hidden download settings are inactive',async t=>{
+  const f=mount(t),initial=component(f.render(),'DownloadSettings')
+  assert.ok(initial);assert.equal(initial.props.active,true);assert.equal(initial.props.available,true);assert.equal(initial.key,null)
+  f.state.form.apiHash='unsaved-private-draft';f.state.authValue.value='typed-code';f.state.navigate('tasks');await flush()
+  const hidden=component(f.render(),'DownloadSettings');assert.equal(hidden.type,initial.type);assert.equal(hidden.key,initial.key);assert.equal(hidden.props.active,false)
+  const settingsPage=nodes(f.render()).find(node=>node.type==='section'&&node.props?.class==='settings-page')
+  assert.ok(settingsPage.testDirectives.some(([,shown])=>shown===false))
+  f.expectSettings(settings(),diagnostics('return'));f.state.navigate('settings');await flush()
+  const returned=component(f.render(),'DownloadSettings');assert.equal(returned.type,initial.type);assert.equal(returned.key,null);assert.equal(returned.props.active,true)
+  assert.equal(f.state.form.apiHash,'unsaved-private-draft');assert.equal(f.state.authValue.value,'typed-code')
+})
+
+test('settings diagnostics and onboarding are collapsed by default while credential and authorization inputs remain directly accessible',t=>{
+  const f=mount(t);f.state.telegram.value={authState:'WAIT_CODE',connectionState:'READY',userId:null,nativeLoaded:true,nativeVersion:'synthetic'}
+  f.state.error.value='visible service error';const tree=f.render(),details=nodes(tree).filter(node=>node.type==='details')
+  const text=node=>typeof node==='string'?node:Array.isArray(node)?node.map(text).join(''):node&&typeof node==='object'?text(node.children):''
+  const summaryText=node=>nodes(node).filter(child=>child.type==='summary').map(text).join('')
+  const diagnostic=details.find(node=>summaryText(node).includes('本机诊断')),help=details.find(node=>summaryText(node).includes('首次连接帮助'))
+  const staticHelp=nodes(tree).map(node=>node.children).find(content=>typeof content==='string'&&content.includes('<summary>首次连接帮助</summary>'))
+  assert.ok(diagnostic);assert.notEqual(diagnostic.props?.open,true)
+  // Vue may hoist the entirely static onboarding disclosure into one static HTML VNode.
+  if(help)assert.notEqual(help.props?.open,true)
+  else assert.match(staticHelp??'',/<details(?![^>]*\bopen\b)[^>]*><summary>首次连接帮助<\/summary>/)
+  for(const id of ['api-id','api-hash','proxy-type','auth-value']){
+    assert.ok(nodes(tree).some(node=>node.props?.id===id),id)
+    assert.equal(details.some(detail=>nodes(detail).some(node=>node.props?.id===id)),false,id+' must stay outside collapsed help')
+  }
+  assert.ok(nodes(tree).some(node=>node.props?.role==='alert'&&text(node).includes('visible service error')))
+  assert.ok(component(tree,'ThumbnailCacheSettings'));assert.ok(component(tree,'DownloadSettings'))
+})

@@ -67,8 +67,8 @@ test('explicitly rereading the same bot clears the old resource before the reque
   const response=deferred();f.expect(BASE+'/preview',response.promise,'POST');const pending=f.state.open()
   assert.equal(f.state.source.value,'@synthetic_bot');assert.equal(f.state.preview.value,null);assert.deepEqual(f.state.selected.value,[])
   assert.equal(f.state.manualButton.value,null);assert.equal(f.state.createdTask.value,null);assert.equal(f.state.pressUnknown.value,false);assert.equal(f.state.waitUnknown.value,false);assert.equal(f.state.localTimedOut.value,false)
-  response.resolve(new ApiError('请先在Telegram重新打开第一页',400));await pending
-  assert.equal(f.state.preview.value,null);assert.deepEqual(f.state.selected.value,[]);assert.match(f.state.error.value,/重新打开第一页/)
+  response.resolve(new ApiError('请先在Telegram重新打开当前资源',400));await pending
+  assert.equal(f.state.preview.value,null);assert.deepEqual(f.state.selected.value,[]);assert.match(f.state.error.value,/重新打开当前资源/)
   assert.doesNotMatch(text(f.render()),/sample\.txt|已获取第1组文件/)
 })
 test('an unknown task creation still blocks resource rereads without discarding the frozen operation or its selected media',async t=>{
@@ -127,7 +127,8 @@ test('brief local unavailability preserves source, media choice and unresolved t
 })
 test('the resource browser exposes no old-history or controller-switch route and refreshes only the current resource',async t=>{
   const f=await opened(t);const tree=f.render()
-  assert.match(text(tree),/重新打开资源第一页.*只追加本次媒体/s);assert.match(text(tree),/本次资源消息/)
+  assert.match(text(tree),/读取当前页／组.*可从任意页开始.*只追加本次媒体/s);assert.match(text(tree),/本次资源消息/)
+  assert.doesNotMatch(text(tree),/第一页/)
   assert.doesNotMatch(text(tree),/读取更早消息|分页消息|可选择分页消息/)
   assert.equal(nodes(tree).filter(node=>node.type==='select').length,0)
   await f.state.read('older');await f.state.read('control','1002');assert.equal(f.calls.length,1,'removed routes are also rejected at runtime')
@@ -266,7 +267,7 @@ test('a failed manual refresh within an observation window immediately stops its
 
 test('a manual GET rejection invalidates old-resource media and controls while preserving source and output drafts',async t=>{
   const f=await opened(t);f.state.select('file-a');f.state.manualButton.value=button();f.state.targetDirectory.value='D:\\chosen'
-  f.expect(BASE+'/preview/'+ID,new ApiError('机器人已收到另一次请求，请重新打开本次资源第一页再读取',400));await f.state.read('refresh')
+  f.expect(BASE+'/preview/'+ID,new ApiError('机器人已收到另一次请求，请重新打开当前资源再读取',400));await f.state.read('refresh')
   assert.equal(f.state.preview.value,null);assert.deepEqual(f.state.selected.value,[]);assert.equal(f.state.manualButton.value,null)
   assert.equal(f.state.source.value,'@synthetic_bot');assert.equal(f.state.targetDirectory.value,'D:\\chosen');assert.equal(f.state.canPress.value,false)
   assert.match(f.state.error.value,/另一次请求/);assert.doesNotMatch(text(f.render()),/sample\.txt/)
@@ -399,8 +400,8 @@ test('download preparation and a rejected in-flight GET remain visible in the ac
   const f=await opened(t);f.state.select('file-a');f.state.targetDirectory.value='D:\\chosen'
   const response=deferred();f.expect(BASE+'/preview/'+ID,response.promise);const refresh=f.state.read(),pending=f.state.create()
   assert.match(text(downloadFooter(f)),/正在核对已选媒体/)
-  response.resolve(new ApiError('本次资源已失效，请重新读取第一页',400));await Promise.all([refresh,pending])
-  assert.equal(f.state.preview.value,null);assert.match(text(downloadFooter(f)),/本次资源已失效，请重新读取第一页/)
+  response.resolve(new ApiError('本次资源已失效，请重新读取当前页',400));await Promise.all([refresh,pending])
+  assert.equal(f.state.preview.value,null);assert.match(text(downloadFooter(f)),/本次资源已失效，请重新读取当前页/)
   assert.equal(f.calls.filter(call=>call.path===BASE+'/tasks').length,0)
 })
 
@@ -503,4 +504,37 @@ test('a permission rejection preserves its footer reason and lets the user remov
   assert.equal(request.sourceId,rejected.sourceId);assert.equal(request.revision,rejected.revision);assert.equal(request.targetDirectory,rejected.targetDirectory)
   assert.equal(f.state.createdTask.value.id,accepted.id);assert.equal(f.calls.filter(call=>call.path===BASE+'/tasks').length,2)
   await f.advance(300000);assert.equal(f.calls.length,3);assert.equal(f.events.some(event=>event[0]==='tasks'),false)
+})
+
+test('the current-page reader accepts an initial middle or final page and downloads its media without implicit pagination or history reads',async t=>{
+  for(const currentPage of [2,6]){
+    const last=currentPage===6,view=preview({currentPage,paginationStatus:last?'END':'MORE',recommendedButtonId:last?null:'button-next'})
+    view.messages[1].text=`已获取第${currentPage}组文件（共6组）`
+    const f=mount(t);f.state.source.value='@synthetic_bot'
+    const open=nodes(f.render()).find(node=>node.type==='button'&&text(node)==='读取当前页／组')
+    f.expect(BASE+'/preview',view,'POST');await open.props.onClick({type:'click'})
+    assert.equal(f.state.preview.value.currentPage,currentPage);assert.match(text(f.render()),new RegExp(`第 ${currentPage} / 6 页／组`))
+    assert.equal(f.calls.length,1);assert.deepEqual(f.state.selected.value,[]);assert.equal(f.state.observing.value,false)
+    if(last)assert.match(text(f.render()),/机器人已显示最后一页／组/)
+    f.state.select('file-a');f.state.targetDirectory.value='D:\\chosen';assert.equal(f.state.canCreate.value,true)
+    const download=nodes(downloadFooter(f)).find(node=>node.type==='button'&&text(node)==='下载选中媒体')
+    f.expect(BASE+'/tasks',task(),'POST');await download.props.onClick({type:'click'})
+    assert.deepEqual(f.calls[1].options.body.mediaKeys,['file-a']);assert.equal(f.state.createdTask.value.id,task().id)
+    await f.advance(300000);assert.deepEqual(f.calls.map(call=>call.path),[BASE+'/preview',BASE+'/tasks'])
+    assert.equal(f.timers.size,0,'reading a current page never starts a pagination observation window by itself')
+  }
+})
+
+test('explicitly rereading after a manual Telegram page change starts from that current batch without carrying the previous selection',async t=>{
+  const f=await opened(t,preview({currentPage:2}));f.state.select('file-a');f.state.targetDirectory.value='D:\\chosen'
+  const value=preview({currentPage:6,paginationStatus:'END',recommendedButtonId:null})
+  value.media[0].key='file-b';value.media[0].fileName='current-batch.txt';value.media[0].message.messageId='1003'
+  value.messages[0].id='1003';value.messages[0].media=[copy(value.media[0])];value.messages[1].text='文件夹内容发送完成'
+  f.expect(BASE+'/preview',value,'POST')
+  const open=nodes(f.render()).find(node=>node.type==='button'&&text(node)==='读取当前页／组');await open.props.onClick({type:'click'})
+  assert.deepEqual(f.state.selected.value,[]);assert.deepEqual(f.state.preview.value.media.map(media=>media.key),['file-b'])
+  assert.equal(f.state.preview.value.currentPage,6);assert.equal(f.state.targetDirectory.value,'D:\\chosen')
+  f.state.select('file-b');f.expect(BASE+'/tasks',task(),'POST');await f.state.create()
+  assert.deepEqual(f.calls[2].options.body.mediaKeys,['file-b'])
+  assert.deepEqual(f.calls.map(call=>call.path),[BASE+'/preview',BASE+'/preview',BASE+'/tasks']);assert.equal(f.timers.size,0)
 })

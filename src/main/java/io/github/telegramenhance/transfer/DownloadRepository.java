@@ -3,6 +3,7 @@ package io.github.telegramenhance.transfer;
 import io.github.telegramenhance.library.ResourceModels.Post;
 import io.github.telegramenhance.library.ResourceModels.MessageRef;
 import io.github.telegramenhance.storage.Database;
+import io.github.telegramenhance.storage.DownloadSettings;
 import io.github.telegramenhance.transfer.DownloadModels.*;
 import io.github.telegramenhance.transfer.DownloadBatchModels.BatchStatus;
 import io.github.telegramenhance.transfer.DownloadBatchModels.TaskSummary;
@@ -30,18 +31,19 @@ public final class DownloadRepository {
         }
     }); }
     public Task create(String account, String operation, String fingerprint, Post post, Path root, List<FrozenFile> files) {
-        return create(account, operation, fingerprint, post, root, files, KEEP_DUPLICATES);
+        return database.write(c -> { String policy=DownloadSettings.readPolicy(c);return create(c,account,operation,fingerprint,post,root,files,policy,HISTORY_SKIP.equals(policy)); });
     }
     public Task create(String account, String operation, String fingerprint, Post post, Path root, List<FrozenFile> files, String policy) {
         if (!List.of(HISTORY_SKIP, KEEP_DUPLICATES).contains(policy)) throw new IllegalArgumentException("下载策略无效");
-        return database.write(c -> create(c,account,operation,fingerprint,post,root,files,policy));
+        return database.write(c -> create(c,account,operation,fingerprint,post,root,files,policy,false));
     }
     /** Short caller-owned SQL transaction: allows durable source checkpoints and tasks to commit together. */
     public Task createInTransaction(Connection connection,String account,String operation,String fingerprint,Post post,Path root,List<FrozenFile> files)throws SQLException {
         if(connection.getAutoCommit()||post==null||!account.equals(post.accountId())||files==null||files.isEmpty()||files.size()>100)throw new IllegalArgumentException("持续下载任务事务或清单无效");
-        return create(connection,account,operation,fingerprint,post,root,List.copyOf(files),KEEP_DUPLICATES);
+        String policy=DownloadSettings.readPolicy(connection);
+        return create(connection,account,operation,fingerprint,post,root,List.copyOf(files),policy,HISTORY_SKIP.equals(policy));
     }
-    private Task create(Connection c,String account,String operation,String fingerprint,Post post,Path root,List<FrozenFile> files,String policy)throws SQLException{
+    private Task create(Connection c,String account,String operation,String fingerprint,Post post,Path root,List<FrozenFile> files,String policy,boolean skipContent)throws SQLException{
             try (var q = c.prepareStatement("SELECT task_id,fingerprint FROM download_tasks WHERE account_id=? AND operation_id=?")) {
                 q.setString(1, account); q.setString(2, operation); try (var rows = q.executeQuery()) {
                     if (rows.next()) { if (!fingerprint.equals(rows.getString(2))) throw new IllegalArgumentException("同一操作的参数已变化，请重新创建任务"); return task(c, account, rows.getString(1)); }
@@ -50,7 +52,7 @@ public final class DownloadRepository {
             // Legacy bindings remain untouched for old checkpoints. Never reuse their extra directories for a new task.
             String directory = DownloadPaths.directory(post);
             String id = UUID.randomUUID().toString(); long stamp = now();
-            update(c, "INSERT INTO download_tasks VALUES(?,?,?,?,?,?,?,?,'QUEUED',0,NULL,?,?,?)", id, account, operation, fingerprint, post.key(), encode(post), root.toString(), directory, stamp, stamp, policy);
+            update(c, "INSERT INTO download_tasks(task_id,account_id,operation_id,fingerprint,post_key,post_json,target_root,relative_directory,state,pause_requested,error_message,created_at,updated_at,duplicate_policy,skip_content_duplicates) VALUES(?,?,?,?,?,?,?,?,'QUEUED',0,NULL,?,?,?,?)", id, account, operation, fingerprint, post.key(), encode(post), root.toString(), directory, stamp, stamp, policy,skipContent?1:0);
             for (int i = 0; i < files.size(); i++) {
                 var file = files.get(i); String relative = DownloadPaths.file(file,root);
                 if (root.resolve(directory).resolve(relative).toString().length() > 240) throw new IllegalArgumentException("保存路径过长，请选择更短的根目录");
@@ -66,10 +68,11 @@ public final class DownloadRepository {
         for(var job:jobs){if(!account.equals(job.post().accountId())||job.files().isEmpty()||job.files().size()>100)throw new IllegalArgumentException("批量主帖或媒体数量无效。");for(var file:job.files()){if(!keys.add(file.media().key())||file.size()<=0)throw new IllegalArgumentException("批量清单包含重复或无效媒体。");total++;bytes=Math.addExact(bytes,file.size());}}
         if(total>1000||total!=snapshot.total()||bytes!=snapshot.totalBytes())throw new IllegalArgumentException("批量媒体统计不符。");
         return database.write(c->{var previous=batchByOperation(c,account,operation,fingerprint);if(previous!=null)return previous;
+            String policy=DownloadSettings.readPolicy(c);
             String id=UUID.randomUUID().toString();long stamp=now();update(c,"INSERT INTO download_batches VALUES(?,?,?,?,?,?)",id,account,operation,fingerprint,encode(snapshot),stamp);
             var ids=new ArrayList<String>();int index=0;
             for(var job:jobs){String childOperation=UUID.nameUUIDFromBytes(("batch:"+id+":"+index).getBytes(java.nio.charset.StandardCharsets.UTF_8)).toString();
-                var child=create(c,account,childOperation,fingerprint+":"+index,job.post(),root,job.files(),KEEP_DUPLICATES);ids.add(child.id());
+                var child=create(c,account,childOperation,fingerprint+":"+index,job.post(),root,job.files(),policy,HISTORY_SKIP.equals(policy));ids.add(child.id());
                 update(c,"INSERT INTO download_batch_tasks VALUES(?,?,?)",id,index++,child.id());}
             return new DownloadBatchModels.Receipt(id,snapshot,ids,stamp);
         });
@@ -152,7 +155,7 @@ public final class DownloadRepository {
             LEFT JOIN download_completion_log receipt ON receipt.item_id=i.item_id AND receipt.task_id=t.task_id
                 AND receipt.account_id=t.account_id AND receipt.unique_id=i.unique_id AND receipt.size=i.size AND receipt.sha256=i.sha256
             LEFT JOIN download_completion_log matched ON matched.item_id=p.duplicate_of AND matched.account_id=t.account_id
-            LEFT JOIN download_history h ON h.id=i.history_id AND h.account_id=t.account_id AND h.unique_id=i.unique_id AND h.size=i.size
+            LEFT JOIN download_history h ON h.id=i.history_id AND h.account_id=t.account_id AND h.size=i.size AND (h.unique_id=i.unique_id OR (t.skip_content_duplicates=1 AND t.duplicate_policy='HISTORY_SKIP_V1' AND h.sha256=i.sha256))
             WHERE b.account_id=? AND b.id=? GROUP BY bt.ordinal,bt.task_id ORDER BY bt.ordinal
             """)){
             q.setString(1,account);q.setString(2,id);try(var r=q.executeQuery()){
@@ -264,6 +267,28 @@ public final class DownloadRepository {
         update(c, "UPDATE download_items SET state='SKIPPED_HISTORY',downloaded_bytes=0,written_bytes=0,sha256=?,error_message=NULL,history_id=? WHERE item_id=?", history.sha256(), history.id(), current.id());
         update(c, "UPDATE download_tasks SET updated_at=? WHERE task_id=?", now(), task.id());return true;
     }); }
+    /** A previously unknown file needs its full hash before content-only duplicates can be discarded. */
+    public boolean skipContent(Task task,Item item,String hash){return database.write(c->{
+        if(!HISTORY_SKIP.equals(task.duplicatePolicy()))return false;
+        try(var q=c.prepareStatement("SELECT skip_content_duplicates FROM download_tasks WHERE task_id=? AND account_id=?")){
+            q.setString(1,task.id());q.setString(2,task.accountId());try(var r=q.executeQuery()){if(!r.next()||r.getInt(1)!=1)return false;}
+        }
+        var current=task(c,task.accountId(),task.id()).items().stream().filter(i->i.id().equals(item.id())).findFirst().orElseThrow();
+        if("SKIPPED_HISTORY".equals(current.state()))return true;
+        if(!"WRITING".equals(current.state())||current.writtenBytes()!=current.file().size()||hash==null||!hash.matches("[0-9a-f]{64}")||!hash.equals(current.sha256()))return false;
+        History history=null;
+        try(var q=c.prepareStatement("""
+            SELECT h.id,h.source_task_id,h.original_path,h.sha256,h.completed_at FROM download_completion_log l
+            JOIN download_history h ON h.account_id=l.account_id AND h.unique_id=l.unique_id AND h.size=l.size AND h.sha256=l.sha256
+            WHERE l.account_id=? AND l.size=? AND l.sha256=? AND l.item_id<>? ORDER BY l.completed_at,l.item_id LIMIT 1
+            """)){
+            q.setString(1,task.accountId());q.setLong(2,current.file().size());q.setString(3,hash);q.setString(4,current.id());
+            try(var r=q.executeQuery()){if(r.next())history=new History(r.getString(1),r.getString(2),r.getString(3),r.getString(4),r.getLong(5));}
+        }
+        if(history==null)return false;
+        update(c,"UPDATE download_items SET state='SKIPPED_HISTORY',downloaded_bytes=0,written_bytes=0,sha256=?,error_message=NULL,history_id=? WHERE item_id=?",hash,history.id(),current.id());
+        update(c,"UPDATE download_tasks SET updated_at=? WHERE task_id=?",now(),task.id());return true;
+    });}
     /** Hash is from the newly read complete file; source identity is checked before content fallback. */
     public OutputPlan outputPlan(Task task,Item item,String hash){return database.write(c->{
         if(!KEEP_DUPLICATES.equals(task.duplicatePolicy()))return null;
@@ -347,7 +372,7 @@ public final class DownloadRepository {
         try (var q = c.prepareStatement("SELECT * FROM download_tasks WHERE account_id=? AND task_id=?")) {
             q.setString(1, account); q.setString(2, id); try (var r = q.executeQuery()) {
                 if (!r.next()) throw new IllegalArgumentException("当前账号中没有这条下载任务");
-                var items = new ArrayList<Item>(); try (var iq = c.prepareStatement("SELECT i.*,h.source_task_id,h.original_path,h.completed_at,h.sha256 AS history_sha,p.relative_path,p.sha256 AS plan_sha,p.duplicate_of,p.reason,p.manifest_relative,p.planned_at,l.item_id AS matched_id,l.source_link AS matched_link,l.output_path AS matched_path FROM download_items i LEFT JOIN download_history h ON h.id=i.history_id AND h.account_id=? AND h.unique_id=i.unique_id AND h.size=i.size LEFT JOIN download_output_plans p ON p.item_id=i.item_id LEFT JOIN download_completion_log l ON l.item_id=p.duplicate_of AND l.account_id=? WHERE i.task_id=? ORDER BY i.ordinal")) {
+                var items = new ArrayList<Item>(); try (var iq = c.prepareStatement("SELECT i.*,h.source_task_id,h.original_path,h.completed_at,h.sha256 AS history_sha,p.relative_path,p.sha256 AS plan_sha,p.duplicate_of,p.reason,p.manifest_relative,p.planned_at,l.item_id AS matched_id,l.source_link AS matched_link,l.output_path AS matched_path FROM download_items i JOIN download_tasks t ON t.task_id=i.task_id LEFT JOIN download_history h ON h.id=i.history_id AND h.account_id=? AND h.size=i.size AND (h.unique_id=i.unique_id OR (t.skip_content_duplicates=1 AND t.duplicate_policy='HISTORY_SKIP_V1' AND h.sha256=i.sha256)) LEFT JOIN download_output_plans p ON p.item_id=i.item_id LEFT JOIN download_completion_log l ON l.item_id=p.duplicate_of AND l.account_id=? WHERE i.task_id=? ORDER BY i.ordinal")) {
                     iq.setString(1, account);iq.setString(2, account);iq.setString(3, id); try (var ir = iq.executeQuery()) { while (ir.next()) items.add(item(ir)); }
                 }
                 return new Task(id, account, r.getString("operation_id"), r.getString("fingerprint"), decode(r.getString("post_json"), Post.class), r.getString("target_root"), r.getString("relative_directory"), r.getString("state"), r.getBoolean("pause_requested"), r.getString("error_message"), r.getLong("created_at"), r.getLong("updated_at"), items,r.getString("duplicate_policy"));

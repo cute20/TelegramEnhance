@@ -91,6 +91,11 @@ public final class DownloadFileStore {
         }
         String hash = digestCopy(digest); check.run();
         if (Files.size(part) != item.file().size() || !matches(part, item.file().size(), hash, check)) throw new IOException("Output verification failed");
+        if(repository.skipContent(task,item,hash)){
+            // Commit the skip decision before removing our verified temporary file, so an interruption
+            // cannot leave a WRITING checkpoint whose entire prefix has already been deleted.
+            cleanupAfterCompleted(dir,verifiedForCleanup(item,hash));return;
+        }
         var plan=repository.outputPlan(task,item,hash);
         String base = plan==null?item.relativeFile():Path.of(plan.relativePath()).getFileName().toString();
         for (int collision = 0; collision < 10000; collision++) {
@@ -111,6 +116,15 @@ public final class DownloadFileStore {
             cleanupAfterCompleted(dir, item); return;
         }
         throw new IOException("No available output name");
+    }
+    public void cleanupSkipped(Task task,Item item)throws IOException{
+        Path existing=Path.of(task.targetRoot()).resolve(task.relativeDirectory());
+        if(!Files.exists(owner(existing,item),LinkOption.NOFOLLOW_LINKS))return;
+        Path dir=directory(task);
+        cleanupAfterCompleted(dir,verifiedForCleanup(item,item.sha256()));
+    }
+    private static Item verifiedForCleanup(Item item,String hash){
+        return new Item(item.id(),item.ordinal(),item.file(),item.relativeFile(),item.token(),item.state(),item.file().size(),item.file().size(),hash,item.error(),item.history(),item.plan());
     }
     private Path output(Task task,String value)throws IOException{
         Path relative=Path.of(value);

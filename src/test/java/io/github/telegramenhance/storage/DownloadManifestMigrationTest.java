@@ -24,7 +24,7 @@ class DownloadManifestMigrationTest {
             assertTrue(Files.size(Path.of(paths.database() + "-wal")) > 0);
             var before = rows(original); var objects = planObjects(original);
             try (var migrated = new Database(paths)) {
-                assertEquals(16, migrated.diagnostics().get("schemaVersion"));
+                assertEquals(Database.SCHEMA_VERSION, migrated.diagnostics().get("schemaVersion"));
                 assertEquals("ok", migrated.diagnostics().get("integrity"));
                 assertEquals(before, migrated.read(DownloadManifestMigrationTest::rows));
                 assertEquals(objects, migrated.read(DownloadManifestMigrationTest::planObjects));
@@ -47,7 +47,7 @@ class DownloadManifestMigrationTest {
         }
         try (var reopened = new Database(paths)) {
             assertEquals("", reopened.diagnostics().get("lastMigrationBackup"));
-            assertEquals(16, reopened.diagnostics().get("schemaVersion"));
+            assertEquals(Database.SCHEMA_VERSION, reopened.diagnostics().get("schemaVersion"));
         }
     }
 

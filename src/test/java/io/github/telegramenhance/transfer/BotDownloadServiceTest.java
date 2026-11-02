@@ -362,10 +362,37 @@ class BotDownloadServiceTest {
             verify(f.reader,times(1)).history(TARGET,null,1);verify(f.reader,never()).history(eq(TARGET),anyString(),anyLong());verifyNoInteractions(f.files);assertTrue(f.repository.list("1",20,0).isEmpty());
         }
     }
-    @Test void openingOnALaterPageCannotFallBackToAnOlderFirstPage()throws Exception{
+    @Test void openingOnALaterPageReadsThatPageInsteadOfFallingBackToAnOlderFirstPage()throws Exception{
         try(var f=new Fixture()){
             when(f.reader.history(TARGET,null,1)).thenReturn(new BotReader.Snapshot(TARGET,List.of(message("200","页码2/3","下一页"),message("100","页码1/3","下一页")),false,"100","50"));
-            assertThrows(ExecutionException.class,f::open);verify(f.reader,never()).press(any(),anyString(),any(),anyLong());verifyNoInteractions(f.files);
+            var current=f.open();assertEquals(2,current.currentPage());assertEquals("200",current.controlMessageId());
+            assertEquals(List.of("200"),current.media().stream().map(m->m.message().messageId()).toList());
+            verify(f.reader,times(1)).history(TARGET,null,1);verify(f.reader,never()).press(any(),anyString(),any(),anyLong());verifyNoInteractions(f.files);
+        }
+    }
+    @Test void aManuallyReachedFinalFolderBatchCanCreateATaskWithoutIncludingItsPreviousBatch()throws Exception{
+        for(String requestBoundary:new String[]{"50",null})try(var f=new Fixture()){
+            var previous=new BotReader.Message(new MessageRef("9","150",null),"当前批次发送完成\n已发送26/38条消息",List.of(),List.of(
+                    new BotReader.Button(0,0,"下一组","CALLBACK",new byte[]{1}),new BotReader.Button(1,0,"1-26/38 跳转","CALLBACK",new byte[]{2})));
+            var end=new BotReader.Message(new MessageRef("9","240",null),"✅文件夹内容发送完成\n共发送38条消息",List.of(),List.of(
+                    new BotReader.Button(0,0,"📍27-38/38 跳转","CALLBACK",new byte[]{3}),new BotReader.Button(1,0,"文件夹详情","CALLBACK",new byte[]{4})));
+            when(f.reader.history(TARGET,null,1)).thenReturn(new BotReader.Snapshot(TARGET,List.of(end,message("220","当前批B",null),message("210","当前批A",null),previous,message("120","前一批",null),message("30","旧资源",null)),false,"30",requestBoundary));
+            var current=f.open();assertEquals("END",current.paginationStatus());assertNull(current.recommendedButtonId());
+            assertEquals(Set.of("210","220"),current.media().stream().map(m->m.message().messageId()).collect(java.util.stream.Collectors.toSet()));
+            var input=f.input(current);
+            assertThrows(ExecutionException.class,()->f.service.create(new BotDownloadService.Create(UUID.randomUUID().toString(),input.sourceId(),input.revision(),List.of("1:9:120:VIDEO"),input.targetDirectory())).get());
+            verifyNoInteractions(f.files);
+            var task=f.service.create(input).get();assertEquals("QUEUED",task.state());assertEquals(2,task.total());
+            verify(f.files).freeze(any(),argThat(items->items.size()==2&&items.stream().allMatch(m->Set.of("210","220").contains(m.message().messageId()))),eq(1L));
+            verify(f.reader,times(1)).history(TARGET,null,1);verify(f.reader,never()).press(any(),anyString(),any(),anyLong());
+        }
+    }
+    @Test void aManuallyEditedLaterMediaHeaderRetainsTheBoundedRequestWindowAndExplainsItsScope()throws Exception{
+        try(var f=new Fixture()){
+            when(f.reader.history(TARGET,null,1)).thenReturn(new BotReader.Snapshot(TARGET,List.of(message("120","本次请求已返回B",null),message("110","本次请求已返回A",null),message("100","页码2/6","下一页"),message("30","以前的资源",null)),false,"30","50"));
+            var current=f.open();assertEquals(2,current.currentPage());assertEquals(Set.of("100","110","120"),current.media().stream().map(m->m.message().messageId()).collect(java.util.stream.Collectors.toSet()));
+            assertNotNull(current.warning());assertTrue(current.warning().contains("当前请求"));
+            assertEquals(3,f.service.create(f.input(current)).get().total());verify(f.reader,never()).press(any(),anyString(),any(),anyLong());
         }
     }
     @Test void unrequestedHistoryIsNotAppendedAndEachCallbackOnlyAdmitsNewRepliesPastItsBarrier()throws Exception{

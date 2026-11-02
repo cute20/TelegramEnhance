@@ -11,12 +11,17 @@ import java.util.Locale;
 import java.util.Set;
 import java.util.regex.Pattern;
 
-/** Selects a bounded first reply only; history exhaustion is deliberately not evidence of its scope. */
+/** Selects a bounded current reply; history exhaustion is deliberately not evidence of its scope. */
 public final class BotReplyScope {
     private static final int MAX_MESSAGES = 200;
     private static final BigInteger MAX_ID = BigInteger.valueOf(Long.MAX_VALUE);
     private static final Pattern ID = Pattern.compile("[1-9][0-9]{0,18}");
     private static final Pattern RANGE = Pattern.compile("(?<!\\d)(\\d{1,7})\\s*[-–—~～至]\\s*(\\d{1,7})\\s*/\\s*(\\d{1,7})(?!\\d)");
+    private static final Pattern PAGE_PAIR = Pattern.compile("(?:页码|頁碼|当前页|當前頁|page|group|batch|第)\\s*[:：]?\\s*(\\d{1,7})\\s*(?:页|頁|组|組|批)?\\s*(?:/|of)\\s*(\\d{1,7})(?!\\d)");
+    private static final Pattern CURRENT = Pattern.compile("(?:第\\s*(\\d{1,7})\\s*(?:页|頁|组|組|批)|(?:当前页|當前頁|当前组|當前組)\\s*[:：]?\\s*(\\d{1,7}))(?!\\d)");
+    private static final Pattern TOTAL = Pattern.compile("(?:共(?:收到|获取到|獲取到|有)?\\s*(\\d{1,7})\\s*(?:页|頁|组|組|批))");
+    private static final Pattern BUTTON_PAIR = Pattern.compile("(?<!\\d)(\\d{1,7})\\s*/\\s*(\\d{1,7})(?!\\d)");
+    private static final Pattern MARKED_NUMBER = Pattern.compile("^[·•●\\[({（【「〈]\\s*(\\d{1,7})\\s*[·•●\\])}）】」〉]$");
     private static final Pattern BATCH_DONE = Pattern.compile("(?:当前批次|當前批次|本批次)\\s*(?:已)?\\s*(?:发送|發送|推送)\\s*(?:完成|完毕|完畢|结束|結束)");
     private static final Pattern SENT = Pattern.compile("(?:已发送|已發送)\\s*[:：]?\\s*(\\d{1,7})\\s*/\\s*(\\d{1,7})\\s*[条條]\\s*(?:消息|信息|訊息)");
     private static final Pattern SENT_TOTAL = Pattern.compile("共\\s*(?:发送|發送|推送)\\s*[:：]?\\s*(\\d{1,7})\\s*[条條]\\s*(?:消息|信息|訊息)");
@@ -38,11 +43,12 @@ public final class BotReplyScope {
     }
 
     public record InitialResult(String status, String controlMessageId, String lowerExclusiveId,
-                                String upperInclusiveId, String reason) { }
+                                String upperInclusiveId, boolean requestWindow, String reason) { }
 
     /**
-     * The caller may expose media only in (lowerExclusiveId, upperInclusiveId] after FIRST_PAGE.
+     * The caller may expose media only in (lowerExclusiveId, upperInclusiveId] after CURRENT_PAGE.
      * latestOutgoingId is the latest actual outgoing request in this bot chat, never a guessed cursor.
+     * requestWindow must be displayed as an observed request range, not as proof of one exact page.
      */
     public static InitialResult initial(List<Message> messages, String latestOutgoingId) {
         if (messages == null) messages = List.of();
@@ -59,15 +65,13 @@ public final class BotReplyScope {
             var footer = inspect(message, identity);
             if (footer.candidate()) parsed.add(footer);
         }
-        if (parsed.isEmpty()) return unverified(null, "尚未找到本次资源第一页的可靠分页信息，请等待回复或在机器人中打开第一页");
+        if (parsed.isEmpty()) return unverified(null, "尚未找到当前资源的可靠回复边界，请等待机器人回复后重新读取");
         parsed.sort(Comparator.comparing(Footer::id));
         Footer control = parsed.getLast();
         if (outgoing != null && outgoing.compareTo(control.id()) >= 0)
-            return unverified(control, "本次请求尚未出现可靠的第一页回复，请等待机器人回复后重新预览");
-        if (control.position() == Position.LATER)
-            return new InitialResult("NOT_FIRST_PAGE", control.message().id(), null, null, "当前资源不是第一页，请在机器人中打开第一页后重新预览");
-        if (control.position() != Position.FIRST)
-            return unverified(control, "当前分页信息不足或相互冲突，请在机器人中打开本次资源第一页后重新预览");
+            return unverified(control, "本次请求尚未出现可靠回复，请等待机器人回复后重新读取");
+        if (!control.reliableBoundary())
+            return unverified(control, "当前回复的分页信息相互冲突或范围证据不足，请核对机器人当前回复后重新读取");
 
         BigInteger lower = outgoing;
         for (int index = parsed.size() - 2; index >= 0; index--) {
@@ -78,39 +82,48 @@ public final class BotReplyScope {
             }
         }
         if (lower == null)
-            return unverified(control, "无法确定本次资源的起点，请重新请求资源第一页后预览；不会读取整个历史记录");
+            return unverified(control, "无法确定当前回复的起点，请在机器人中重新展开当前资源后读取；不会读取整个历史记录");
         BigInteger upper = control.id();
-        // A media-bearing header can precede its album siblings. Extend only for an actual same-request
-        // boundary; a previous footer alone cannot prove that media after a header belongs to this page.
+        // A media-bearing header can precede its media or be edited in place. The actual outgoing request
+        // bounds the resource, but only an explicit first-page position proves these are same-page siblings.
+        // Later/unknown pages therefore require an explicit observed-request-range warning from the caller.
         boolean boundedHeader = control.message().hasMedia() && outgoing != null && outgoing.equals(lower);
-        if (boundedHeader) upper = newest;
-        return new InitialResult("FIRST_PAGE", control.message().id(), lower.toString(), upper.toString(),
-                boundedHeader ? "已根据本次请求限定第一页及同页相册成员" : "已根据请求或前一分页边界限定本次资源第一页");
+        boolean extended = boundedHeader && newest.compareTo(control.id()) > 0;
+        if (extended) upper = newest;
+        boolean requestWindow = extended && control.position() != Position.FIRST;
+        return new InitialResult("CURRENT_PAGE", control.message().id(), lower.toString(), upper.toString(), requestWindow,
+                requestWindow ? "当前请求已返回的媒体，可能含本资源已返回的其他页/组，以勾选列表为准"
+                        : extended ? "已根据本次请求限定第一页及同页相册成员" : "已根据请求或前一回复边界限定当前已展开的媒体");
     }
 
     private static Footer inspect(Message message, BigInteger identity) {
         var page = BotPagination.analyze(message.text(), message.buttons());
         String body = normalize(message.text());
         boolean paging = page.buttons().stream().anyMatch(button -> PAGING_KINDS.contains(button.kind()));
-        var range = inspectRange(body, message.buttons(), page);
+        boolean conflict = paginationConflict(body, message.buttons(), page);
+        var range = inspectRange(body, message.buttons(), page, conflict);
         boolean advertising = AD_NOTICE.matcher(body).find();
-        boolean candidate = !advertising && (paging || page.current() != null || "END".equals(page.status()) || range.relevant());
-        boolean reliable = !"UNKNOWN".equals(page.status()) && !range.conflict();
+        boolean metadata = PAGE_PAIR.matcher(body).find() || CURRENT.matcher(body).find() || TOTAL.matcher(body).find();
+        boolean candidate = !advertising && (paging || metadata || "END".equals(page.status()) || range.relevant());
+        // A missing/ambiguous next button is not a conflict: reading selected media does not execute it.
+        boolean reliable = !conflict && !range.conflict() && (!range.relevant() || range.proven());
         Position position = Position.UNKNOWN;
         if (range.relevant()) {
             if (range.proven() && !range.conflict()) {
                 position = range.start() == 1 ? Position.FIRST : Position.LATER;
-                if (page.current() != null && (page.current() == 1) != (position == Position.FIRST)) position = Position.UNKNOWN;
+                if (page.current() != null && (page.current() == 1) != (position == Position.FIRST)) {
+                    position = Position.UNKNOWN; reliable = false;
+                }
             }
         } else if (page.current() != null) {
             if (page.current() > 1) position = Position.LATER;
             else if (reliable) position = Position.FIRST;
         }
-        boolean boundary = candidate && reliable && (!range.relevant() || range.proven() && position != Position.UNKNOWN);
+        boolean boundary = candidate && reliable;
         return new Footer(message, identity, candidate, boundary, position);
     }
 
-    private static RangeEvidence inspectRange(String body, List<BotPagination.InputButton> buttons, BotPagination.Result page) {
+    private static RangeEvidence inspectRange(String body, List<BotPagination.InputButton> buttons, BotPagination.Result page, boolean pageConflict) {
         var ranges = new LinkedHashSet<RangeValue>();
         boolean invalidRange = false;
         boolean found = false;
@@ -126,20 +139,53 @@ public final class BotReplyScope {
         boolean batch = hasNotice(body, BATCH_DONE);
         var sent = pairs(body, SENT);
         var totals = totals(body);
-        boolean relevant = found && (batch || !sent.values().isEmpty() || sent.invalid() || "END".equals(page.status())
-                || body.contains("批次") || body.contains("已发送") || body.contains("已發送"));
+        boolean relevant = found;
         if (!relevant) return new RangeEvidence(false, false, false, 0);
         boolean conflict = invalidRange || ranges.size() != 1 || sent.invalid() || totals.invalid()
-                || sent.values().size() > 1 || totals.values().size() > 1 || "UNKNOWN".equals(page.status());
+                || sent.values().size() > 1 || totals.values().size() > 1 || pageConflict;
         if (conflict) return new RangeEvidence(true, false, true, 0);
         RangeValue range = ranges.iterator().next();
-        boolean partial = batch && "MORE".equals(page.status()) && sent.values().size() == 1
+        boolean partial = batch && sent.values().size() == 1
                 && sent.values().contains(new CountPair(range.end(), range.total())) && range.end() < range.total();
         boolean completed = "END".equals(page.status()) && range.end() == range.total() && totals.values().size() == 1
                 && totals.values().contains(range.total());
         if (!sent.values().isEmpty() && !sent.values().contains(new CountPair(range.end(), range.total()))) conflict = true;
         if (!totals.values().isEmpty() && !totals.values().contains(range.total())) conflict = true;
         return new RangeEvidence(true, !conflict && (partial || completed), conflict, range.start());
+    }
+
+    /** Distinguish unknown navigation from contradictory metadata without granting button execution. */
+    private static boolean paginationConflict(String body, List<BotPagination.InputButton> buttons, BotPagination.Result page) {
+        var counters = new Counters();
+        var pair = PAGE_PAIR.matcher(body);
+        while (pair.find()) { counters.current(pair.group(1)); counters.total(pair.group(2)); }
+        var current = CURRENT.matcher(body);
+        while (current.find()) counters.current(current.group(1) == null ? current.group(2) : current.group(1));
+        var total = TOTAL.matcher(body);
+        while (total.find()) counters.total(total.group(1));
+        for (int index = 0; index < buttons.size(); index++) {
+            String label = normalize(buttons.get(index).text());
+            var marked = MARKED_NUMBER.matcher(label);
+            if (marked.matches()) counters.current(marked.group(1));
+            if ("NEXT".equals(page.buttons().get(index).kind())) {
+                var target = BUTTON_PAIR.matcher(label);
+                while (target.find()) {
+                    Integer at = count(target.group(1)), size = count(target.group(2));
+                    if (at == null || size == null || at > size) counters.conflict = true;
+                    else { counters.total(target.group(2)); if (at > 1) counters.current(Integer.toString(at - 1)); }
+                }
+            }
+        }
+        Integer at = counters.current.size() == 1 ? counters.current.iterator().next() : null;
+        Integer size = counters.total.size() == 1 ? counters.total.iterator().next() : null;
+        boolean forward = page.buttons().stream().anyMatch(button -> "NEXT".equals(button.kind()) || "WINDOW".equals(button.kind())
+                || "PAGE".equals(button.kind()) && at != null && button.page() > at);
+        // Remove recognized counters only to ask the existing parser about affirmative terminal notices.
+        String notices = TOTAL.matcher(CURRENT.matcher(PAGE_PAIR.matcher(body).replaceAll("")).replaceAll("")).replaceAll("");
+        boolean explicitEnd = "END".equals(BotPagination.analyze(notices, List.of()).status());
+        return counters.conflict || at != null && size != null && (at > size || at.equals(size) && forward)
+                || size != null && page.buttons().stream().anyMatch(button -> "PAGE".equals(button.kind()) && button.page() > size)
+                || explicitEnd && (forward || at != null && size != null && at < size);
     }
 
     private static PairEvidence pairs(String body, Pattern pattern) {
@@ -185,7 +231,7 @@ public final class BotReplyScope {
     }
 
     private static InitialResult unverified(Footer control, String reason) {
-        return new InitialResult("UNVERIFIED", control == null ? null : control.message().id(), null, null, reason);
+        return new InitialResult("UNVERIFIED", control == null ? null : control.message().id(), null, null, false, reason);
     }
 
     private static BigInteger id(String value) {
@@ -212,4 +258,15 @@ public final class BotReplyScope {
     private record PairEvidence(Set<CountPair> values, boolean invalid) { }
     private record TotalEvidence(Set<Integer> values, boolean invalid) { }
     private record RangeEvidence(boolean relevant, boolean proven, boolean conflict, int start) { }
+    private static final class Counters {
+        final Set<Integer> current = new LinkedHashSet<>(), total = new LinkedHashSet<>();
+        boolean conflict;
+        void current(String value) { add(current, value); }
+        void total(String value) { add(total, value); }
+        void add(Set<Integer> values, String text) {
+            Integer value = count(text);
+            if (value == null) conflict = true;
+            else { values.add(value); if (values.size() > 1) conflict = true; }
+        }
+    }
 }

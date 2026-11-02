@@ -321,8 +321,8 @@ onBeforeUnmount(() => { stopObservation(); disposed = true; generation++ })
 
 <template>
   <section class="bot-download" aria-label="机器人下载">
-    <p class="bot-help">先在 Telegram 重新打开资源第一页，再读取本次资源。后续翻页只追加本次媒体，不读取以前的资源。</p>
-    <div class="bot-source"><label>机器人用户名或会话 ID<input v-model="source" class="input" :disabled="inputLocked" placeholder="@example_bot 或 https://t.me/example_bot" maxlength="2048" autocomplete="off" @keydown.enter.prevent="open" /></label><button type="button" class="btn primary" :disabled="!ready || inputLocked || previewReadPending || !source.trim()" @click="open">{{ busy === 'open' ? '读取中…' : '读取本次资源' }}</button></div>
+    <p class="bot-help">在 Telegram 打开要下载的页／组，再点击“读取当前页／组”。可从任意页开始，也可手动翻页后重新读取；后续分页只追加本次媒体，不自动读取历史资源。</p>
+    <div class="bot-source"><label>机器人用户名或会话 ID<input v-model="source" class="input" :disabled="inputLocked" placeholder="@example_bot 或 https://t.me/example_bot" maxlength="2048" autocomplete="off" @keydown.enter.prevent="open" /></label><button type="button" class="btn primary" :disabled="!ready || inputLocked || previewReadPending || !source.trim()" @click="open">{{ busy === 'open' ? '读取中…' : '读取当前页／组' }}</button></div>
     <div class="bot-wait-settings"><label>回复稳定等待（秒）<input v-model.number="waitSeconds" class="input" type="number" min="2" max="60" step="1" :disabled="!ready || inputLocked || observing || previewReadPending" /></label><label>最长等待（秒）<input v-model.number="timeoutSeconds" class="input" type="number" min="15" max="300" step="1" :disabled="!ready || inputLocked || observing || previewReadPending" /></label></div>
     <p v-if="!waitSettingsValid" class="notice warning" role="status">稳定等待为 2～60 秒；最长等待为 15～300 秒，且不少于稳定等待的两倍。</p>
     <p v-if="!authorized" class="notice warning">请先在设置中连接 Telegram。</p>
@@ -339,7 +339,7 @@ onBeforeUnmount(() => { stopObservation(); disposed = true; generation++ })
       <div class="bot-media-toolbar"><div><strong>已读取 {{ preview.media.length }} 个媒体</strong><span>已选 {{ selected.length }} / 100</span></div><div class="bot-view-switch" role="group" aria-label="机器人媒体显示方式"><button type="button" :class="{selected:display==='list'}" :aria-pressed="display==='list'" @click="display='list'">列表</button><button type="button" :class="{selected:display==='cards'}" :aria-pressed="display==='cards'" @click="display='cards'">卡片</button></div></div>
       <button v-if="selectable.length" type="button" class="btn bot-select-all" :disabled="inputLocked || !!createdTask" @click="selectAll">{{ allSelected ? '取消全选' : selectable.length > 100 ? '选择前 100 个' : '全选媒体' }}</button>
       <div :class="['bot-media',display]"><label v-for="media in preview.media" :key="media.key" class="bot-media-item"><input type="checkbox" :checked="selected.includes(media.key)" :disabled="inputLocked || !!createdTask || media.size<=0 || selected.length>=100 && !selected.includes(media.key)" @change="select(media.key)" /><span class="bot-media-icon"><AppIcon :name="media.type==='PHOTO'?'photo':media.type==='VIDEO'?'video':media.type==='AUDIO'?'audio':'file'" /></span><span class="bot-media-info"><strong>{{ media.fileName }}</strong><small>{{ botMediaNames[media.type] }} · {{ formatMediaBytes(media.size) }}</small><span v-if="media.caption">{{ media.caption }}</span></span></label></div>
-      <p v-if="!preview.media.length" class="bot-help">本次资源还没有可下载媒体，请确认 Telegram 已打开该资源的第一页。</p>
+      <p v-if="!preview.media.length" class="bot-help">当前页／组还没有可下载媒体，请在 Telegram 打开目标页／组后重新读取。</p>
       <label class="bot-directory">保存目录<input v-model="targetDirectory" class="input" :disabled="inputLocked || !!createdTask" placeholder="例如 D:\TelegramDownloads" autocomplete="off" /></label>
     </template>
     <div v-if="preview || downloadStatus" class="bot-download-footer">

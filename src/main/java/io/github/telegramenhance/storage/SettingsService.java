@@ -159,6 +159,7 @@ public final class SettingsService {
                 """)) {
                 long now = Instant.now().toEpochMilli();
                 for (Map.Entry<String, String> value : values.entrySet()) {
+                    if (!java.util.Set.of(API_ID, API_HASH, PROXY_TYPE, PROXY_HOST, PROXY_PORT, PROXY_USERNAME, PROXY_PASSWORD, TDLIB_KEY).contains(value.getKey())) continue;
                     statement.setString(1, value.getKey());
                     statement.setString(2, value.getValue());
                     statement.setLong(3, now);

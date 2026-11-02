@@ -99,7 +99,7 @@ public final class DownloadRuleTaskService {
               matched.item_id AS matched_id,matched.source_link AS matched_link,matched.output_path AS matched_path,
               completed.item_id AS receipt_id
             """ + FILES_FROM + """
-            LEFT JOIN download_history h ON h.id=i.history_id AND h.account_id=t.account_id AND h.unique_id=i.unique_id AND h.size=i.size
+            LEFT JOIN download_history h ON h.id=i.history_id AND h.account_id=t.account_id AND h.size=i.size AND (h.unique_id=i.unique_id OR (t.skip_content_duplicates=1 AND t.duplicate_policy='HISTORY_SKIP_V1' AND h.sha256=i.sha256))
             LEFT JOIN download_output_plans p ON p.item_id=i.item_id
             LEFT JOIN download_completion_log matched ON matched.item_id=p.duplicate_of AND matched.account_id=t.account_id
             LEFT JOIN download_completion_log completed ON completed.item_id=i.item_id AND completed.task_id=t.task_id AND completed.account_id=t.account_id

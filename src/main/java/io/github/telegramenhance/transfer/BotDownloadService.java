@@ -116,11 +116,12 @@ public final class BotDownloadService {
             var snapshot=reader.history(target,null,session.generation());current(session);
             var scope=BotReplyScope.initial(snapshot.messages().stream().map(message->new BotReplyScope.Message(message.ref().messageId(),message.text(),
                     message.buttons().stream().map(button->new BotPagination.InputButton(button.row()+":"+button.column(),button.text(),"CALLBACK".equals(button.type()))).toList(),!message.media().isEmpty())).toList(),snapshot.requestBoundary());
-            if(!"FIRST_PAGE".equals(scope.status()))throw new IllegalArgumentException(scope.reason());
+            if(!"CURRENT_PAGE".equals(scope.status()))throw new IllegalArgumentException(scope.reason());
             Entry e=new Entry(session,target,clock.getAsLong());e.scopeLower=scope.lowerExclusiveId();e.initialUpper=scope.upperInclusiveId();e.requestBoundary=snapshot.requestBoundary();e.openingHead=head(snapshot);
             var initial=snapshot.messages().stream().filter(message->after(message.ref().messageId(),scope.lowerExclusiveId())&&!after(message.ref().messageId(),scope.upperInclusiveId())).toList();
             initial.forEach(message->e.admittedMessages.add(message.ref().messageId()));
             applyScoped(e,new BotReader.Snapshot(snapshot.target(),initial,true,null,snapshot.requestBoundary()));
+            if(scope.requestWindow())e.warning=scope.reason();
             prune();while(entries.size()>=4)entries.remove(entries.keySet().iterator().next());entries.put(e.id,e);return view(e);
         });
     }
@@ -152,7 +153,7 @@ public final class BotDownloadService {
         throw new IllegalArgumentException("机器人下载只读取本次资源，不读取以前的聊天历史");
     }
     public CompletableFuture<View> control(String id,Control input){
-        throw new IllegalArgumentException("分页消息由本次资源绑定，请重新打开资源第一页后读取");
+        throw new IllegalArgumentException("分页消息由本次读取绑定，请重新读取机器人当前页／组");
     }
     public CompletableFuture<View> press(String id,Press input){
         if(input==null||!uuid(input.operationId())||!uuid(input.buttonId()))throw new IllegalArgumentException("翻页操作标识无效");
@@ -195,7 +196,7 @@ public final class BotDownloadService {
         String request=snapshot.requestBoundary();
         if(request!=null&&(!positive(request)||after(request,e.requestBoundary==null?e.openingHead:e.requestBoundary))){
             entries.remove(e.id);
-            throw new IllegalArgumentException("机器人已收到另一次请求，请重新打开本次资源第一页再读取");
+            throw new IllegalArgumentException("机器人已收到另一次请求，请重新读取当前页／组");
         }
         var messages=snapshot.messages().stream().filter(message->after(message.ref().messageId(),e.scopeLower)
                 &&(e.admittedMessages.contains(message.ref().messageId())||e.appendAfter==null&&!after(message.ref().messageId(),e.initialUpper)

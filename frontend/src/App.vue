@@ -6,6 +6,7 @@ import TransferComposer from './components/TransferComposer.vue'
 import TransferTasks from './components/TransferTasks.vue'
 import RuleWorkspace from './components/RuleWorkspace.vue'
 import ThumbnailCacheSettings from './components/ThumbnailCacheSettings.vue'
+import DownloadSettings from './components/DownloadSettings.vue'
 import { validTaskCategory, type TaskCategory } from './taskCategories'
 import { api, ApiError, clearAppToken, hasAppToken, type Bootstrap, type Diagnostics, type ProxyType, type Settings, type TelegramStatus } from './api'
 
@@ -18,6 +19,7 @@ const navigation: { id: Page; label: string; icon: string }[] = [
   { id: 'settings', label: '设置', icon: 'settings' },
 ]
 const page = ref<Page>('settings')
+const settingsVisited = ref(page.value === 'settings')
 const currentPage = computed(() => navigation.find(item => item.id === page.value)!)
 const loading = ref(hasAppToken)
 const busy = ref('')
@@ -53,6 +55,7 @@ const taskCategory = ref<TaskCategory>('download')
 function navigate(next: Page) {
   if (!navigation.some(item => item.id === next) || page.value === next) return
   page.value = next
+  if (next === 'settings') settingsVisited.value = true
   settingsReadGeneration++
   if (next === 'settings') void refreshSettingsPage()
 }
@@ -317,14 +320,13 @@ onBeforeUnmount(() => { disposed = true; stopPolling(); window.clearInterval(clo
     <div class="workspace">
       <header class="topbar"><div class="breadcrumb"><span>工作空间</span><AppIcon name="chevron" /><strong>{{ currentPage.label }}</strong></div><div class="top-actions"><button class="btn new-transfer" :disabled="!canOperate" @click="openTransfer()"><AppIcon name="plus" />新建传输</button></div></header>
       <main id="main" tabindex="-1">
-        <div class="page-heading"><div><div class="eyebrow">{{ page === 'settings' ? 'PREFERENCES' : 'WORKSPACE' }}</div><h1>{{ currentPage.label }}</h1><p v-if="page === 'settings'">配置本机连接，安全地接入你的 Telegram 账号。</p></div><button v-if="page === 'settings'" type="button" class="btn close-project" :disabled="!canOperate" @click="exitProject"><AppIcon name="power" />{{ busy === 'exit' ? '正在关闭…' : '关闭项目' }}</button></div>
+        <div :class="['page-heading',{'settings-heading':page==='settings'}]"><div><div class="eyebrow">{{ page === 'settings' ? 'PREFERENCES' : 'WORKSPACE' }}</div><h1>{{ currentPage.label }}</h1></div><button v-if="page === 'settings'" type="button" class="btn close-project" :disabled="!canOperate" @click="exitProject"><AppIcon name="power" />{{ busy === 'exit' ? '正在关闭…' : '关闭项目' }}</button></div>
         <div v-if="exited" class="notice success service-notice" role="status"><AppIcon name="check" /><div><strong>已请求关闭项目</strong><p>后台正在保存并退出，Telegram 会话保留。再次使用时，请重新运行项目启动脚本。</p></div></div>
         <div v-else-if="accessInvalid" class="notice warning service-notice" role="alert"><AppIcon name="lock" /><div><strong>请从项目启动脚本打开界面</strong><p>当前页面缺少有效的本机访问令牌。请使用启动脚本打开的新链接进入。</p></div></div>
         <div v-else-if="!loading && !serviceReachable" class="notice warning service-notice" role="alert"><AppIcon name="info" /><div><strong>本机服务连接中断</strong><p>请确认 Java 后台仍在运行。恢复后会自动重查 Telegram 状态。</p></div><button class="btn" :disabled="!!busy" @click="bootstrap">重新读取</button></div>
         <div v-if="error" class="notice danger" role="alert"><AppIcon name="info" /><span>{{ error }}</span><button class="icon-btn dismiss" aria-label="关闭错误提示" @click="error = ''"><AppIcon name="close" /></button></div>
         <div v-if="notice" class="notice success" role="status"><AppIcon name="check" /><span>{{ notice }}</span><button class="icon-btn dismiss" aria-label="关闭提示" @click="notice = ''"><AppIcon name="close" /></button></div>
-        <template v-if="page === 'settings'">
-          <div class="stage-banner"><span class="stage-icon"><AppIcon name="link" /></span><div><strong>先连接，再整理你的资源</strong><p>配置应用凭证和独立代理，连接并保留你的 Telegram 本机会话。</p></div></div>
+        <section v-if="settingsVisited" v-show="page === 'settings'" class="settings-page" aria-label="设置">
           <div v-if="loading" class="loading-panel" role="status"><span class="spinner" />正在读取本机配置与 Telegram 状态…</div>
           <div v-else class="settings-grid">
             <div class="settings-primary">
@@ -350,7 +352,6 @@ onBeforeUnmount(() => { disposed = true; stopPolling(); window.clearInterval(clo
                   <div class="save-bar"><span><span :class="['unsaved-dot', { visible: dirty }]" />{{ dirty ? '有尚未保存的更改' : savedSettings ? '当前设置已保存' : '等待读取设置' }}</span><button type="submit" class="btn primary" :disabled="!canOperate">{{ busy === 'save' ? '正在保存…' : '保存设置' }}</button></div>
                 </fieldset>
               </form>
-              <ThumbnailCacheSettings :available="serviceReachable && !loading && !accessInvalid && !exited" @access-error="reportError" />
               <section class="settings-section authorization" aria-labelledby="auth-heading">
                 <div class="section-heading"><span class="section-icon"><AppIcon name="shield" /></span><div><h2 id="auth-heading">Telegram 授权与会话</h2><p>连接一个已有账号；有效本机会话会在下次连接时复用。</p></div></div>
                 <div class="account-box"><span :class="['account-avatar', { online: connected }]"><AppIcon :name="connected ? 'check' : 'telegram'" /></span><div class="account-identity"><strong>{{ connected ? telegram?.displayName || 'Telegram 账号' : authLabel }}</strong><small>{{ connected ? `Telegram ID · ${telegram?.userId ?? '等待读取'}` : '应用凭证只用于发起连接，账号仍需 Telegram 授权。' }}</small></div><span :class="['status-pill', connected ? 'green' : 'neutral']">{{ authLabel }}</span></div>
@@ -374,16 +375,17 @@ onBeforeUnmount(() => { disposed = true; stopPolling(); window.clearInterval(clo
                 <p class="section-footnote">断开和退出应用会保留授权。注销会让此设备的 Telegram 会话失效，再次使用需要重新验证。</p>
               </section>
             </div>
-            <aside class="settings-secondary" aria-label="本机运行信息">
-              <section class="settings-section runtime-section"><div class="section-heading compact"><h2><AppIcon name="server" />本机运行</h2></div><div :class="['runtime-status', { ready: telegram?.nativeLoaded }]"><span class="connection-dot" :class="{ online: telegram?.nativeLoaded }" />{{ nativeLabel }}</div><dl class="runtime-list"><dt>原生版本</dt><dd>{{ telegram?.nativeVersion || '等待读取' }}</dd><dt>Java</dt><dd>{{ diagnostics?.javaVersion || '等待检查' }}</dd><dt>平台</dt><dd>{{ diagnostics ? `${diagnostics.os} · ${diagnostics.architecture}` : '等待检查' }}</dd><dt>SQLite 模式</dt><dd>{{ diagnostics?.database.journalMode || '等待检查' }}</dd><dt>同步策略</dt><dd>{{ diagnostics?.database.synchronous || '等待检查' }}</dd><dt>数据库完整性</dt><dd>{{ diagnostics?.database.integrity || '等待检查' }}</dd><dt>数据库版本</dt><dd>{{ diagnostics?.database.schemaVersion ?? '等待检查' }}</dd><dt>Windows 保护</dt><dd>{{ diagnostics?.dpapi || '等待检查' }}</dd></dl><details class="data-directory"><summary>应用数据位置</summary><p>默认保存在项目的 data 文件夹中，包含设置、资源库、任务记录和 Telegram 会话；用户媒体另存。</p><code>{{ diagnostics?.dataDirectory || '等待检查' }}</code></details><button type="button" class="btn full-width" :disabled="!canOperate" @click="refreshDiagnostics"><AppIcon name="refresh" />{{ busy === 'diagnostics' ? '正在检查…' : '刷新本机诊断' }}</button></section>
-              <section class="helper-card"><h3>首次连接，三步完成</h3><ol class="setup-steps"><li><span>1</span><div><strong>填写应用凭证</strong><p>配置你的 API ID 和 API Hash。</p></div></li><li><span>2</span><div><strong>确认网络方式</strong><p>选择直连，或软件独立代理。</p></div></li><li><span>3</span><div><strong>完成 Telegram 验证</strong><p>手机号、验证码与必要的两步验证。</p></div></li></ol></section>
-              <section class="privacy-note"><AppIcon name="shield" /><p>普通资源元数据与 Telegram 会话分开保存。Windows 保护覆盖敏感配置，不代表媒体或整个数据库已加密。</p></section>
+            <aside class="settings-secondary" aria-label="下载与本机设置">
+              <DownloadSettings :active="page==='settings'" :available="serviceReachable && !loading && !accessInvalid && !exited" @access-error="reportError" />
+              <ThumbnailCacheSettings :available="serviceReachable && !loading && !accessInvalid && !exited" @access-error="reportError" />
+              <details class="settings-section runtime-section settings-disclosure"><summary>本机诊断<span :class="{'ready':telegram?.nativeLoaded}">{{ nativeLabel }}</span></summary><div class="settings-disclosure-body"><dl class="runtime-list"><dt>原生版本</dt><dd>{{ telegram?.nativeVersion || '等待读取' }}</dd><dt>Java</dt><dd>{{ diagnostics?.javaVersion || '等待检查' }}</dd><dt>平台</dt><dd>{{ diagnostics ? `${diagnostics.os} · ${diagnostics.architecture}` : '等待检查' }}</dd><dt>SQLite 模式</dt><dd>{{ diagnostics?.database.journalMode || '等待检查' }}</dd><dt>同步策略</dt><dd>{{ diagnostics?.database.synchronous || '等待检查' }}</dd><dt>数据库完整性</dt><dd>{{ diagnostics?.database.integrity || '等待检查' }}</dd><dt>数据库版本</dt><dd>{{ diagnostics?.database.schemaVersion ?? '等待检查' }}</dd><dt>Windows 保护</dt><dd>{{ diagnostics?.dpapi || '等待检查' }}</dd></dl><details class="data-directory"><summary>应用数据位置</summary><p>默认保存在项目的 data 文件夹中，包含设置、资源库、任务记录和 Telegram 会话；用户媒体另存。</p><code>{{ diagnostics?.dataDirectory || '等待检查' }}</code></details><button type="button" class="btn full-width" :disabled="!canOperate" @click="refreshDiagnostics"><AppIcon name="refresh" />{{ busy === 'diagnostics' ? '正在检查…' : '刷新本机诊断' }}</button></div></details>
+              <details class="settings-section settings-disclosure"><summary>首次连接帮助</summary><div class="settings-disclosure-body"><ol class="setup-steps"><li><span>1</span><div><strong>填写应用凭证</strong><p>配置你的 API ID 和 API Hash。</p></div></li><li><span>2</span><div><strong>确认网络方式</strong><p>选择直连，或软件独立代理。</p></div></li><li><span>3</span><div><strong>完成 Telegram 验证</strong><p>手机号、验证码与必要的两步验证。</p></div></li></ol><p class="section-footnote">普通资源元数据与 Telegram 会话分开保存。Windows 保护覆盖敏感配置，不代表媒体或整个数据库已加密。</p></div></details>
             </aside>
           </div>
-        </template>
-        <LibraryWorkspace v-else-if="page === 'library'" :authorized="telegram?.authState === 'READY'" :available="serviceReachable && !loading && !accessInvalid && !exited" :account-id="telegram?.userId ?? null" @settings="navigate('settings')" @access-error="reportError" />
+        </section>
+        <LibraryWorkspace v-if="page === 'library'" :authorized="telegram?.authState === 'READY'" :available="serviceReachable && !loading && !accessInvalid && !exited" :account-id="telegram?.userId ?? null" @settings="navigate('settings')" @access-error="reportError" />
         <RuleWorkspace @tasks="openTasks" v-else-if="page === 'rules'" :category="ruleCategory" :refresh-version="ruleRefresh" :authorized="telegram?.authState === 'READY'" :available="serviceReachable && !loading && !accessInvalid && !exited" :account-id="telegram?.userId ?? null" @create="openRule" @access-error="reportError" />
-        <section v-else-if="page !== 'tasks'" class="empty-state"><span class="empty-state-icon"><AppIcon :name="currentPage.icon" /></span><h2>{{ currentPage.label }}暂不可用</h2><p>请在设置中检查本机服务与 Telegram 连接状态。</p><button class="btn primary" @click="navigate('settings')">返回设置<AppIcon name="arrow" /></button></section>
+        <section v-else-if="page !== 'tasks' && page !== 'settings'" class="empty-state"><span class="empty-state-icon"><AppIcon :name="currentPage.icon" /></span><h2>{{ currentPage.label }}暂不可用</h2><p>请在设置中检查本机服务与 Telegram 连接状态。</p><button class="btn primary" @click="navigate('settings')">返回设置<AppIcon name="arrow" /></button></section>
         <TransferTasks v-show="page === 'tasks'" :active="page === 'tasks'" v-model:category="taskCategory" :refresh-version="taskRefresh" :authorized="telegram?.authState === 'READY'" :available="serviceReachable && !loading && !accessInvalid && !exited" :account-id="telegram?.userId ?? null" @access-error="reportError" />
       </main>
       <footer class="statusbar"><span><span :class="['connection-dot', { online: connected && telegram?.connectionState === 'READY' }]" />{{ connectionLabel }}</span><span>本机单账号<span class="footer-divider">|</span>会话与媒体目录分开管理</span></footer>
@@ -399,5 +401,6 @@ onBeforeUnmount(() => { disposed = true; stopPolling(); window.clearInterval(clo
 
 <style scoped>
 .page-heading>div{min-width:0}.close-project{flex-shrink:0;align-self:flex-start;margin-top:20px;color:#ad6b68;border-color:#e5d3d1;background:#fff;font-size:11px}.close-project>.icon{width:15px;height:15px}
+.settings-heading>.close-project{margin-top:6px}
 @media(max-width:480px){.page-heading{flex-wrap:wrap;gap:12px}.close-project{margin-top:0}}
 </style>

@@ -20,7 +20,7 @@ import org.springframework.stereotype.Component;
 /** One process owns one connection. Callbacks must contain only short local SQL work. */
 @Component
 public final class Database implements AutoCloseable {
-    public static final int SCHEMA_VERSION = 16;
+    public static final int SCHEMA_VERSION = 17;
     private static final int BUSY_TIMEOUT_MS = 5_000;
     private final Path databasePath;
     private final Connection connection;
@@ -87,7 +87,7 @@ public final class Database implements AutoCloseable {
                 """)) { }
             try (Statement statement = connection.createStatement(); ResultSet ignored = statement.executeQuery("SELECT t.prepared_json,g.owner_run,i.temporary_id,i.formal_id,i.staging_json,i.archive_phase,i.archive_identity,e.event_json,c.sha256 FROM upload_tasks t LEFT JOIN upload_groups g ON g.task_id=t.id LEFT JOIN upload_items i ON i.task_id=t.id LEFT JOIN upload_events e ON e.group_id=g.id LEFT JOIN upload_claims c ON c.task_id=t.id LIMIT 0")) { }
             try (Statement statement = connection.createStatement(); ResultSet ignored = statement.executeQuery("SELECT i.history_id,h.account_id,h.unique_id,h.size,h.sha256,h.source_task_id,h.original_path,h.completed_at FROM download_items i LEFT JOIN download_history h ON h.id=i.history_id LIMIT 0")) { }
-            try (Statement statement = connection.createStatement(); ResultSet ignored = statement.executeQuery("SELECT t.duplicate_policy,p.relative_path,p.sha256,p.duplicate_of,p.reason,p.manifest_relative,p.planned_at,l.source_key,l.source_link,l.post_link,l.output_path FROM download_tasks t LEFT JOIN download_items i ON i.task_id=t.task_id LEFT JOIN download_output_plans p ON p.item_id=i.item_id LEFT JOIN download_completion_log l ON l.item_id=i.item_id LIMIT 0")) { }
+            try (Statement statement = connection.createStatement(); ResultSet ignored = statement.executeQuery("SELECT t.duplicate_policy,t.skip_content_duplicates,p.relative_path,p.sha256,p.duplicate_of,p.reason,p.manifest_relative,p.planned_at,l.source_key,l.source_link,l.post_link,l.output_path FROM download_tasks t LEFT JOIN download_items i ON i.task_id=t.task_id LEFT JOIN download_output_plans p ON p.item_id=i.item_id LEFT JOIN download_completion_log l ON l.item_id=i.item_id LIMIT 0")) { }
             try (Statement statement=connection.createStatement();ResultSet ignored=statement.executeQuery("SELECT r.account_id,r.current_version,r.revision,r.enabled,r.next_scan_at,v.config_json,o.version,o.observation_json FROM auto_rules r LEFT JOIN auto_rule_versions v ON v.rule_id=r.id AND v.version=r.current_version LEFT JOIN auto_rule_observations o ON o.rule_id=r.id LIMIT 0")){}
             try (Statement statement=connection.createStatement();ResultSet ignored=statement.executeQuery("SELECT a.item_id,a.operation_id,a.check_id,a.prior_temporary_id,a.failed_id,a.new_temporary_id,a.owner_run,a.state,f.failure_json FROM upload_retry_attempts a LEFT JOIN upload_send_failures f ON f.group_id=a.group_id AND f.old_id=a.prior_temporary_id LIMIT 0")){}
             try (Statement statement=connection.createStatement();ResultSet ignored=statement.executeQuery("SELECT a.rule_id,a.version,a.revision,a.target_json,b.task_id,b.snapshot_json,b.pause_kind,b.manual_takeover_at,b.settled_at FROM auto_rule_authorizations a LEFT JOIN auto_upload_bindings b ON b.rule_id=a.rule_id LIMIT 0")){}
@@ -102,6 +102,7 @@ public final class Database implements AutoCloseable {
                 LEFT JOIN download_rule_media m ON m.rule_id=r.id AND m.version=r.current_version
                 LEFT JOIN download_rule_tasks t ON t.rule_id=r.id LIMIT 0
                 """)){}
+            validateContentSkipColumn(connection);
         } catch (SQLException | IOException | RuntimeException failure) {
             if (opened != null) {
                 try { opened.close(); }
@@ -507,10 +508,47 @@ public final class Database implements AutoCloseable {
                     statement.execute("CREATE INDEX download_rule_media_task ON download_rule_media(task_id,item_id)");
                 }
                 if (oldVersion < 16) allowDuplicatePlansWithoutManifests(sql);
+                if (oldVersion < 17) addContentSkipColumn(sql);
                 statement.execute("PRAGMA user_version=" + SCHEMA_VERSION);
             }
             return null;
         });
+    }
+
+    private static void addContentSkipColumn(Connection sql) throws SQLException {
+        boolean exists = false;
+        try (var statement = sql.createStatement(); var rows = statement.executeQuery("PRAGMA table_info(download_tasks)")) {
+            while (rows.next()) if ("skip_content_duplicates".equals(rows.getString("name"))) exists = true;
+        }
+        if (!exists) try (var statement = sql.createStatement()) {
+            statement.execute("ALTER TABLE download_tasks ADD COLUMN skip_content_duplicates INTEGER NOT NULL DEFAULT 0 CHECK(skip_content_duplicates IN(0,1))");
+        }
+        // Some older-version fixtures already retain this additive future column. Preserve it only if valid.
+        validateContentSkipColumn(sql);
+    }
+
+    private static void validateContentSkipColumn(Connection sql) throws SQLException {
+        boolean found = false;
+        try (var statement = sql.createStatement(); var rows = statement.executeQuery("PRAGMA table_info(download_tasks)")) {
+            while (rows.next()) if ("skip_content_duplicates".equals(rows.getString("name"))) {
+                found = true;
+                String defaultValue = rows.getString("dflt_value");
+                if (!"INTEGER".equalsIgnoreCase(rows.getString("type")) || rows.getInt("notnull") != 1
+                        || defaultValue == null || !"0".equals(defaultValue.strip()))
+                    throw new SQLException("下载任务内容去重标记的列定义无效，原数据已保留");
+            }
+        }
+        if (!found) throw new SQLException("下载任务内容去重标记缺失，原数据已保留");
+        try (var statement = sql.createStatement(); var rows = statement.executeQuery("SELECT sql FROM sqlite_master WHERE type='table' AND name='download_tasks'")) {
+            if (!rows.next()) throw new SQLException("下载任务表结构无效，原数据已保留");
+            String definition = rows.getString(1).toLowerCase(java.util.Locale.ROOT).replaceAll("\\s+", "")
+                    .replace("\"", "").replace("`", "").replace("[", "").replace("]", "");
+            if (!definition.contains("check(skip_content_duplicatesin(0,1))"))
+                throw new SQLException("下载任务内容去重标记缺少有效约束，原数据已保留");
+        }
+        try (var statement = sql.createStatement(); var rows = statement.executeQuery("SELECT 1 FROM download_tasks WHERE skip_content_duplicates IS NULL OR typeof(skip_content_duplicates)<>'integer' OR skip_content_duplicates NOT IN(0,1) LIMIT 1")) {
+            if (rows.next()) throw new SQLException("下载任务内容去重标记含无效值，原数据已保留");
+        }
     }
 
     private static void allowDuplicatePlansWithoutManifests(Connection sql) throws SQLException {
