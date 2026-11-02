@@ -25,11 +25,11 @@ public final class RuleUploadBroker {
     public CompletableFuture<Void> consider(Rule rule,Scan scan,Runnable running){
         long generation=telegram.sessionGeneration();current(rule,generation,running);if(resumeActive(rule,running))return CompletableFuture.completedFuture(null);
         var approved=policy.authorization(rule);var claimed=uploads.claimed(rule.accountId(),approved.post(),scan.files());int claimedCount=(int)scan.files().stream().filter(f->claimed.contains(UploadRepository.contentKey(f))).count();
-        var available=scan.files().stream().filter(f->!claimed.contains(UploadRepository.contentKey(f))).sorted(Comparator.comparingLong(FileVersion::modifiedMillis).thenComparing(FileVersion::relativePath)).toList();
+        var available=scan.files().stream().filter(f->!claimed.contains(UploadRepository.contentKey(f))).sorted(Comparator.comparing(FileVersion::relativePath,UploadDirectoryScanner::natural)).toList();
         if(available.isEmpty()){note(rule,"IDLE",claimedCount>0?"同目标已有上传任务的内容未重复创建或移动；可到任务中心核对":"没有新的稳定媒体",null,claimedCount);return CompletableFuture.completedFuture(null);}
         var first=available.getFirst();long maximumBytes=8L*1024*1024*1024;int maximum=first.mediaType().equals("ANIMATION")?1:10;long bytes=0;var selectedPaths=new HashSet<String>();
-        for(var file:available){if(!file.mediaType().equals(first.mediaType())||selectedPaths.size()>=maximum)continue;if(file.size()>maximumBytes){note(rule,"BLOCKED","候选媒体超过单组暂存上限，请拆分文件后处理",null,claimedCount);return CompletableFuture.completedFuture(null);}if(bytes+file.size()>maximumBytes)continue;bytes+=file.size();selectedPaths.add(file.relativePath());}
-        var selected=scan.files().stream().filter(f->selectedPaths.contains(f.relativePath())).toList();
+        for(var file:available){if(!file.mediaType().equals(first.mediaType()))continue;if(selectedPaths.size()>=maximum)break;if(file.size()>maximumBytes){note(rule,"BLOCKED","候选媒体超过单组暂存上限，请拆分文件后处理",null,claimedCount);return CompletableFuture.completedFuture(null);}if(bytes>maximumBytes-file.size())break;bytes+=file.size();selectedPaths.add(file.relativePath());}
+        var selected=available.stream().filter(f->selectedPaths.contains(f.relativePath())).toList();
         CompletableFuture<Void> preparation;
         try{preparation=reads.readWork(()->{
             current(rule,generation,running);var target=targets.read(rule.input().link(),rule.accountId(),generation,Set.of(first.mediaType()));current(rule,generation,running);

@@ -6,7 +6,11 @@ import java.util.List;
 
 public final class UploadTaskModels {
     private UploadTaskModels() { }
-    public record Staged(String path, long size, String sha256, String identity, int width, int height) { }
+    public record VideoThumbnail(String path, long size, String sha256, String identity, int width, int height) { }
+    public record VideoDetails(int duration, boolean supportsStreaming, VideoThumbnail thumbnail) { }
+    public record Staged(String path, long size, String sha256, String identity, int width, int height, VideoDetails video) {
+        public Staged(String path, long size, String sha256, String identity, int width, int height) { this(path,size,sha256,identity,width,height,null); }
+    }
     public record Item(String id, int ordinal, FileVersion file, String caption, String state, String temporaryId,
                        String formalId, String remoteUniqueId, Staged staged, String archiveRelative, String archivePhase, String archiveIdentity, String error) { }
     public record Group(long id, int number, String mediaType, String mode, String state, String ownerRun, Long startedAt, String error, List<Item> items) { public Group { items = List.copyOf(items); } }

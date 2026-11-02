@@ -58,7 +58,49 @@ public final class UploadRepository {
         sql(c,"UPDATE upload_tasks SET state='QUEUED',stop_requested=1,error=NULL,updated_at=? WHERE id=?",now(),id);return task(c,account,id);
     });}
     public Task cancel(String account,String id){return database.write(c->{var t=task(c,account,id);if(!List.of("READY","PAUSED").contains(t.state())||t.groups().stream().anyMatch(g->!g.state().equals("READY")))throw new IllegalArgumentException("仅能取消尚未发起发送的任务，已有发送意图必须先核对");sql(c,"UPDATE upload_tasks SET state='CANCELLED',stop_requested=1,updated_at=? WHERE id=?",now(),id);sql(c,"DELETE FROM upload_claims WHERE task_id=?",id);return task(c,account,id);});}
-    public Task next(String account){return database.write(c->{String id=null;try(var q=c.prepareStatement("SELECT id FROM upload_tasks WHERE account_id=? AND state='QUEUED' ORDER BY created_at LIMIT 1")){q.setString(1,account);try(var r=q.executeQuery()){if(r.next())id=r.getString(1);}}if(id==null)return null;sql(c,"UPDATE upload_tasks SET state='RUNNING',updated_at=? WHERE id=?",now(),id);return task(c,account,id);});}
+    public Task next(String account){return database.write(c->{queueConfirmedArchives(c,account);String id=null;try(var q=c.prepareStatement("SELECT id FROM upload_tasks WHERE account_id=? AND state='QUEUED' ORDER BY created_at LIMIT 1")){q.setString(1,account);try(var r=q.executeQuery()){if(r.next())id=r.getString(1);}}if(id==null)return null;sql(c,"UPDATE upload_tasks SET state='RUNNING',updated_at=? WHERE id=?",now(),id);return task(c,account,id);});}
+    /** A late, fully proved receipt only resumes archive work. It never grants another send. */
+    private void queueConfirmedArchives(Connection c,String account)throws SQLException{
+        var ids=new ArrayList<String>();
+        try(var q=c.prepareStatement("""
+                SELECT t.id FROM upload_tasks t WHERE t.account_id=? AND t.state='NEEDS_REVIEW'
+                AND EXISTS(SELECT 1 FROM upload_groups g JOIN upload_items i ON i.group_id=g.id
+                    WHERE g.task_id=t.id AND g.state='CONFIRMED' AND i.state<>'ARCHIVED')
+                AND NOT EXISTS(SELECT 1 FROM upload_groups g WHERE g.task_id=t.id AND g.state NOT IN ('READY','CONFIRMED'))
+                AND NOT EXISTS(SELECT 1 FROM upload_retry_attempts a WHERE a.task_id=t.id AND a.state IN ('QUEUED','DISPATCHING','WAITING'))
+                ORDER BY t.created_at,t.id LIMIT 20
+                """)){
+            q.setString(1,account);try(var r=q.executeQuery()){while(r.next())ids.add(r.getString(1));}
+        }
+        for(var id:ids){
+            var saved=task(c,account,id);boolean valid=true;
+            for(var group:saved.groups())if(group.state().equals("CONFIRMED")&&!confirmedArchiveProof(c,saved,group)){valid=false;break;}
+            if(!valid)continue;
+            for(var group:saved.groups())if(group.state().equals("CONFIRMED"))apply(c,account,id,group.id());
+            var checked=task(c,account,id);
+            if(checked.groups().stream().allMatch(g->List.of("READY","CONFIRMED").contains(g.state())))
+                sql(c,"UPDATE upload_tasks SET state='QUEUED',stop_requested=1,error=NULL,updated_at=? WHERE id=? AND account_id=? AND state='NEEDS_REVIEW'",now(),id,account);
+        }
+    }
+    private boolean confirmedArchiveProof(Connection c,Task task,Group group)throws SQLException{
+        if(!group.state().equals("CONFIRMED")||group.items().isEmpty()||group.items().size()>10
+                ||!task.accountId().equals(task.prepared().target().post().accountId())
+                ||group.mode().equals("ALBUM")&&group.items().size()<2)return false;
+        var temporary=new HashSet<String>();var formal=new HashSet<String>();var albums=new HashSet<String>();
+        for(var item:group.items()){
+            if(!List.of("SENT","ARCHIVED").contains(item.state())||item.temporaryId()==null||item.formalId()==null
+                    ||!temporary.add(item.temporaryId())||!formal.add(item.formalId()))return false;
+            var proof=event(c,group.id(),item.temporaryId());
+            if(proof==null||!item.temporaryId().equals(proof.oldId())||!item.formalId().equals(proof.formalId())
+                    ||!identity(task,item,proof)||!group.mediaType().equals(item.file().mediaType())||!item.file().mediaType().equals(proof.mediaType())
+                    ||proof.uniqueId()==null||proof.uniqueId().isBlank()||!proof.uniqueId().equals(item.remoteUniqueId()))return false;
+            if(group.mode().equals("ALBUM")){
+                if(proof.albumId()==null||!proof.albumId().matches("-?[1-9][0-9]*"))return false;
+                albums.add(proof.albumId());if(albums.size()>1)return false;
+            }else if(!group.mode().equals("SINGLE")||group.items().size()!=1||!"0".equals(proof.albumId()))return false;
+        }
+        return true;
+    }
     public void state(Task task,String state,String error){database.write(c->{sql(c,"UPDATE upload_tasks SET state=?,error=?,updated_at=? WHERE id=? AND account_id=?",state,error,now(),task.id(),task.accountId());return null;});}
     public void preparing(Task task,Group group){database.write(c->{sql(c,"UPDATE upload_groups SET state='PREPARING' WHERE id=? AND task_id=? AND state='READY'",group.id(),task.id());return null;});}
     public void staged(Task task,Item item,Staged staged){database.write(c->{sql(c,"UPDATE upload_items SET staging_json=?,state='STAGED',error=NULL WHERE id=? AND task_id=? AND formal_id IS NULL",encode(staged),item.id(),task.id());return null;});}

@@ -12,6 +12,7 @@ import * as downloadTasks from '../src/downloadTasks.ts'
 import * as uploadTasks from '../src/uploadTasks.ts'
 import * as uploadPreview from '../src/uploadPreview.ts'
 import * as rules from '../src/rules.ts'
+import * as rulePreparation from '../src/rulePreparation.ts'
 import * as creation from '../src/transferCreation.ts'
 import * as downloadBatchStatus from '../src/downloadBatchStatus.ts'
 
@@ -36,7 +37,7 @@ function mount(t, name, initialProps = {}) {
   const stubs = new Map()
   const modules = { vue: runtimeVue, '../api': api, './api': api, '../taskCategories': categories, './taskCategories': categories,
     '../taskHistory': taskHistory, '../library': library, '../downloadPreview': preview, '../downloadTasks': downloadTasks, '../uploadTasks': uploadTasks,
-    '../uploadPreview': uploadPreview, '../rules': rules, '../downloadBatchStatus': downloadBatchStatus, '../transferCreation':creation }
+    '../uploadPreview': uploadPreview, '../rules': rules, '../rulePreparation':rulePreparation, '../downloadBatchStatus': downloadBatchStatus, '../transferCreation':creation }
   const requireModule = name => {
     if (name.endsWith('.vue')) { const title = name.split('/').at(-1).replace('.vue', ''); if (!stubs.has(title)) stubs.set(title, { __name: title }); return { __esModule: true, default: stubs.get(title) } }
     assert.ok(Object.hasOwn(modules, name), name); return modules[name]

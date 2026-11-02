@@ -57,6 +57,24 @@ class RuleTest {
         var a=f.create(all());var pending=new CompletableFuture<UploadPreviewModels.Scan>();var previews=mock(UploadPreviewService.class);when(previews.observeDirectories(any(),any())).thenReturn(pending);var service=new RuleService(f.repo,f.scanner,previews,f.telegram,f.clock);var work=service.observe(a.id(),new RuleService.Position(a.revision()));f.repo.enabled("1",a.id(),a.revision(),false,2);pending.complete(f.scan());assertThrows(ExecutionException.class,work::get);assertNull(f.repo.get("1",a.id()).observation());
         var b=f.repo.get("1",a.id());var pending2=new CompletableFuture<UploadPreviewModels.Scan>();when(previews.observeDirectories(any(),any())).thenReturn(pending2);var work2=service.observe(b.id(),new RuleService.Position(b.revision()));when(f.telegram.sessionGeneration()).thenReturn(2L);pending2.complete(f.scan());assertThrows(ExecutionException.class,work2::get);assertNull(f.repo.get("1",a.id()).observation());
     }}
+    @Test void preparationGuardsStopDetectionBeforeCommitAndPreviewBeforeTargetRead()throws Exception{try(var f=new Fixture()){
+        f.file("one.txt","one");var a=f.create(all());var pending=new CompletableFuture<UploadPreviewModels.Scan>();var previews=mock(UploadPreviewService.class);
+        var checks=new java.util.concurrent.atomic.AtomicReference<Runnable>();when(previews.observeDirectories(any(),any())).thenAnswer(i->{checks.set(i.getArgument(1));return pending;});
+        var service=new RuleService(f.repo,f.scanner,previews,f.telegram,f.clock);var running=new java.util.concurrent.atomic.AtomicBoolean(true);
+        Runnable guard=()->{if(!running.get())throw new IllegalArgumentException("准备已超时");};
+        var work=service.observe(a.id(),new RuleService.Position(a.revision()),guard);checks.get().run();running.set(false);
+        assertThrows(IllegalArgumentException.class,checks.get()::run);pending.complete(f.scan());assertThrows(ExecutionException.class,work::get);
+        assertNull(f.repo.get("1",a.id()).observation());
+        assertThrows(IllegalArgumentException.class,()->f.service.preview(a.id(),new RuleService.Position(a.revision()),guard));verifyNoInteractions(f.targets);
+    }}
+    @Test void previewForwardsItsBoundGuardAndDiscardsAnExpiredResultWithoutCreatingActivation()throws Exception{try(var f=new Fixture()){
+        var a=f.create(all());var pending=new CompletableFuture<UploadPreviewModels.View>();var previews=mock(UploadPreviewService.class);
+        var checks=new java.util.concurrent.atomic.AtomicReference<Runnable>();when(previews.previewRule(any(),any())).thenAnswer(i->{checks.set(i.getArgument(1));return pending;});
+        var service=new RuleService(f.repo,f.scanner,previews,f.telegram,f.clock);var running=new java.util.concurrent.atomic.AtomicBoolean(true);
+        var work=service.preview(a.id(),new RuleService.Position(a.revision()),()->{if(!running.get())throw new IllegalArgumentException("准备已超时");});
+        checks.get().run();running.set(false);assertThrows(IllegalArgumentException.class,checks.get()::run);pending.complete(null);
+        assertThrows(ExecutionException.class,work::get);assertFalse(f.repo.get("1",a.id()).enabled());verifyNoInteractions(f.targets);
+    }}
     @Test void invalidTargetAndDriveRootFailBeforeSaving()throws Exception{try(var f=new Fixture()){
         var input=f.input(all());assertThrows(IllegalArgumentException.class,()->f.service.create(new RuleService.Create(UUID.randomUUID().toString(),new Input("x","https://example.com/1",input.sourceDirectory(),input.archiveDirectory(),true,"FILENAME",all()))));assertThrows(IllegalArgumentException.class,()->f.service.create(new RuleService.Create(UUID.randomUUID().toString(),new Input("x",LINK,f.source.getRoot().toString(),input.archiveDirectory(),true,"FILENAME",all()))));assertTrue(f.repo.list("1").isEmpty());
     }}

@@ -39,7 +39,7 @@ public final class UploadEngine implements AutoCloseable,org.springframework.con
                 if(!task.prepared().target().post().equals(fresh.post()))throw new IllegalArgumentException("目标主帖或讨论映射已变化，请核对任务");
                 try(var lease=files.lease(active.items().stream().map(Item::staged).toList(),check)){
                     check.run();repository.intent(task,active,transport.owner(session));intended=true;transport.send(task,active,session);
-                    long deadline=System.nanoTime()+TimeUnit.MINUTES.toNanos(20);
+                    long deadline=System.nanoTime()+TimeUnit.SECONDS.toNanos(receiptWaitSeconds(active.items().stream().mapToLong(i->i.file().size()).sum()));
                     while(true){check.run();transport.expireRecoveries();task=repository.task(task.accountId(),task.id());active=task.groups().stream().filter(g->g.id()==initial.id()).findFirst().orElseThrow();
                         if(active.state().equals("CONFIRMED"))break;
                         if(active.state().equals("UNCERTAIN")||transport.lostEvidence()||System.nanoTime()>deadline)throw new IllegalArgumentException("未能确认全部正式回执，需核对；不会重发");
@@ -54,6 +54,12 @@ public final class UploadEngine implements AutoCloseable,org.springframework.con
         catch(Exception failure){if(failure instanceof InterruptedException)Thread.currentThread().interrupt();String receiptReason="发送结果需核对，源文件保留，禁止直接重发";if(active!=null){if(intended){repository.uncertain(active,"发送结果未全部确认，请核对");long groupId=active.id();var saved=repository.task(task.accountId(),task.id()).groups().stream().filter(g->g.id()==groupId).findFirst().orElseThrow();if(saved.error()!=null)receiptReason=saved.error();}else repository.unprepared(active);}
             if(closed&&!intended&&failure instanceof Stopped)repository.markAutomaticRestart(task);
             repository.state(task,intended?"NEEDS_REVIEW":"PAUSED",intended?receiptReason:failure instanceof IllegalArgumentException?failure.getMessage():"文件准备或目标核对未完成，请检查源版本、格式、空间和权限后继续");}
+    }
+    /** Finite receipt wait: at least twenty minutes, estimated at 1MiB/s plus two minutes, capped at six hours. */
+    static long receiptWaitSeconds(long bytes){
+        if(bytes<0)throw new IllegalArgumentException("上传组大小无效");
+        long mebibyte=1024L*1024,estimated=bytes/mebibyte+(bytes%mebibyte==0?0:1)+120;
+        return Math.min(TimeUnit.HOURS.toSeconds(6),Math.max(TimeUnit.MINUTES.toSeconds(20),estimated));
     }
     private void archive(Task task,Group group,Runnable check){for(var item:group.items()){if(item.state().equals("ARCHIVED"))continue;try{check.run();files.archive(task,item,check);}catch(IOException|RuntimeException failure){repository.itemError(item,"已发送待移动：请检查源版本、归档空间、占用或已有文件");throw new ArchiveFailure();}}}
     private static final class Stopped extends RuntimeException{}private static final class ArchiveFailure extends RuntimeException{}

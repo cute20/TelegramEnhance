@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { api, ApiError } from '../api'
 import { formatMediaBytes } from '../library'
 import { validUploadPreview, uploadTypes } from '../uploadPreview'
@@ -10,6 +10,7 @@ import DownloadRules from './DownloadRules.vue'
 import RuleFormDialog from './RuleFormDialog.vue'
 import type {TaskCategory} from '../taskCategories'
 import type {UploadCreationSelection} from '../transferCreation'
+import { preparationElapsed, rulePreparationId, validRulePreparation, type PreparationIdentity, type PreparationKind, type RulePreparation } from '../rulePreparation'
 const props=defineProps<{authorized:boolean;available:boolean;accountId:string|null;createOnly?:boolean;embedded?:boolean;category?:'download'|'upload';refreshVersion?:number;selection?:UploadCreationSelection}>()
 const emit=defineEmits<{accessError:[cause:ApiError];tasks:[category:TaskCategory];create:[direction:'download'|'upload'];saved:[direction:'download'|'upload'];close:[];locked:[value:boolean]}>()
 const ruleCategories=[{id:'download',label:'下载规则'},{id:'upload',label:'上传规则'}] as const
@@ -18,6 +19,10 @@ function selectCategory(category:'download'|'upload'){if(busy.value||formOpen.va
 const items=ref<RuleView[]>([]),busy=ref(''),error=ref(''),notice=ref(''),editing=ref<RuleView|null>(null),formOpen=ref(false),uncertain=ref(false)
 const preview=ref<RulePreview|null>(null)
 const activation=ref<{rule:RuleView;preview:RulePreview}|null>(null),activationDialog=ref<HTMLDialogElement|null>(null)
+type PreparationRequest=PreparationIdentity&{intent:'observe'|'preview'|'activation';rule:RuleView;generation:number;startedAt:number}
+const preparationRequest=ref<PreparationRequest|null>(null),preparation=ref<RulePreparation|null>(null),preparationWaiting=ref(false),preparationPending=ref(false),preparationNow=ref(Date.now())
+const preparationTime=computed(()=>preparationElapsed(preparation.value?.startedAt??preparationRequest.value?.startedAt??Date.now(),preparationNow.value))
+let preparationTimer:ReturnType<typeof setTimeout>|undefined,preparationEpoch=0,preparationFlight=0
 const empty=():RuleInput=>({name:'',link:'',sourceDirectory:'',archiveDirectory:'',recursive:true,captionMode:'FILENAME',window:{mode:'ALL_DAY',start:null,end:null,timezone:'Asia/Shanghai'},executionMode:'AUTO_UPLOAD'})
 const form=reactive(empty())
 const nameAutomatic=ref(true),nameBusy=ref(false),nameError=ref('')
@@ -35,6 +40,8 @@ async function refresh(){
   try{const result=await api<{items:RuleView[];mode:string}>('/rules');if(!alive(g,account)||busy.value)return
     if(!['RULES','OBSERVE_ONLY'].includes(result.mode)||!Array.isArray(result.items)||result.items.length>20||!result.items.every(x=>validRule(x,account)))throw new Error('规则列表无法确认')
     items.value=result.items
+    const request=preparationRequest.value
+    if(request&&!items.value.some(value=>value.rule.id===request.ruleId&&value.rule.version===request.version&&value.rule.revision===request.revision)){clearPreparation();error.value='规则已变化，旧准备结果已丢弃；请重新核对当前规则。'}
     if(preview.value&&!items.value.some(v=>v.rule.id===preview.value!.ruleId&&v.rule.revision===preview.value!.revision))preview.value=null
   }catch(cause){if(alive(g,account))fail(cause)}
 }
@@ -46,7 +53,7 @@ function applySelection(){
   form.link=selection.link;form.sourceDirectory=selection.sourceDirectory;form.archiveDirectory=ruleArchiveDirectory(selection.sourceDirectory)
   form.recursive=selection.recursive;form.captionMode=selection.captionMode
 }
-function edit(value:RuleView|null){if(busy.value||uncertain.value)return;generation++;nameGeneration++;nameBusy.value=false;nameError.value='';nameAutomatic.value=false;editing.value=value;Object.assign(form,empty(),JSON.parse(JSON.stringify(value?value.rule.input:empty())));form.executionMode=value?.mode??'AUTO_UPLOAD';form.archiveDirectory=ruleArchiveDirectory(form.sourceDirectory);nameAutomatic.value=!value;lastNameAttempt='';lastAutoName='';formOpen.value=true;preview.value=null;error.value='';notice.value='';if(!value)applySelection()}
+function edit(value:RuleView|null){if(busy.value||uncertain.value||preparationRequest.value)return;generation++;nameGeneration++;nameBusy.value=false;nameError.value='';nameAutomatic.value=false;editing.value=value;Object.assign(form,empty(),JSON.parse(JSON.stringify(value?value.rule.input:empty())));form.executionMode=value?.mode??'AUTO_UPLOAD';form.archiveDirectory=ruleArchiveDirectory(form.sourceDirectory);nameAutomatic.value=!value;lastNameAttempt='';lastAutoName='';formOpen.value=true;preview.value=null;error.value='';notice.value='';if(!value)applySelection()}
 function closeForm(){
   if(busy.value||props.createOnly&&uncertain.value)return
   generation++;nameGeneration++;nameBusy.value=false;nameError.value='';formOpen.value=false
@@ -89,21 +96,68 @@ async function lookup(){
   }catch(cause){if(alive(g,account))fail(cause)}finally{if(alive(g,account)){busy.value='';if(completed&&props.createOnly)emit('saved','upload')}}
 }
 async function act(value:RuleView,kind:'enabled'|'observe'|'preview'){
-  if(!ready()||busy.value||uncertain.value||value.scanning&&kind!=='enabled')return
+  if(!ready()||busy.value||uncertain.value||preparationRequest.value||value.scanning&&kind!=='enabled')return
   if(kind==='enabled'&&value.mode==='AUTO_UPLOAD'&&!value.rule.enabled){await prepareActivation(value);return}
+  if(kind==='observe'||kind==='preview'){await startPreparation(value,kind,kind);return}
   const g=++generation,account=props.accountId;busy.value=kind;error.value='';notice.value='';preview.value=null
-  try{const result=await api<unknown>('/rules/'+value.rule.id+'/'+kind,{method:'POST',timeout:kind==='preview'?150000:80000,body:{revision:value.rule.revision,...(kind==='enabled'?{enabled:!value.rule.enabled}:{})}})
+  try{const result=await api<unknown>('/rules/'+value.rule.id+'/enabled',{method:'POST',timeout:80000,body:{revision:value.rule.revision,enabled:!value.rule.enabled}})
     if(!alive(g,account))return
-    if(kind==='preview'){const p=result as RulePreview;if(p.ruleId!==value.rule.id||p.version!==value.rule.version||p.revision!==value.rule.revision||!validUploadPreview(p.preview,account!))throw new Error('分组预览无法确认');preview.value=p}
-    else{put(result);notice.value=kind==='enabled'?'目录观察状态已更新。':'本次目录检测已完成，请查看结果。'}
+    put(result);notice.value='目录观察状态已更新。'
   }catch(cause){if(alive(g,account)){fail(cause);error.value+=' 不会自动重试，请刷新规则核对状态。'}}finally{if(alive(g,account))busy.value=''}
 }
 function closeActivation(){activationDialog.value?.close();activation.value=null}
 async function prepareActivation(value:RuleView){
-  if(!ready()||busy.value||uncertain.value)return;const g=++generation,account=props.accountId;busy.value='activation';error.value='';notice.value=''
-  try{const result=await api<RulePreview>('/rules/'+value.rule.id+'/preview',{method:'POST',timeout:150000,body:{revision:value.rule.revision}});if(!alive(g,account))return;if(result.ruleId!==value.rule.id||result.version!==value.rule.version||result.revision!==value.rule.revision||!validUploadPreview(result.preview,account!))throw new Error('启用预览无法确认');activation.value={rule:JSON.parse(JSON.stringify(value)),preview:result};await nextTick();if(alive(g,account))activationDialog.value?.showModal()}
-  catch(cause){if(alive(g,account))fail(cause)}finally{if(alive(g,account))busy.value=''}
+  return startPreparation(value,'preview','activation')
 }
+function stopPreparation(){clearTimeout(preparationTimer);preparationTimer=undefined;preparationEpoch++;preparationWaiting.value=false;if(busy.value==='preparation')busy.value=''}
+function clearPreparation(){stopPreparation();preparationFlight++;preparationPending.value=false;preparationRequest.value=null;preparation.value=null}
+function pausePreparation(){stopPreparation();notice.value='已停止前端等待，后台不会因此取消；可核对原操作结果。'}
+function preparationCurrent(request:PreparationRequest,epoch:number){return preparationRequest.value?.operationId===request.operationId&&epoch===preparationEpoch&&alive(request.generation,request.accountId)}
+function schedulePreparation(request:PreparationRequest,epoch:number){
+  if(!preparationCurrent(request,epoch)||!preparationWaiting.value)return
+  preparationNow.value=Date.now()
+  if(preparationNow.value-request.startedAt>=13*60_000){stopPreparation();error.value='准备结果尚未确认，请核对原操作；没有重新提交。';return}
+  preparationTimer=setTimeout(()=>{preparationTimer=undefined;void readPreparation()},2000)
+}
+async function applyPreparation(value:unknown,request:PreparationRequest,epoch:number){
+  if(!preparationCurrent(request,epoch))return
+  if(!validRulePreparation(value,request))throw new Error('后台准备回执无法确认，请核对原操作结果。')
+  preparation.value=value;preparationNow.value=Date.now()
+  if(value.state==='RUNNING')return
+  if(value.state==='FAILED'){const message=value.error!;clearPreparation();error.value=message;return}
+  const result=value.result
+  if(request.kind==='observe'){
+    if(!validRule(result,request.accountId)||result.rule.id!==request.ruleId||result.rule.version!==request.version||result.rule.revision!==request.revision)throw new Error('目录检测回执与本次规则不符，请核对原操作。')
+    put(result);clearPreparation();notice.value='本次目录检测已完成，请查看结果。'
+  }else{
+    const p=result as RulePreview
+    if(!p||p.ruleId!==request.ruleId||p.version!==request.version||p.revision!==request.revision||!validUploadPreview(p.preview,request.accountId))throw new Error('分组预览无法确认，请核对原操作。')
+    if(request.intent==='activation'){activation.value={rule:request.rule,preview:p};clearPreparation();await nextTick();if(alive(request.generation,request.accountId))activationDialog.value?.showModal()}
+    else{preview.value=p;clearPreparation()}
+  }
+}
+async function startPreparation(value:RuleView,kind:PreparationKind,intent:PreparationRequest['intent']){
+  if(!ready()||busy.value||uncertain.value||preparationRequest.value)return
+  let operationId:string
+  try{operationId=rulePreparationId()}catch(cause){fail(cause);return}
+  const request:PreparationRequest={operationId,ruleId:value.rule.id,accountId:props.accountId!,version:value.rule.version,revision:value.rule.revision,kind,intent,rule:JSON.parse(JSON.stringify(value)),generation:++generation,startedAt:Date.now()}
+  preparationRequest.value=request;preparation.value=null;preparationNow.value=request.startedAt;preparationWaiting.value=true;busy.value='preparation';error.value='';notice.value='';preview.value=null
+  const epoch=++preparationEpoch,flight=++preparationFlight;preparationPending.value=true
+  try{const result=await api<unknown>('/rules/'+request.ruleId+'/preparations',{method:'POST',body:{operationId,revision:request.revision,kind}});await applyPreparation(result,request,epoch)}
+  catch(cause){if(preparationCurrent(request,epoch)){fail(cause);if(cause instanceof ApiError&&cause.status>=400&&cause.status<500)clearPreparation();else{stopPreparation();error.value+=' 请核对原操作结果，不会自动重复提交。'}}}
+  finally{if(flight===preparationFlight)preparationPending.value=false;schedulePreparation(request,epoch)}
+}
+async function readPreparation(){
+  const request=preparationRequest.value
+  if(!request||!ready()||preparationPending.value)return
+  clearTimeout(preparationTimer);preparationTimer=undefined
+  const epoch=preparationEpoch,flight=++preparationFlight;preparationPending.value=true;error.value=''
+  try{const result=await api<unknown>('/rules/'+request.ruleId+'/preparations/by-operation/'+request.operationId);if(!preparationCurrent(request,epoch))return
+    if(result===null){stopPreparation();error.value='尚未查到这次后台准备，请稍后核对原操作；重启或过期后可离开并重新打开规则校验，没有重新提交。';return}await applyPreparation(result,request,epoch)}
+  catch(cause){if(preparationCurrent(request,epoch)){fail(cause);if(cause instanceof ApiError&&cause.status===400)clearPreparation();else stopPreparation();error.value+=' 请核对原操作结果，不会自动重新准备。'}}
+  finally{if(flight===preparationFlight)preparationPending.value=false;schedulePreparation(request,epoch)}
+}
+function resumePreparation(){if(!preparationRequest.value||!ready()||preparationPending.value)return;preparationWaiting.value=true;busy.value='preparation';notice.value='';void readPreparation()}
 async function confirmActivation(){
   const selected=activation.value;if(!selected||!ready()||busy.value)return;if(selected.preview.preview.expiresAt<=Date.now()){closeActivation();error.value='启用预览已过期，请重新预览后确认。';return}const g=++generation,account=props.accountId;busy.value='enable-auto';error.value=''
   try{const result=await api<RuleView>('/rules/'+selected.rule.rule.id+'/enabled',{method:'POST',body:{revision:selected.rule.rule.revision,enabled:true,previewId:selected.preview.preview.id}});if(!alive(g,account))return;put(result);closeActivation();notice.value='自动上传已明确启用，按保存的时段处理当前及今后稳定媒体。'}
@@ -112,8 +166,9 @@ async function confirmActivation(){
 watch([()=>props.authorized,()=>props.available,()=>props.accountId],(context,previous)=>{
   const identityChanged=!previous||context[0]!==previous[0]||context[2]!==previous[2]
   const saving=busy.value==='save'||busy.value==='lookup'
+  if(!identityChanged&&preparationRequest.value){stopPreparation();error.value='连接状态已变化，请核对原后台准备结果；不会重新提交。';if(ready())void refresh();return}
   if(!identityChanged&&saving)uncertain.value=true
-  generation++;closeActivation();nameGeneration++;nameBusy.value=false;lastNameAttempt='';preview.value=null;busy.value=''
+  clearPreparation();generation++;closeActivation();nameGeneration++;nameBusy.value=false;lastNameAttempt='';preview.value=null;busy.value=''
   if(identityChanged){nameError.value='';nameAutomatic.value=true;lastAutoName='';items.value=[];error.value='';notice.value='';uncertain.value=false;pendingOperation=null;formOpen.value=false;editing.value=null;Object.assign(form,empty())}
   else if(saving){error.value='连接中断，已保留本次提交，请恢复连接后核对保存结果；不会自动重复提交。'}
   if(ready())void refresh()
@@ -123,7 +178,7 @@ watch(()=>props.category,category=>{if(!props.createOnly&&category&&!busy.value&
 watch(()=>props.refreshVersion,()=>{if(!props.createOnly){if(props.category&&!busy.value&&!formOpen.value&&!activation.value)selectedCategory.value=props.category;void refresh()}})
 watch([()=>props.selection?.link,()=>props.selection?.sourceDirectory,()=>props.selection?.recursive,()=>props.selection?.captionMode],applySelection,{immediate:true,flush:'sync'})
 onMounted(()=>{if(props.createOnly){edit(null);if(props.selection&&form.link.trim())void resolveName()}})
-onBeforeUnmount(()=>{disposed=true;generation++;closeActivation();nameGeneration++})
+onBeforeUnmount(()=>{disposed=true;generation++;clearPreparation();closeActivation();nameGeneration++})
 </script>
 <template>
   <div class="rule-workspace">
@@ -132,10 +187,11 @@ onBeforeUnmount(()=>{disposed=true;generation++;closeActivation();nameGeneration
     <DownloadRules :authorized="authorized" :available="available" :account-id="accountId" :refresh-version="refreshVersion" @create="emit('create',$event)" @access-error="emit('accessError',$event)" @tasks="emit('tasks','download')" />
     </section>
     <section :id="createOnly?undefined:'rule-panel-upload'" v-show="createOnly||selectedCategory==='upload'" class="upload-rules" :aria-labelledby="createOnly?undefined:'rule-category-upload'">
-    <header v-if="!createOnly" class="rule-toolbar rule-section-header"><span class="rule-count">{{items.length}} 条上传规则</span><button class="btn" :disabled="!!busy||!authorized||!available" @click="refresh()">刷新</button><button class="btn primary" :disabled="!!busy||uncertain||!authorized||!available" @click="emit('create','upload')">新建上传规则</button></header>
+    <header v-if="!createOnly" class="rule-toolbar rule-section-header"><span class="rule-count">{{items.length}} 条上传规则</span><button class="btn" :disabled="!!busy||!authorized||!available" @click="refresh()">刷新</button><button class="btn primary" :disabled="!!busy||uncertain||!!preparationRequest||!authorized||!available" @click="emit('create','upload')">新建上传规则</button></header>
     <div v-if="!createOnly&&(!authorized||!available)" class="notice warning">请先连接 Telegram 并恢复本机服务。</div>
 
-    <p v-if="!createOnly&&busy&&!formOpen" class="notice" role="status">正在处理，请等待当前操作完成…</p><p v-if="!createOnly&&error&&!formOpen" class="notice danger" role="alert">{{error}}</p><p v-if="!createOnly&&notice" class="notice success" role="status">{{notice}}</p>
+    <p v-if="!createOnly&&busy&&!formOpen&&!preparationRequest" class="notice" role="status">正在处理，请等待当前操作完成…</p><p v-if="!createOnly&&error&&!formOpen" class="notice danger" role="alert">{{error}}</p><p v-if="!createOnly&&notice" class="notice success" role="status">{{notice}}</p>
+    <section v-if="preparationRequest" class="rule-preparation" aria-label="后台目录准备"><div><strong>{{preparationRequest.rule.rule.input.name}}</strong><p role="status">{{preparationWaiting?'正在校验目录与文件':'准备结果待核对'}} · 已用 {{preparationTime}}</p><small>大目录会在后台完整校验，完成前不会启用规则或发送文件。</small></div><button v-if="preparationWaiting" type="button" class="btn" @click="pausePreparation">停止等待</button><button v-else type="button" class="btn" :disabled="!authorized||!available||preparationPending" @click="resumePreparation">{{preparationPending?'等待本次查询结束…':'继续等待／核对结果'}}</button></section>
     <div v-if="!createOnly&&uncertain&&!formOpen" class="notice warning rule-uncertain"><p>保存结果尚未确认，请先核对，避免重复创建或修改规则。</p><div class="rule-actions"><button class="btn" type="button" :disabled="!!busy" @click="lookup">核对本次保存结果</button><button class="btn" type="button" :disabled="!!busy" @click="reopenForm">返回表单</button></div></div>
     <RuleFormDialog :open="formOpen" :embedded="embedded" :title="editing?'编辑上传规则':'新建上传规则'" :busy="!!busy||!!createOnly&&uncertain" @close="closeForm">
     <form v-if="formOpen" class="rule-form" @submit.prevent="save">
@@ -172,8 +228,8 @@ onBeforeUnmount(()=>{disposed=true;generation++;closeActivation();nameGeneration
       <div class="rule-detection" v-if="value.rule.observation?.scan"><span>最近检测 {{ruleTime(value.rule.observation.scanAt)}}</span><strong>{{value.rule.observation.scan.files.length}} 个候选媒体</strong></div><p v-else class="rule-muted">尚未检测目录。</p>
       <details v-if="value.rule.observation?.scan" class="rule-observation"><summary>检测明细与文件</summary><p>新增 {{value.rule.observation.added}} · 变化 {{value.rule.observation.changed}} · 本次未观察到 {{value.rule.observation.unobserved}} · 暂缓 {{value.rule.observation.scan.deferredFiles}} · 重复 {{value.rule.observation.scan.duplicateFiles}} · 跳过链接 {{value.rule.observation.scan.linkedEntries}}</p><ul><li v-for="file in value.rule.observation.scan.files.slice(0,50)" :key="file.relativePath">{{file.relativePath}} · {{formatMediaBytes(file.size)}}</li></ul><p v-if="value.rule.observation.scan.files.length>50">仅显示前50个文件</p><p v-if="value.rule.observation.upload">最近调度 {{ruleTime(value.rule.observation.upload.checkedAt)}}：{{value.rule.observation.upload.message}}</p></details>
       <div v-if="value.job" class="rule-latest"><span>最近任务</span><strong>{{uploadTaskLabels[value.job.state]??value.job.state}}</strong><span>{{value.job.total}} 个媒体 · 已归档 {{value.job.archived}}</span><button class="btn" @click="emit('tasks','upload')">查看任务</button><p v-if="value.job.manualTakeover">已转为手动处理</p><p v-else-if="value.job.ruleVersion!==value.rule.version">旧版本任务，请到任务中心处理。</p><p v-if="value.job.error" class="notice warning">{{value.job.error}}</p></div>
-      <div class="rule-actions"><button class="btn" :disabled="!!busy||uncertain||value.scanning||!authorized||!available" @click="act(value,'preview')">预览分组</button></div>
-      <template #actions><button class="btn" :disabled="!!busy||uncertain||!authorized||!available" @click="act(value,'enabled')">{{value.mode==='AUTO_UPLOAD'?(value.rule.enabled?'暂停自动上传':'启用自动上传'):(value.rule.enabled?'暂停观察':'启用观察')}}</button><button class="btn" :disabled="!!busy||uncertain||value.scanning||!authorized||!available" @click="act(value,'observe')">立即检测</button><button class="btn" :disabled="!!busy||uncertain" @click="edit(value)">修改规则</button><button v-if="jobNeedsAttention(value)" class="btn" @click="emit('tasks','upload')">到任务中心处理</button></template>
+      <div class="rule-actions"><button class="btn" :disabled="!!busy||uncertain||!!preparationRequest||value.scanning||!authorized||!available" @click="act(value,'preview')">预览分组</button></div>
+      <template #actions><button class="btn" :disabled="!!busy||uncertain||!!preparationRequest||!authorized||!available" @click="act(value,'enabled')">{{value.mode==='AUTO_UPLOAD'?(value.rule.enabled?'暂停自动上传':'启用自动上传'):(value.rule.enabled?'暂停观察':'启用观察')}}</button><button class="btn" :disabled="!!busy||uncertain||!!preparationRequest||value.scanning||!authorized||!available" @click="act(value,'observe')">立即检测</button><button class="btn" :disabled="!!busy||uncertain||!!preparationRequest" @click="edit(value)">修改规则</button><button v-if="jobNeedsAttention(value)" class="btn" @click="emit('tasks','upload')">到任务中心处理</button></template>
     </CompactRecord>
     <section v-if="!createOnly&&preview" class="settings-section rule-preview"><h2>分组预览 · 规则版本 {{preview.version}}</h2><p>{{preview.preview.channelTitle}} / {{preview.preview.postTitle}}</p><p>{{preview.preview.fileCount}} 个媒体 · {{preview.preview.groups.length}} 组 · {{formatMediaBytes(preview.preview.totalBytes)}}</p><p class="rule-muted">本次目标权限已核对，仍未发送。目录变化后请重新预览。</p><p v-for="warning in preview.preview.warnings.filter(w=>!w.startsWith('预览不发送或移动文件；'))" :key="warning" class="rule-muted">{{warning}}</p><div v-for="group in preview.preview.groups" :key="group.number" class="rule-group"><strong>第{{group.number}}组 · {{uploadTypes[group.mediaType]}} · {{group.files.length}}个</strong><ul><li v-for="file in group.files" :key="file.relativePath">{{file.relativePath}} · {{formatMediaBytes(file.size)}}</li></ul></div></section>
     </section>
@@ -183,6 +239,7 @@ onBeforeUnmount(()=>{disposed=true;generation++;closeActivation();nameGeneration
   </dialog>
 </template>
 <style scoped>
+.rule-preparation{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:12px 14px;margin:12px 0;border:1px solid #dce8f2;border-radius:7px;background:#f2f7fb;min-width:0}.rule-preparation>div{min-width:0}.rule-preparation strong{font-size:12px;color:#4c6c84;overflow-wrap:anywhere}.rule-preparation p{font-size:11px;line-height:1.8;margin:3px 0;color:#65869e}.rule-preparation small{font-size:10px;line-height:1.6}.rule-preparation .btn{font-size:10px;flex-shrink:0}@media(max-width:480px){.rule-preparation{align-items:stretch;flex-direction:column}.rule-preparation .btn{align-self:flex-end}}
 .rule-category-switch{display:flex;flex-wrap:wrap;gap:8px;border-bottom:1px solid #dfe8ef;padding-bottom:15px;margin-bottom:23px}.rule-category-switch button{border:1px solid #d8e3ec;border-radius:6px;background:#fff;color:#7893a8;padding:8px 14px;font-size:12px;line-height:1.5}.rule-category-switch button.selected{background:#263f54;border-color:#263f54;color:#fff}.rule-category-switch button:hover:not(.selected):not(:disabled){background:#f0f6fa}.download-rule-panel{min-width:0}.download-rule-panel :deep(.download-rules){margin:0;padding:0;border:0}@media(max-width:480px){.rule-category-switch{gap:6px;margin-bottom:18px}.rule-category-switch button{font-size:10px;padding:7px 10px}}
 .upload-rules{min-width:0}.rule-section-header{margin:0 0 12px;align-items:flex-start}.rule-section-header>div{flex:1;min-width:200px}.rule-section-header h2{font-size:17px;margin-bottom:6px}.rule-section-header p,.rule-count{margin:0;color:#7894a8;font-size:12px;line-height:1.8}.rule-count{margin:12px 0}.rule-form{min-width:0;margin:0!important;padding:0;border:0;box-shadow:none}.rule-form .notice,.upload-rules>.notice{font-size:12px;line-height:1.8}.rule-form small{display:block;color:#869eaf;font-size:11px;line-height:1.9;overflow-wrap:anywhere}.rule-uncertain p{margin:0 0 10px}.rule-form .rule-actions{margin-top:18px}.rule-form .rule-name-action small{flex:1;min-width:160px}.rule-form .rule-fields>*{min-width:0}.rule-form .rule-options{align-items:flex-start}.rule-form .rule-options label{max-width:100%}.rule-form .rule-options .input{min-width:0}.rule-form .rule-muted{font-size:12px;color:#869eaf;line-height:1.8}@media(max-width:600px){.rule-section-header>div{flex-basis:100%}.rule-section-header>.btn{flex:1}.rule-intro{flex-wrap:wrap}.rule-intro details{max-width:100%}}
 .rule-intro{display:flex;align-items:flex-start;gap:16px;justify-content:space-between;font-size:11px;line-height:1.9;color:#7892a7}.rule-intro details{flex:0 0 auto;max-width:500px;margin:0}.rule-intro summary{white-space:nowrap}.rule-intro p{font-size:11px;white-space:normal}

@@ -41,9 +41,11 @@ public final class RuleService {
     public View get(String id){String account=telegram.accountId();id(id);var result=view(repository.get(account,id));currentAccount(account);return result;}
     public View lookup(String operation){String account=telegram.accountId();id(operation);var rule=repository.byOperation(account,operation);currentAccount(account);return rule==null?null:view(rule);}
     public List<Version> versions(String id){String account=telegram.accountId();id(id);var out=repository.versions(account,id);currentAccount(account);return out;}
-    public CompletableFuture<View> observe(String id,Position position){String account=telegram.accountId();id(id);var rule=repository.get(account,id);position(rule,position);return scan(rule,false,()->{});}
-    public CompletableFuture<Preview> preview(String id,Position position){String account=telegram.accountId();long generation=telegram.sessionGeneration();id(id);var rule=repository.get(account,id);position(rule,position);
-        return previews.previewRule(rule.input().uploadInput()).thenApply(result->{require(rule,generation,false);if(rule.input().executionMode().equals("AUTO_UPLOAD")){synchronized(activations){activations.values().removeIf(a->a.expires()<=clock.millis()||!a.account().equals(account)||a.generation()!=generation);activations.put(result.id(),new Activation(rule.id(),account,generation,rule.version(),rule.revision(),result.expiresAt()));while(activations.size()>8)activations.remove(activations.keySet().iterator().next());}}return new Preview(rule.id(),rule.version(),rule.revision(),result);});
+    public CompletableFuture<View> observe(String id,Position position){return observe(id,position,()->{});}
+    public CompletableFuture<View> observe(String id,Position position,Runnable running){Objects.requireNonNull(running).run();String account=telegram.accountId();id(id);var rule=repository.get(account,id);position(rule,position);return scan(rule,false,running);}
+    public CompletableFuture<Preview> preview(String id,Position position){return preview(id,position,()->{});}
+    public CompletableFuture<Preview> preview(String id,Position position,Runnable running){Objects.requireNonNull(running).run();String account=telegram.accountId();long generation=telegram.sessionGeneration();id(id);var rule=repository.get(account,id);position(rule,position);Runnable check=guard(rule,generation,false,running);check.run();
+        return previews.previewRule(rule.input().uploadInput(),check).thenApply(result->{check.run();require(rule,generation,false);if(rule.input().executionMode().equals("AUTO_UPLOAD")){synchronized(activations){activations.values().removeIf(a->a.expires()<=clock.millis()||!a.account().equals(account)||a.generation()!=generation);activations.put(result.id(),new Activation(rule.id(),account,generation,rule.version(),rule.revision(),result.expiresAt()));while(activations.size()>8)activations.remove(activations.keySet().iterator().next());}}return new Preview(rule.id(),rule.version(),rule.revision(),result);});
     }
     public CompletableFuture<?> monitorOnce(Runnable running){String account=telegram.accountId();running.run();var rule=repository.due(account,clock.millis());if(rule==null)return CompletableFuture.completedFuture(null);
         if(!rule.input().window().allows(clock.instant())){repository.defer(rule,rule.input().window().nextAllowed(clock.instant()));return CompletableFuture.completedFuture(null);}
@@ -57,11 +59,8 @@ public final class RuleService {
     }
     private CompletableFuture<View> scan(Rule rule,boolean automatic,Runnable running){
         long generation=telegram.sessionGeneration();String token=UUID.randomUUID().toString();if(active.putIfAbsent(rule.id(),token)!=null)throw new IllegalArgumentException("这条规则正在检测，请等待本次结果");
-        var stopped=new AtomicBoolean();long[] last={0};Runnable check=()->{
-            running.run();current(rule.accountId(),generation);if(stopped.get())throw new IllegalArgumentException("本次检测已停止");
-            long now=System.nanoTime();if(now-last[0]>TimeUnit.MILLISECONDS.toNanos(250)){require(rule,generation,automatic);last[0]=now;}
-        };
-        try{return previews.observeDirectories(rule.input().uploadInput(),check).orTimeout(70,TimeUnit.SECONDS).handle((result,failure)->{
+        var stopped=new AtomicBoolean();Runnable bound=guard(rule,generation,automatic,running);Runnable check=()->{if(stopped.get())throw new IllegalArgumentException("本次检测已停止");bound.run();};
+        try{return previews.observeDirectories(rule.input().uploadInput(),check).orTimeout(610,TimeUnit.SECONDS).handle((result,failure)->{
             try{running.run();require(rule,generation,automatic);
                 String error=failure==null?null:"目录检测未完成，请检查文件是否复制完成、目录权限和预览范围；本轮未执行上传";
                 if(!repository.observe(rule,result,error,automatic,clock.millis()))throw new IllegalArgumentException("规则状态已变化，旧检测结果已丢弃");
@@ -69,7 +68,8 @@ public final class RuleService {
             }finally{stopped.set(true);active.remove(rule.id(),token);}
         });}catch(RuntimeException rejected){stopped.set(true);active.remove(rule.id(),token);throw rejected;}
     }
-    private void require(Rule expected,long generation,boolean automatic){current(expected.accountId(),generation);var current=repository.get(expected.accountId(),expected.id());if(current.revision()!=expected.revision()||automatic&&!current.enabled())throw new IllegalArgumentException("规则已更新或暂停，旧读取结果已丢弃");}
+    private Runnable guard(Rule rule,long generation,boolean automatic,Runnable running){long[] last={0};return ()->{running.run();current(rule.accountId(),generation);long now=System.nanoTime();if(last[0]==0||now-last[0]>TimeUnit.MILLISECONDS.toNanos(250)){require(rule,generation,automatic);last[0]=now;}};}
+    private void require(Rule expected,long generation,boolean automatic){current(expected.accountId(),generation);var current=repository.get(expected.accountId(),expected.id());if(current.version()!=expected.version()||current.revision()!=expected.revision()||automatic&&!current.enabled())throw new IllegalArgumentException("规则已更新或暂停，旧读取结果已丢弃");}
     private View view(Rule rule){var now=clock.instant();String state=!rule.enabled()?"PAUSED":rule.input().window().allows(now)?"OBSERVING":"WAITING_WINDOW";return new View(rule,rule.input().executionMode(),state,active.containsKey(rule.id()),rule.input().window().nextAllowed(now),repository.latestJob(rule.accountId(),rule.id()));}
     private Input normalize(Input input){
         if(input==null||input.name()==null||input.name().strip().isEmpty()||input.name().strip().length()>80||input.window()==null||!("FILENAME".equals(input.captionMode())||"EMPTY".equals(input.captionMode())))throw new IllegalArgumentException("请填写80字以内规则名称、目录、目标和观察时段");

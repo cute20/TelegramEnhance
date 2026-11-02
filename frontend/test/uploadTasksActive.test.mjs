@@ -16,6 +16,7 @@ const flush=async()=>{await vue.nextTick();await new Promise(setImmediate)}
 const deferred=()=>{let resolve;const promise=new Promise(done=>{resolve=done});return {promise,resolve}}
 const task=(overrides={})=>({id:ID,state:'READY',channelTitle:'Synthetic',postTitle:'Synthetic',postLink:'https://t.me/synthetic/1',discussionTitle:'Synthetic',sourceDirectory:'D:\\source',archiveDirectory:'D:\\archive',stopRequested:false,total:1,confirmed:0,archived:0,error:null,createdAt:1,updatedAt:1,groups:[{id:'group',number:1,mediaType:'DOCUMENT',state:'READY',items:[{id:'item',fileName:'sample.txt',mediaType:'DOCUMENT',size:3,state:'READY',formalMessageId:null,archivePath:null,error:null}]}],...overrides})
 const reviewTask=()=>{const value=task({state:'NEEDS_REVIEW'});value.groups[0].state='UNCERTAIN';value.groups[0].items[0].state='FAILED';return value}
+const archiveTask=(count=9)=>{const value=task({state:'NEEDS_REVIEW',total:count,confirmed:count});value.groups[0].state='CONFIRMED';value.groups[0].items=Array.from({length:count},(_,index)=>({...value.groups[0].items[0],id:'item-'+index,fileName:`sample-${index+1}.txt`,state:'SENT',formalMessageId:String(1000+index)}));return value}
 const check=()=>({id:CHECK,taskId:ID,groupId:'group',expiresAt:Date.now()+60_000,confirmed:0,retryable:1,pending:0,unresolved:0,items:[{itemId:'item',fileName:'sample.txt',state:'RETRYABLE',reason:'Synthetic confirmed failure'}]})
 const list=items=>({items,workerWarning:null})
 class ApiError extends Error{constructor(message,status){super(message);this.status=status}}
@@ -54,6 +55,90 @@ function renderRecords(f){
   function visit(node){if(!node||typeof node!=='object')return;if(node.type==='CompactRecord')records.push(node);if(Array.isArray(node.children))node.children.forEach(visit)}
   visit(root);return records
 }
+
+function nodes(value){
+  if(Array.isArray(value))return value.flatMap(nodes)
+  if(!value||typeof value!=='object')return []
+  return [value,...(Array.isArray(value.children)?nodes(value.children):[])]
+}
+function text(value){return Array.isArray(value)?value.map(text).join(''):value&&typeof value==='object'?text(value.children):typeof value==='string'?value:''}
+const recordBody=(f,index=0)=>{const record=renderRecords(f)[index];return nodes(typeof record.children?.default==='function'?record.children.default():record.children)}
+
+test('paused tasks only offer receipt recovery when some member still has sending evidence',()=>{
+  const value=task({state:'PAUSED'})
+  assert.equal(uploadTasks.canReconcileUpload(value),false)
+  value.groups[0].items[0].state='STAGED';assert.equal(uploadTasks.canReconcileUpload(value),false)
+  value.groups[0].state='SENDING';assert.equal(uploadTasks.canReconcileUpload(value),true)
+  const past=archiveTask(1);Object.assign(past,{state:'PAUSED',total:2,archived:1})
+  Object.assign(past.groups[0].items[0],{state:'ARCHIVED',archivePath:'D:\\archive\\sample.txt'})
+  past.groups.push({...task().groups[0],id:'next',items:[{...task().groups[0].items[0],id:'next-item'}]})
+  assert.equal(uploadTasks.validUploadTask(past),true)
+  assert.equal(uploadTasks.canReconcileUpload(past),false,'an archived previous group must not obstruct an untouched next group')
+  for(const state of ['PENDING','FAILED']){const pending=task({state:'PAUSED'});pending.groups[0].items[0].state=state;assert.equal(uploadTasks.canReconcileUpload(pending),true)}
+  assert.equal(uploadTasks.canReconcileUpload({...archiveTask(1),state:'PAUSED'}),true)
+})
+
+test('untouched paused task renders continue and cancel without a misleading receipt-recovery button',async t=>{
+  const value=task({state:'PAUSED'}),f=mount(t,{steps:[{path:LIST,value:list([value])}]});await flush()
+  const body=recordBody(f)
+  assert.ok(body.some(node=>node.type==='button'&&text(node)==='继续未发送组'))
+  assert.ok(body.some(node=>node.type==='button'&&text(node)==='取消未发送任务'))
+  assert.ok(!body.some(node=>node.type==='button'&&/核对|归档/.test(text(node))))
+  assert.equal(f.timers.filter(timer=>!timer.cancelled).length,0)
+})
+
+test('fully confirmed review explains pending archive accurately and keeps only a closed recovery fallback',async t=>{
+  const value=archiveTask(),f=mount(t,{steps:[{path:LIST,value:list([value])}]});await flush()
+  assert.equal(uploadTasks.validUploadTask(value),true);assert.equal(uploadTasks.awaitingArchiveVerification(value),true)
+  const body=recordBody(f),status=body.find(node=>node.props?.role==='status'),fallback=body.find(node=>node.type==='details'&&node.props?.class==='upload-archive-fallback')
+  assert.equal(text(status),'正式回执已齐，等待后台核对并归档（不会重发）。')
+  assert.ok(fallback);assert.notEqual(fallback.props?.open,true)
+  const fallbackButtons=nodes(fallback).filter(node=>node.type==='button')
+  assert.deepEqual(fallbackButtons.map(text),['核对发送结果','核对已有回执，不重发'])
+  assert.ok(body.filter(node=>node.props?.class==='upload-task-actions').at(-1).children.every(node=>node.type!== 'button'))
+  assert.ok(!body.some(node=>node.type==='button'&&/开始|继续未发送|重传/.test(text(node))))
+  assert.equal(f.calls.length,1);assert.ok(f.calls.every(call=>!call.options.method))
+  for(const changed of [{confirmed:8},{archived:9},{state:'SENT_PENDING_ARCHIVE'}])assert.equal(uploadTasks.awaitingArchiveVerification({...value,...changed}),false)
+  const unresolved=archiveTask();unresolved.groups[0].state='UNCERTAIN';assert.equal(uploadTasks.awaitingArchiveVerification(unresolved),false)
+})
+
+test('fully confirmed review follows only local GET progress through archive completion without mutating or collapsing its card',async t=>{
+  const value=archiveTask(),f=mount(t,{steps:[{path:LIST,value:list([value])}]});await flush()
+  const initial=renderRecords(f)[0],known=f.state.tasks.value[0]
+  f.state.toggleGroup(ID,'group',{currentTarget:{open:true}})
+  let timer=f.timers.findLast(timer=>!timer.cancelled);assert.equal(timer.delay,2000)
+  f.expect('/transfers/upload/tasks/'+ID,{...value,state:'RUNNING',updatedAt:2});timer.callback();await flush()
+  assert.equal(f.state.tasks.value[0].state,'RUNNING');assert.equal(f.state.loading.value,false);assert.equal(f.state.busy.value,'')
+  const completed=archiveTask();Object.assign(completed,{state:'COMPLETED',archived:9,updatedAt:3});completed.groups[0].items.forEach(item=>Object.assign(item,{state:'ARCHIVED',archivePath:'D:\\archive\\'+item.fileName}))
+  timer=f.timers.findLast(timer=>!timer.cancelled);f.expect('/transfers/upload/tasks/'+ID,completed);timer.callback();await flush()
+  assert.equal(f.state.tasks.value[0].state,'COMPLETED');assert.notEqual(f.state.tasks.value[0],known)
+  assert.equal(renderRecords(f)[0].key,initial.key);assert.equal(f.state.groupOpen(f.state.tasks.value[0],'group'),true)
+  assert.equal(f.state.offset.value,1);assert.equal(f.calls.filter(call=>call.path===LIST).length,1)
+  assert.ok(f.calls.every(call=>!call.options.method),'archive observation must never submit start, reconcile, or retry')
+  assert.ok(f.timers.every(timer=>timer.cancelled))
+})
+
+test('partial unknown review and archive failures do not enter the full-formal automatic observation category',async t=>{
+  const partial=reviewTask(),failed={...archiveTask(1),id:'archive-failure',state:'SENT_PENDING_ARCHIVE',error:'Synthetic move failure'}
+  const f=mount(t,{steps:[{path:LIST,value:list([partial,failed])}]});await flush()
+  assert.equal(f.timers.filter(timer=>!timer.cancelled).length,0);await f.state.readProgress();assert.equal(f.calls.length,1)
+  const body=recordBody(f),button=body.find(node=>node.type==='button'&&text(node)==='核对发送结果')
+  assert.ok(button);assert.ok(!text(body).includes('核对并继续'))
+  f.expect('/transfers/upload/tasks/'+ID+'/retry-check',check(),'POST');await button.props.onClick();await flush()
+  assert.equal(f.calls.at(-1).path,'/transfers/upload/tasks/'+ID+'/retry-check')
+  assert.equal(f.calls.filter(call=>call.options.method==='POST').length,1)
+  const failedBody=recordBody(f,1),retry=failedBody.find(node=>node.type==='button'&&text(node)==='仅重试归档')
+  assert.ok(retry);f.expect('/transfers/upload/tasks/archive-failure/reconcile',failed,'POST');await retry.props.onClick();await flush()
+  assert.equal(f.calls.at(-1).path,'/transfers/upload/tasks/archive-failure/reconcile')
+  assert.ok(!f.calls.some(call=>call.path.endsWith('/start')||call.path.endsWith('/retry-failed')))
+})
+
+test('archive follow-up GET is discarded after leaving the page and stops scheduling until a deliberate return',async t=>{
+  const value=archiveTask(),f=mount(t,{steps:[{path:LIST,value:list([value])}]});await flush()
+  const pending=deferred(),timer=f.timers.findLast(timer=>!timer.cancelled);f.expect('/transfers/upload/tasks/'+ID,pending.promise);timer.callback();await flush()
+  f.props.active=false;await flush();pending.resolve({...value,state:'RUNNING',updatedAt:2});await flush()
+  assert.equal(f.state.tasks.value[0].state,'NEEDS_REVIEW');assert.ok(f.timers.every(timer=>timer.cancelled));assert.equal(f.calls.length,2)
+})
 
 test('upload records pass panel activity and always start closed, including newly returned running tasks',async t=>{
   const value=task({state:'RUNNING'}),f=mount(t,{steps:[{path:LIST,value:list([value])}]});await flush()

@@ -17,17 +17,22 @@ export function validUploadPreview(value: unknown, account: string): value is Up
   if (![p.fileCount,p.totalBytes,p.otherFiles,p.deferredFiles,p.linkedEntries,p.duplicateFiles,p.slowModeSeconds,p.targetCheckedAt,p.createdAt,p.expiresAt].every(x => Number.isSafeInteger(x) && x >= 0) || p.fileCount > 500 || p.expiresAt <= p.createdAt) return false
   if (!Array.isArray(p.groups) || p.groups.length > p.fileCount || !Array.isArray(p.warnings) || !p.warnings.every(x => typeof x === 'string')) return false
   const paths = new Set<string>(); let count = 0, bytes = 0
-  const order = Object.keys(uploadTypes); let previousType = -1, previousCount = 0
+  const order = Object.keys(uploadTypes), maximumBytes = 8 * 1024 * 1024 * 1024
+  let previousType = -1, previousCount = 0, previousBytes = 0
   for (const [i, group] of p.groups.entries()) {
     if (!group || !Object.hasOwn(uploadTypes, group.mediaType)) return false
     const rank = order.indexOf(group.mediaType), maximum = group.mediaType === 'ANIMATION' ? 1 : 10
-    if (rank < previousType || rank === previousType && previousCount !== maximum || group.number !== i + 1 || !Array.isArray(group.files) || !group.files.length || group.files.length > maximum || group.mode !== (group.files.length === 1 ? 'SINGLE' : 'ALBUM')) return false
-    previousType = rank; previousCount = group.files.length
+    if (rank < previousType || group.number !== i + 1 || !Array.isArray(group.files) || !group.files.length || group.files.length > maximum || group.mode !== (group.files.length === 1 ? 'SINGLE' : 'ALBUM')) return false
+    const firstSize = group.files[0]?.size
+    if (rank === previousType && previousCount !== maximum && (!Number.isSafeInteger(firstSize) || firstSize! <= 0 || firstSize! > maximumBytes || previousBytes + firstSize! <= maximumBytes)) return false
+    let groupBytes = 0
     for (const file of group.files) {
-      if (!file || typeof file.relativePath !== 'string' || !file.relativePath || typeof file.fileName !== 'string' || !file.fileName || typeof file.caption !== 'string' || !Number.isSafeInteger(file.size) || file.size <= 0 || paths.has(file.relativePath)) return false
+      if (!file || typeof file.relativePath !== 'string' || !file.relativePath || typeof file.fileName !== 'string' || !file.fileName || typeof file.caption !== 'string' || !Number.isSafeInteger(file.size) || file.size <= 0 || file.size > maximumBytes || paths.has(file.relativePath)) return false
       if (file.mediaType !== group.mediaType || file.caption !== (p.captionMode === 'FILENAME' ? file.fileName : '')) return false
+      groupBytes += file.size; if (groupBytes > maximumBytes) return false
       paths.add(file.relativePath); count++; bytes += file.size
     }
+    previousType = rank; previousCount = group.files.length; previousBytes = groupBytes
   }
   return count === p.fileCount && bytes === p.totalBytes
 }

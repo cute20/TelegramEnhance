@@ -19,15 +19,17 @@ public final class UploadPreviewService implements AutoCloseable {
     private record Session(String account, long generation) { }
     private record Snapshot(String id, Session session, Input input, Target target, Scan scan, long createdAt, long expiresAt) { }
     public UploadPreviewService(TelegramService telegram, ResourceService reads, UploadTargetReader targets, UploadDirectoryScanner scanner) { this.telegram = telegram; this.reads = reads; this.targets = targets; this.scanner = scanner; }
-    public CompletableFuture<View> preview(Input input) { return preview(input, false); }
-    public CompletableFuture<View> previewRule(Input input) { return preview(input, true); }
-    private CompletableFuture<View> preview(Input input, boolean bound) {
+    public CompletableFuture<View> preview(Input input) { return preview(input, false, () -> { }); }
+    public CompletableFuture<View> previewRule(Input input) { return previewRule(input, () -> { }); }
+    public CompletableFuture<View> previewRule(Input input, Runnable running) { return preview(input, true, running); }
+    private CompletableFuture<View> preview(Input input, boolean bound, Runnable running) {
         if (input == null || input.link() == null || input.link().isBlank() || input.link().length() > 2048
                 || !("FILENAME".equals(input.captionMode()) || "EMPTY".equals(input.captionMode()))) throw new IllegalArgumentException("请填写目标主帖、待上传及归档目录，并选择说明方式");
-        Session session = capture(); scanner.directories(input.sourceDirectory(), input.archiveDirectory());
-        return submit(() -> { current(session); if(bound)boundDirectories(input);var scan=scanner.scan(input.sourceDirectory(), input.archiveDirectory(), !Boolean.FALSE.equals(input.recursive()), () -> current(session));if(bound)boundDirectories(input);return scan; })
+        Objects.requireNonNull(running); running.run(); Session session = capture(); scanner.directories(input.sourceDirectory(), input.archiveDirectory());
+        Runnable check = () -> { running.run(); current(session); };
+        return submit(() -> { check.run(); if(bound)boundDirectories(input);var scan=scanner.scan(input.sourceDirectory(), input.archiveDirectory(), !Boolean.FALSE.equals(input.recursive()), check);check.run();if(bound)boundDirectories(input);return scan; })
             .thenCompose(scan -> reads.readWork(() -> {
-                current(session); var target = targets.read(input.link(), session.account(), session.generation(), types(scan)); current(session);
+                check.run(); var target = targets.read(input.link(), session.account(), session.generation(), types(scan)); check.run();
                 long stamp = System.currentTimeMillis(); var snapshot = new Snapshot(UUID.randomUUID().toString(), session, input, target, scan, stamp, stamp + TTL);
                 remember(snapshot); return view(snapshot, target.checkedAt());
             }));
@@ -81,12 +83,18 @@ public final class UploadPreviewService implements AutoCloseable {
     public static List<Group> groups(List<FileVersion> files,String captionMode){
         var groups=new ArrayList<Group>();
         for (String type : List.of("PHOTO", "VIDEO", "AUDIO", "DOCUMENT", "ANIMATION")) {
-            var batch = files.stream().filter(file -> file.mediaType().equals(type)).toList(); int maximum = type.equals("ANIMATION") ? 1 : 10;
-            for (int from = 0; from < batch.size(); from += maximum) {
-                var members = batch.subList(from, Math.min(from + maximum, batch.size())).stream().map(file -> {
-                    String name = Path.of(file.relativePath()).getFileName().toString(); return new Member(file.relativePath(), name, type, file.size(), "FILENAME".equals(captionMode) ? name : "");
-                }).toList(); groups.add(new Group(groups.size() + 1, type, members.size() == 1 ? "SINGLE" : "ALBUM", members));
+            int maximum = type.equals("ANIMATION") ? 1 : 10; long bytes=0, limit=8L*1024*1024*1024;
+            var members=new ArrayList<Member>();
+            for (var file : files) {
+                if(!file.mediaType().equals(type))continue;
+                if(file.size()<1||file.size()>limit)throw new IllegalArgumentException("单个文件超过8GiB暂存上限或大小无效，请拆分文件后重新预览");
+                if(!members.isEmpty()&&(members.size()==maximum||bytes>limit-file.size())){
+                    groups.add(new Group(groups.size()+1,type,members.size()==1?"SINGLE":"ALBUM",members));members=new ArrayList<>();bytes=0;
+                }
+                String name=Path.of(file.relativePath()).getFileName().toString();
+                members.add(new Member(file.relativePath(),name,type,file.size(),"FILENAME".equals(captionMode)?name:""));bytes+=file.size();
             }
+            if(!members.isEmpty())groups.add(new Group(groups.size()+1,type,members.size()==1?"SINGLE":"ALBUM",members));
         }
         return List.copyOf(groups);
     }

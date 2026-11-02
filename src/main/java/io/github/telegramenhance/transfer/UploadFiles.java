@@ -8,6 +8,7 @@ import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.file.*;
 import java.nio.file.attribute.BasicFileAttributes;
+import java.io.ByteArrayInputStream;
 import java.util.*;
 import javax.imageio.ImageIO;
 import com.sun.nio.file.ExtendedOpenOption;
@@ -16,22 +17,75 @@ import org.springframework.stereotype.Component;
 /** Own immutable sending copies, and journalled, no-overwrite archival after formal receipts. */
 @Component
 public final class UploadFiles {
-    private final AppPaths app;private final DownloadPaths paths;private final UploadRepository repository;
-    public UploadFiles(AppPaths app,DownloadPaths paths,UploadRepository repository){this.app=app;this.paths=paths;this.repository=repository;}
+    private final AppPaths app;private final DownloadPaths paths;private final UploadRepository repository;private final VideoUploadPreparer videos;
+    public UploadFiles(AppPaths app,DownloadPaths paths,UploadRepository repository){this(app,paths,repository,new VideoUploadPreparer());}
+    @org.springframework.beans.factory.annotation.Autowired
+    public UploadFiles(AppPaths app,DownloadPaths paths,UploadRepository repository,VideoUploadPreparer videos){this.app=app;this.paths=paths;this.repository=repository;this.videos=Objects.requireNonNull(videos);}
     public Staged stage(Task task,Item item,Runnable check)throws IOException{
         Path source=source(task,item);verifyOriginal(source,item.file(),check);
         Path dir=directory(app.root().resolve("outgoing"),Path.of(task.id(),item.id()));
         Path output=dir.resolve(source.getFileName().toString());if(output.toString().length()>240)throw new IOException("Staging path too long");
         Path part=dir.resolve("content.twb-part"),owner=dir.resolve("content.twb-owner");
         if(Files.exists(output,LinkOption.NOFOLLOW_LINKS)){
-            if(item.staged()!=null){verifyStaged(item.staged(),check);return item.staged();}
+            if(item.staged()!=null){
+                if(!output.equals(Path.of(item.staged().path())))throw new IOException("Staged path changed");
+                verifyStaged(item.staged(),check);
+                if(!item.file().mediaType().equals("VIDEO")||item.staged().video()!=null){cleanupStageOwners(item,item.staged());return item.staged();}
+                return registerStage(task,item,withVideo(item.staged(),item,check),check);
+            }
             if(!Files.isRegularFile(owner,LinkOption.NOFOLLOW_LINKS)||Files.isSymbolicLink(owner)||Files.size(owner)>256||!Files.readString(owner).equals(item.id()+"\n"+DownloadFileStore.fileKey(output))||!matches(output,item.file().size(),item.file().sha256(),check))throw new IOException("Unknown staged file");
-            int[] dimensions=dimensions(output,item);var recovered=new Staged(output.toString(),item.file().size(),item.file().sha256(),DownloadFileStore.fileKey(output),dimensions[0],dimensions[1]);repository.staged(task,item,recovered);Files.delete(owner);return recovered;
+            int[] dimensions=dimensions(output,item);var recovered=new Staged(output.toString(),item.file().size(),item.file().sha256(),DownloadFileStore.fileKey(output),dimensions[0],dimensions[1]);
+            return registerStage(task,item,withVideo(recovered,item,check),check);
         }
         checkQuota(item.file().size(),check);copyOwned(source,part,owner,item.id(),item.file().size(),item.file().sha256(),check);verifyOriginal(source,item.file(),check);
         int[] dimensions=dimensions(part,item);
         check.run();Files.move(part,output);var staged=new Staged(output.toString(),item.file().size(),item.file().sha256(),DownloadFileStore.fileKey(output),dimensions[0],dimensions[1]);
-        repository.staged(task,item,staged);Files.delete(owner);return staged;
+        return registerStage(task,item,withVideo(staged,item,check),check);
+    }
+    private Staged registerStage(Task task,Item item,Staged staged,Runnable check)throws IOException{
+        verifyStaged(staged,check);check.run();repository.staged(task,item,staged);cleanupStageOwners(item,staged);return staged;
+    }
+    /** A legacy never-sent copy is upgraded before intent; legacy pending recovery can still lease null metadata. */
+    private Staged withVideo(Staged staged,Item item,Runnable check)throws IOException{
+        if(!item.file().mediaType().equals("VIDEO"))return staged;
+        try(var ignored=lease(List.of(staged),check)){
+            VideoUploadPreparer.PreparedVideo prepared;
+            try{prepared=videos.prepare(Path.of(staged.path()),check);}catch(IOException failure){throw new IllegalArgumentException("无法读取视频信息或生成封面，请检查 FFmpeg、FFprobe 与视频格式；尚未发送",failure);}
+            check.run();
+            byte[] jpeg=prepared.jpeg();
+            if(prepared.duration()<1||prepared.width()<1||prepared.height()<1||prepared.width()>32768||prepared.height()>32768||jpeg==null||jpeg.length<1||jpeg.length>128*1024||prepared.thumbnailWidth()<1||prepared.thumbnailWidth()>320||prepared.thumbnailHeight()<1||prepared.thumbnailHeight()>320)throw new IOException("视频元数据或封面无效，未发送");
+            try(var input=ImageIO.createImageInputStream(new ByteArrayInputStream(jpeg))){var readers=ImageIO.getImageReaders(input);if(!readers.hasNext())throw new IOException("视频封面无效，未发送");var reader=readers.next();try{reader.setInput(input,true,true);if(!reader.getFormatName().equalsIgnoreCase("JPEG")||reader.getWidth(0)!=prepared.thumbnailWidth()||reader.getHeight(0)!=prepared.thumbnailHeight())throw new IOException("视频封面无效，未发送");}finally{reader.dispose();}}
+            var thumbnail=writeThumbnail(Path.of(staged.path()).getParent(),item.id(),jpeg,prepared.thumbnailWidth(),prepared.thumbnailHeight(),check);
+            var result=new Staged(staged.path(),staged.size(),staged.sha256(),staged.identity(),prepared.width(),prepared.height(),new VideoDetails(prepared.duration(),prepared.supportsStreaming(),thumbnail));
+            verifyStaged(result,check);return result;
+        }
+    }
+    private VideoThumbnail writeThumbnail(Path directory,String token,byte[] bytes,int width,int height,Runnable check)throws IOException{
+        Path output=directory.resolve("thumbnail.twb.jpg"),part=directory.resolve("thumbnail.twb-part"),owner=directory.resolve("thumbnail.twb-owner");
+        String hash=HexFormat.of().formatHex(DownloadPaths.digest().digest(bytes));
+        if(Files.exists(output,LinkOption.NOFOLLOW_LINKS)){
+            if(!owned(owner,token,output)||!matches(output,bytes.length,hash,check))throw new IOException("Unknown video thumbnail");
+            return new VideoThumbnail(output.toString(),bytes.length,hash,DownloadFileStore.fileKey(output),width,height);
+        }
+        checkQuota(bytes.length,check);
+        if(!Files.exists(part,LinkOption.NOFOLLOW_LINKS)){
+            if(Files.exists(owner,LinkOption.NOFOLLOW_LINKS))throw new IOException("Uncertain thumbnail ownership");
+            Files.createFile(part);Files.writeString(owner,token+"\n"+DownloadFileStore.fileKey(part),StandardOpenOption.CREATE_NEW);
+        }
+        if(!owned(owner,token,part))throw new IOException("Unknown thumbnail temporary file");
+        try(var channel=FileChannel.open(part,StandardOpenOption.WRITE,LinkOption.NOFOLLOW_LINKS,ExtendedOpenOption.NOSHARE_WRITE,ExtendedOpenOption.NOSHARE_DELETE)){
+            if(!owned(owner,token,part))throw new IOException("Thumbnail replaced before opening");
+            check.run();channel.truncate(0);channel.position(0);ByteBuffer data=ByteBuffer.wrap(bytes);while(data.hasRemaining()){check.run();channel.write(data);}channel.force(true);
+        }
+        if(!matches(part,bytes.length,hash,check))throw new IOException("Thumbnail verification failed");
+        check.run();Files.move(part,output);
+        if(!owned(owner,token,output)||!matches(output,bytes.length,hash,check))throw new IOException("Thumbnail publication changed");
+        return new VideoThumbnail(output.toString(),bytes.length,hash,DownloadFileStore.fileKey(output),width,height);
+    }
+    private static boolean owned(Path owner,String token,Path content)throws IOException{return !Files.isSymbolicLink(owner)&&Files.isRegularFile(owner,LinkOption.NOFOLLOW_LINKS)&&Files.size(owner)<=256&&Files.readString(owner).equals(token+"\n"+DownloadFileStore.fileKey(content));}
+    private static void cleanupStageOwners(Item item,Staged staged){
+        Path main=Path.of(staged.path());try{Path owner=main.getParent().resolve("content.twb-owner");if(owned(owner,item.id(),main))Files.delete(owner);}catch(IOException ignored){/* An unverified marker is preserved. */}
+        if(staged.video()!=null&&staged.video().thumbnail()!=null)try{Path thumbnail=thumbnailPath(staged),owner=thumbnail.getParent().resolve("thumbnail.twb-owner");if(owned(owner,item.id(),thumbnail))Files.delete(owner);}catch(IOException ignored){/* An unverified marker is preserved. */}
     }
     private static int[] dimensions(Path path,Item item)throws IOException{
         boolean animation=item.file().mediaType().equals("ANIMATION");
@@ -41,12 +95,23 @@ public final class UploadFiles {
     private void checkQuota(long additional,Runnable check)throws IOException{
         Path root=app.root().resolve("outgoing");long used=0;int entries=0;try(var paths=Files.walk(root)){var iterator=paths.iterator();while(iterator.hasNext()){check.run();Path path=iterator.next();if(++entries>10000)throw new IOException("Outgoing cache entry limit");if(Files.isRegularFile(path,LinkOption.NOFOLLOW_LINKS))used=Math.addExact(used,Files.size(path));if(used+additional>16L*1024*1024*1024)throw new IOException("Outgoing cache limit");}}
     }
-    public void verifyStaged(Staged staged,Runnable check)throws IOException{Path file=Path.of(staged.path());if(!staged.identity().equals(DownloadFileStore.fileKey(file))||!matches(file,staged.size(),staged.sha256(),check))throw new IOException("Staged file changed");}
+    public void verifyStaged(Staged staged,Runnable check)throws IOException{
+        Path file=Path.of(staged.path());if(!staged.identity().equals(DownloadFileStore.fileKey(file))||!matches(file,staged.size(),staged.sha256(),check))throw new IOException("Staged file changed");
+        if(staged.video()!=null){Path thumbnail=thumbnailPath(staged);var saved=staged.video().thumbnail();if(!saved.identity().equals(DownloadFileStore.fileKey(thumbnail))||!matches(thumbnail,saved.size(),saved.sha256(),check))throw new IOException("Video thumbnail changed");}
+    }
+    private static Path thumbnailPath(Staged staged)throws IOException{
+        var video=staged.video();var thumbnail=video==null?null:video.thumbnail();
+        if(video==null||video.duration()<1||staged.width()<1||staged.height()<1||staged.width()>32768||staged.height()>32768||thumbnail==null||thumbnail.path()==null||thumbnail.size()<1||thumbnail.size()>128*1024||thumbnail.width()<1||thumbnail.width()>320||thumbnail.height()<1||thumbnail.height()>320||thumbnail.sha256()==null||!thumbnail.sha256().matches("[0-9a-f]{64}")||thumbnail.identity()==null||thumbnail.identity().isBlank()||thumbnail.identity().equals(staged.identity()))throw new IOException("Video metadata changed");
+        Path main=Path.of(staged.path()),path=Path.of(thumbnail.path());
+        if(!path.isAbsolute()||!path.equals(path.normalize())||!Objects.equals(path.getParent(),main.getParent())||!path.getFileName().toString().equals("thumbnail.twb.jpg"))throw new IOException("Thumbnail escaped staging directory");
+        return path;
+    }
     public static final class Lease implements AutoCloseable {private final List<FileChannel> channels=new ArrayList<>();public void close(){for(var channel:channels)try{channel.close();}catch(IOException ignored){}}}
     /** Windows denies concurrent writes/replacement while TDLib is consuming our frozen copies. */
     public Lease lease(List<Staged> staged,Runnable check)throws IOException{
-        var lease=new Lease();try{for(var file:staged){check.run();lease.channels.add(FileChannel.open(Path.of(file.path()),StandardOpenOption.READ,LinkOption.NOFOLLOW_LINKS,ExtendedOpenOption.NOSHARE_WRITE,ExtendedOpenOption.NOSHARE_DELETE));verifyStaged(file,check);}return lease;}catch(IOException|RuntimeException failure){lease.close();throw failure;}
+        var lease=new Lease();try{for(var file:staged){check.run();lease.channels.add(hold(Path.of(file.path())));if(file.video()!=null)lease.channels.add(hold(thumbnailPath(file)));verifyStaged(file,check);}return lease;}catch(IOException|RuntimeException failure){lease.close();throw failure;}
     }
+    private static FileChannel hold(Path path)throws IOException{return FileChannel.open(path,StandardOpenOption.READ,LinkOption.NOFOLLOW_LINKS,ExtendedOpenOption.NOSHARE_WRITE,ExtendedOpenOption.NOSHARE_DELETE);}
     public void archive(Task task,Item original,Runnable check)throws IOException{
         if(original.formalId()==null)throw new IOException("Formal receipt required");
         Path source=source(task,original),held=source.resolveSibling(".twb-"+original.id()+".twb-hold");
@@ -84,7 +149,12 @@ public final class UploadFiles {
         if(item.archiveRelative()!=null&&item.archiveIdentity()!=null){Path target=Path.of(task.prepared().scan().archiveDirectory()).resolve(item.archiveRelative());Path owner=target.getParent().resolve(".twb-"+item.id()+".twb-owner");if(Files.isRegularFile(owner,LinkOption.NOFOLLOW_LINKS)&&!Files.isSymbolicLink(owner)&&Files.size(owner)<=256&&Files.readString(owner).equals(item.id()+"\n"+item.archiveIdentity())&&!Files.exists(target.getParent().resolve(".twb-"+item.id()+".twb-part"),LinkOption.NOFOLLOW_LINKS))Files.delete(owner);}
         repository.archived(task,item);cleanupStage(item);
     }
-    private static void cleanupStage(Item item){if(item.staged()==null)return;try{var p=Path.of(item.staged().path());if(item.staged().identity().equals(DownloadFileStore.fileKey(p))&&matches(p,item.staged().size(),item.staged().sha256(),()->{})){Files.delete(p);try{Files.delete(p.getParent());Files.delete(p.getParent().getParent());}catch(IOException keepDirectory){/* Nonempty directories are preserved. */}}}catch(IOException ignored){/* Preserve anything whose ownership cannot be verified. */}}
+    private static void cleanupStage(Item item){
+        var staged=item.staged();if(staged==null)return;
+        cleanupStageOwners(item,staged);
+        if(staged.video()!=null)try{Path thumbnail=thumbnailPath(staged);var saved=staged.video().thumbnail();if(saved.identity().equals(DownloadFileStore.fileKey(thumbnail))&&matches(thumbnail,saved.size(),saved.sha256(),()->{}))Files.delete(thumbnail);}catch(IOException ignored){/* Preserve an altered or unowned thumbnail. */}
+        try{var p=Path.of(staged.path());if(staged.identity().equals(DownloadFileStore.fileKey(p))&&matches(p,staged.size(),staged.sha256(),()->{}))Files.delete(p);try{Files.delete(p.getParent());Files.delete(p.getParent().getParent());}catch(IOException keepDirectory){/* Nonempty directories are preserved. */}}catch(IOException ignored){/* Preserve anything whose ownership cannot be verified. */}
+    }
     private Path source(Task task,Item item)throws IOException{
         Path root=paths.root(task.prepared().scan().sourceDirectory());if(!DownloadPaths.key(root).equals(DownloadPaths.key(Path.of(task.prepared().scan().sourceDirectory()))))throw new IOException("Source root changed");
         Path relative=Path.of(item.file().relativePath());if(relative.isAbsolute()||relative.normalize().startsWith(".."))throw new IOException("Invalid relative source");Path file=root.resolve(relative).normalize();

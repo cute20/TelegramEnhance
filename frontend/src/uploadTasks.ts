@@ -4,6 +4,16 @@ export interface UploadGroup {id:string;number:number;mediaType:string;state:str
 export interface UploadAutomation {ruleId:string;name:string;version:number;manualTakeover:boolean;windowMode:'ALL_DAY'|'WINDOW';start:string|null;end:string|null;timezone:'Asia/Shanghai';status:'MANUAL'|'AUTOMATIC'|'WAITING_WINDOW'|'RULE_PAUSED';reason:string;nextAllowedAt:number}
 export interface UploadTask { id:string;state:string;channelTitle:string;postTitle:string;postLink:string;discussionTitle:string;sourceDirectory:string;archiveDirectory:string;stopRequested:boolean;total:number;confirmed:number;archived:number;error:string|null;createdAt:number;updatedAt:number;groups:UploadGroup[];automation?:UploadAutomation|null }
 export function canStartManaged(task:UploadTask){return !task.automation||task.automation.manualTakeover||task.automation.status==='AUTOMATIC'}
+export function awaitingArchiveVerification(task:UploadTask):boolean {
+  return task.state==='NEEDS_REVIEW'&&task.total>0&&task.confirmed===task.total&&task.archived<task.total&&task.groups.length>0
+    &&task.groups.reduce((count,group)=>count+group.items.length,0)===task.total
+    &&task.groups.every(group=>group.state==='CONFIRMED'&&group.items.length>0&&group.items.every(item=>['SENT','ARCHIVED'].includes(item.state)&&typeof item.formalMessageId==='string'&&/^\d+$/.test(item.formalMessageId)))
+}
+export function canReconcileUpload(task:UploadTask):boolean {
+  if(['NEEDS_REVIEW','SENT_PENDING_ARCHIVE'].includes(task.state))return true
+  return task.state==='PAUSED'&&task.groups.some(group=>group.items.some(item=>item.state==='PENDING'||item.state==='FAILED'||!!item.formalMessageId&&item.state!=='ARCHIVED')
+    ||['INTENT','DISPATCHING','SENDING','UNCERTAIN'].includes(group.state)&&group.items.some(item=>item.state!=='ARCHIVED'))
+}
 export function documentAcceptancePath(task:UploadTask,groupId:string):string|null {
   const group=task.groups.find(g=>g.id===groupId)
   if(!group||!['NEEDS_REVIEW','PAUSED'].includes(task.state)||group.state!=='UNCERTAIN'||group.mediaType!=='ANIMATION'||group.items.length!==1||!group.items[0]||group.items[0].formalMessageId!==null||group.canAcceptDocument!==true)return null

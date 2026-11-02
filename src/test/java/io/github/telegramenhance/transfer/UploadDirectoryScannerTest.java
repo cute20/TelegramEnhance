@@ -56,4 +56,21 @@ class UploadDirectoryScannerTest {
         assertThrows(IllegalArgumentException.class, () -> scanner.scan(source.toString(), archive.toString(), true, () -> { throw new IllegalArgumentException("account changed"); }));
         assertFalse(Files.exists(archive));
     }
+    @Test void aSlowFullHashMayCrossSixtySecondsWithoutLosingCompletenessOrDigestChecks() throws Exception {
+        scanner(); file("first.mp4","first-content");file("second.mp4","second-content");
+        var nanos=new java.util.concurrent.atomic.AtomicLong();
+        var slow=new UploadDirectoryScanner(new DownloadPaths(new AppPaths(directory.resolve("data"))),()->now,nanos::get);
+        var scan=slow.scan(source.toString(),archive.toString(),true,()->nanos.addAndGet(java.util.concurrent.TimeUnit.SECONDS.toNanos(10)));
+        assertTrue(nanos.get()>java.util.concurrent.TimeUnit.SECONDS.toNanos(60));assertEquals(2,scan.files().size());
+        assertEquals(DownloadPaths.hash("first-content"),scan.files().getFirst().sha256());
+        assertFalse(Files.exists(archive));
+    }
+    @Test void theLongerScanStillHasAFiniteDeadlineAndDoesNotReturnAPartialReadyManifest() throws Exception {
+        scanner();file("first.mp4","first-content");file("second.mp4","second-content");
+        var nanos=new java.util.concurrent.atomic.AtomicLong();
+        var slow=new UploadDirectoryScanner(new DownloadPaths(new AppPaths(directory.resolve("data"))),()->now,nanos::get);
+        var error=assertThrows(IllegalArgumentException.class,()->slow.scan(source.toString(),archive.toString(),true,()->nanos.addAndGet(java.util.concurrent.TimeUnit.SECONDS.toNanos(120))));
+        assertTrue(error.getMessage().contains("10分钟"));assertFalse(Files.exists(archive));
+        assertEquals("first-content",Files.readString(source.resolve("first.mp4")));
+    }
 }

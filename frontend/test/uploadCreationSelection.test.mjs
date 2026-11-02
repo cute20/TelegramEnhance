@@ -5,6 +5,7 @@ import * as vue from 'vue'
 import {compileScript,parse} from 'vue/compiler-sfc'
 import ts from 'typescript'
 import * as rules from '../src/rules.ts'
+import * as rulePreparation from '../src/rulePreparation.ts'
 import * as upload from '../src/uploadPreview.ts'
 import * as uploadTasks from '../src/uploadTasks.ts'
 import * as library from '../src/library.ts'
@@ -20,7 +21,7 @@ function mount(t,component,initialProps={},initialSteps=[]){
   const code=ts.transpileModule(compileScript(descriptor,{id:'upload-selection-test'}).content,{compilerOptions:{module:ts.ModuleKind.CommonJS,target:ts.ScriptTarget.ES2022}}).outputText
   const props=vue.reactive({authorized:true,available:true,accountId:'1',...initialProps}),calls=[],events=[],errors=[],hooks=[],mounted=[],steps=[...initialSteps]
   const api=async(path,options={})=>{calls.push({path,options});const step=steps.shift();try{assert.ok(step,path);assert.equal(path,step.path);assert.equal(options.method??'GET',step.method??'POST')}catch(error){errors.push(error);throw error}if(step.value instanceof Error)throw step.value;return await step.value}
-  const modules={vue:{...vue,onMounted:fn=>mounted.push(fn),onBeforeUnmount:fn=>hooks.push(fn)},'../api':{api,ApiError:class extends Error{}},'../rules':rules,'../uploadPreview':upload,'../uploadTasks':uploadTasks,'../library':library},module={exports:{}}
+  const modules={vue:{...vue,onMounted:fn=>mounted.push(fn),onBeforeUnmount:fn=>hooks.push(fn)},'../api':{api,ApiError:class extends Error{}},'../rules':rules,'../rulePreparation':rulePreparation,'../uploadPreview':upload,'../uploadTasks':uploadTasks,'../library':library},module={exports:{}}
   new Function('require','module','exports',code)(name=>name.endsWith('.vue')?{}:modules[name],module,module.exports)
   const scope=vue.effectScope(),state=scope.run(()=>module.exports.default.setup(props,{expose(){},emit:(...event)=>events.push(event)}))
   mounted.forEach(fn=>fn())

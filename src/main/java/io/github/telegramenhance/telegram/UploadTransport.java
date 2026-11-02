@@ -131,12 +131,21 @@ public final class UploadTransport implements AutoCloseable {
         if(item.staged()==null)throw new IllegalArgumentException("发送文件尚未准备好");var file=new TdApi.InputFileLocal(item.staged().path());var caption=new TdApi.FormattedText(item.caption(),new TdApi.TextEntity[0]);
         return switch(item.file().mediaType()){
             case "PHOTO" -> new TdApi.InputMessagePhoto(new TdApi.InputPhoto(file,null,null,new int[0],item.staged().width(),item.staged().height()),caption,false,null,false);
-            case "VIDEO" -> new TdApi.InputMessageVideo(new TdApi.InputVideo(file,null,null,0,new int[0],0,0,0,false),caption,false,null,false);
+            case "VIDEO" -> video(item,file,caption);
             case "AUDIO" -> new TdApi.InputMessageAudio(new TdApi.InputAudio(file,null,0,"",""),caption);
             case "DOCUMENT" -> new TdApi.InputMessageDocument(new TdApi.InputDocument(file,null,true),caption);
             case "ANIMATION" -> new TdApi.InputMessageAnimation(new TdApi.InputAnimation(file,null,new int[0],0,item.staged().width(),item.staged().height()),caption,false,false);
             default -> throw new IllegalArgumentException("未知媒体类型，未发送");
         };
+    }
+    private static TdApi.InputMessageVideo video(Item item,TdApi.InputFile file,TdApi.FormattedText caption){
+        var staged=item.staged();var details=staged.video();var thumbnail=details==null?null:details.thumbnail();
+        if(staged.width()<1||staged.width()>32768||staged.height()<1||staged.height()>32768||details==null||details.duration()<1||thumbnail==null
+                ||thumbnail.path()==null||thumbnail.path().isBlank()||thumbnail.size()<1||thumbnail.size()>128*1024||thumbnail.width()<1||thumbnail.width()>320||thumbnail.height()<1||thumbnail.height()>320
+                ||thumbnail.sha256()==null||!thumbnail.sha256().matches("[0-9a-f]{64}")||thumbnail.identity()==null||thumbnail.identity().isBlank())
+            throw new IllegalArgumentException("视频时长、尺寸或封面尚未准备完整，请重新准备后再发送");
+        var cover=new TdApi.InputThumbnail(new TdApi.InputFileLocal(thumbnail.path()),thumbnail.width(),thumbnail.height());
+        return new TdApi.InputMessageVideo(new TdApi.InputVideo(file,cover,null,0,new int[0],details.duration(),staged.width(),staged.height(),details.supportsStreaming()),caption,false,null,false);
     }
     private void update(String account,long generation,TdApi.Update update){
         TdApi.Message message;long old;boolean success;

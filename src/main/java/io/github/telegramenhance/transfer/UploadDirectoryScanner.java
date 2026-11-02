@@ -17,10 +17,12 @@ public final class UploadDirectoryScanner {
     private static final Set<String> PHOTO = Set.of("jpg", "jpeg", "png", "webp", "bmp", "tif", "tiff", "heic", "avif");
     private static final Set<String> AUDIO = Set.of("mp3", "m4a", "flac", "wav", "ogg", "opus", "aac", "wma", "aiff", "alac");
     private static final Set<String> TEMP = Set.of("part", "tmp", "crdownload", "download", "partial", "twb-hold", "twb-part", "twb-owner");
-    private final DownloadPaths paths; private final LongSupplier now;
+    public static final long SCAN_TIMEOUT_SECONDS = 600;
+    private final DownloadPaths paths; private final LongSupplier now, nanoTime;
     @org.springframework.beans.factory.annotation.Autowired
     public UploadDirectoryScanner(DownloadPaths paths) { this(paths, System::currentTimeMillis); }
-    UploadDirectoryScanner(DownloadPaths paths, LongSupplier now) { this.paths = paths; this.now = now; }
+    UploadDirectoryScanner(DownloadPaths paths, LongSupplier now) { this(paths, now, System::nanoTime); }
+    UploadDirectoryScanner(DownloadPaths paths, LongSupplier now, LongSupplier nanoTime) { this.paths = paths; this.now = now; this.nanoTime = nanoTime; }
     public record Directories(Path source, Path archive) { }
     /** Rule archives are siblings, derived from the canonical source directory. No creation. */
     public Directories ruleDirectories(String sourceValue) {
@@ -38,8 +40,8 @@ public final class UploadDirectoryScanner {
         return new Directories(source, archive);
     }
     public Scan scan(String sourceValue, String archiveValue, boolean recursive, Runnable check) {
-        var dirs = directories(sourceValue, archiveValue); long deadline = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(60);
-        Runnable bounded = () -> { check.run(); if (Thread.currentThread().isInterrupted() || System.nanoTime() > deadline) throw new IllegalArgumentException("目录预览达到时间上限，请缩小目录后重新预览"); };
+        var dirs = directories(sourceValue, archiveValue); long started = nanoTime.getAsLong();
+        Runnable bounded = () -> { check.run(); if (Thread.currentThread().isInterrupted() || nanoTime.getAsLong() - started >= java.util.concurrent.TimeUnit.SECONDS.toNanos(SCAN_TIMEOUT_SECONDS)) throw new IllegalArgumentException("目录完整校验超过10分钟，尚未生成可上传清单；请检查磁盘读取速度或缩小目录后重试"); };
         var candidates = new ArrayList<Path>(); int[] counts = new int[4];
         try {
             Files.walkFileTree(dirs.source(), EnumSet.noneOf(FileVisitOption.class), recursive ? 33 : 1, new SimpleFileVisitor<>() {
@@ -87,7 +89,7 @@ public final class UploadDirectoryScanner {
         }
         return HexFormat.of().formatHex(hash.digest());
     }
-    static int natural(String a, String b) {
+    public static int natural(String a, String b) {
         String x = a.toLowerCase(Locale.ROOT), y = b.toLowerCase(Locale.ROOT); int i = 0, j = 0;
         while (i < x.length() && j < y.length()) {
             char p = x.charAt(i), q = y.charAt(j);
