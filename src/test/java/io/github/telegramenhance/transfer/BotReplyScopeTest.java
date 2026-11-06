@@ -8,6 +8,28 @@ import java.util.stream.IntStream;
 import org.junit.jupiter.api.Test;
 
 class BotReplyScopeTest {
+    @Test void pageCountersAboveMillionAndIntegerStillProveOnlyTheirActualReplyBoundary(){
+        for(String number:List.of("1000001","10000001","2147483648","999999999999999999999999999999")){
+            var total=new java.math.BigInteger(number);var at=total.subtract(java.math.BigInteger.ONE);
+            for(var control:List.of(message("103","页码"+at+"/"+total,"下一页"),message("103","页码"+total+"/"+total,"上一页"))){
+                var result=BotReplyScope.initial(List.of(terminal("50"),media("101"),control),"100");
+                assertEquals("CURRENT_PAGE",result.status(),number);assertEquals("100",result.lowerExclusiveId());assertEquals("103",result.upperInclusiveId());
+            }
+            var conflict=BotReplyScope.initial(List.of(media("101"),message("103","页码"+total.add(java.math.BigInteger.ONE)+"/"+total,"下一页")),"100");
+            noScope(conflict,"UNVERIFIED","103");
+        }
+    }
+    @Test void hugeFolderMessageTotalsAndRangesRemainExactAndRejectContradictoryReceipts(){
+        for(String number:List.of("1000001","10000001","2147483648","999999999999999999999999999999")){
+            var total=new java.math.BigInteger(number);var sent=total.subtract(java.math.BigInteger.ONE);
+            var partial=message("103","✅当前批次发送完成\n已发送："+sent+"/"+total+"条消息","下一组","📍1-"+sent+"/"+total+" 跳转");
+            var observed=BotReplyScope.initial(List.of(media("101"),partial),"100");assertEquals("CURRENT_PAGE",observed.status(),number);assertEquals("100",observed.lowerExclusiveId());assertEquals("103",observed.upperInclusiveId());
+            var finalPage=message("103","✅文件夹内容发送完成\n共发送"+total+"条消息","📍"+sent+"-"+total+"/"+total+" 跳转");
+            assertEquals("CURRENT_PAGE",BotReplyScope.initial(List.of(media("101"),finalPage),"100").status(),number);
+            var inconsistent=message("103","✅当前批次发送完成\n已发送："+sent+"/"+total+"条消息","下一组","📍1-"+sent.subtract(java.math.BigInteger.ONE)+"/"+total+" 跳转");
+            noScope(BotReplyScope.initial(List.of(media("101"),inconsistent),"100"),"UNVERIFIED","103");
+        }
+    }
     private static BotPagination.InputButton callback(String text) { return new BotPagination.InputButton(text, text, true); }
     private static BotPagination.InputButton url(String text) { return new BotPagination.InputButton(text, text, false); }
     private static BotReplyScope.Message message(String id, String text, String... buttons) {

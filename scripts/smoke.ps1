@@ -42,10 +42,23 @@ function Post-Status-Code([string]$path, $requestHeaders=@{}, $body=@{}) {
     try { return [int](Invoke-WebRequest -Method POST -Uri ($script:baseUrl + $path) -Headers $requestHeaders -ContentType 'application/json' -Body ($body | ConvertTo-Json -Compress) -TimeoutSec 5).StatusCode }
     catch { if ($_.Exception.Response) { return [int]$_.Exception.Response.StatusCode } throw }
 }
-function Stop-TestBackend {
+function Stop-TestBackend([bool]$ExpectEnabledTray = $false) {
+    if ($ExpectEnabledTray) {
+        $beforeExitTray = Request 'GET' '/api/settings/desktop'
+        Assert-Check ($beforeExitTray.trayEnabled -and $beforeExitTray.trayActive) 'HTTP exit starts with an active tray and its enabled preference intact'
+    }
+    $retiredPort = ([uri]$script:baseUrl).Port
     $null = Request 'POST' '/api/app/exit'
     if (!$script:backend.WaitForExit(40000)) { throw 'Graceful exit timed out' }
     Assert-Check ($script:backend.ExitCode -eq 0) 'graceful shutdown exits cleanly'
+    Assert-Check $script:backend.HasExited 'HTTP exit leaves no backend or AWT process running'
+    $connection = [System.Net.Sockets.TcpClient]::new()
+    $portStillOpen = $false
+    try { $null = $connection.ConnectAsync('127.0.0.1', $retiredPort).Wait(1000); $portStillOpen = $connection.Connected }
+    catch { $portStillOpen = $false }
+    finally { $connection.Dispose() }
+    Assert-Check (!$portStillOpen) 'HTTP exit closes the old loopback listener'
+    Assert-Check (!(Test-Path -LiteralPath (Join-Path $testRoot 'runtime.json'))) 'HTTP exit removes the launch handshake'
 }
 try {
     Start-TestBackend
@@ -63,6 +76,28 @@ try {
     $badHost=@{} + $script:headers; $badHost.Host='localhost'
     Assert-Check ((Status-Code '/api/bootstrap' $badHost) -eq 403) 'foreign Host rejected'
     Assert-Check ((Status-Code '/') -eq 200) 'frontend served locally'
+    Assert-Check ($bootstrap.transferPreferences.downloadConcurrency -eq 1) 'bootstrap exposes new-task transfer defaults'
+    foreach($preferencePath in @('/api/settings/transfers','/api/settings/desktop','/api/settings/thumbnail-cache')) {
+        Assert-Check ((Status-Code $preferencePath) -eq 401) 'local preferences require the launch token'
+    }
+    $transferDefaults=Request 'GET' '/api/settings/transfers'
+    Assert-Check ($transferDefaults.defaultDownloadDirectory -eq '' -and $transferDefaults.downloadConcurrency -eq 1) 'new transfer defaults are conservative'
+    $smokeDownloadDirectory=Join-Path $projectRoot '.runtime/smoke-new-downloads'
+    $transferDefaults=Request 'PUT' '/api/settings/transfers' @{defaultDownloadDirectory=$smokeDownloadDirectory;downloadConcurrency=3}
+    Assert-Check ($transferDefaults.downloadConcurrency -eq 3 -and $transferDefaults.defaultDownloadDirectory -eq $smokeDownloadDirectory) 'transfer preferences save without changing connection settings'
+    $smokeCacheDirectory=$testRoot+'-cache'
+    $cachePreferences=Request 'PUT' '/api/settings/thumbnail-cache' @{directory=$smokeCacheDirectory;maximumBytes=536870912}
+    Assert-Check ($cachePreferences.maximumBytes -eq 536870912 -and $cachePreferences.directory -eq $smokeCacheDirectory) 'cache quota and isolated location save together'
+    $invalidQuotaDenied=$false
+    try { $null=Request 'PUT' '/api/settings/thumbnail-cache' @{directory=$smokeCacheDirectory;maximumBytes=12345} }
+    catch { $invalidQuotaDenied=$_.Exception.Response -and [int]$_.Exception.Response.StatusCode -eq 400 }
+    Assert-Check ($invalidQuotaDenied -and (Request 'GET' '/api/settings/thumbnail-cache').maximumBytes -eq 536870912) 'invalid cache quota preserves saved preference'
+    $desktopPreferences=Request 'GET' '/api/settings/desktop'
+    Assert-Check (!$desktopPreferences.trayEnabled -and !$desktopPreferences.trayActive) 'tray is opt-in and is not installed by validation'
+    Assert-Check ((Status-Code '/api/transfers/center') -eq 401) 'unified task center requires local token'
+    Assert-Check ((Status-Code '/api/transfers/center' $script:headers) -eq 400) 'unified task center requires Telegram authorization'
+    Assert-Check ((Post-Status-Code '/api/transfers/center/pause-all' @{} @{operationId='00000000-0000-0000-0000-000000000001'}) -eq 401) 'global pause requires local token'
+    Assert-Check ((Post-Status-Code '/api/transfers/center/pause-all' $script:headers @{operationId='00000000-0000-0000-0000-000000000001'}) -eq 400) 'global pause cannot run without an authorized account'
     Assert-Check ((Post-Status-Code '/api/rules/name' @{} @{link='https://t.me/synthetic/1'}) -eq 401) 'rule name lookup requires local token'
     Assert-Check ((Post-Status-Code '/api/rules/name' $script:headers @{link='https://t.me/synthetic/1'}) -eq 400) 'rule name lookup requires Telegram authorization'
     foreach($ruleRead in @('/api/rules','/api/rules/by-operation/00000000-0000-0000-0000-000000000000','/api/rules/00000000-0000-0000-0000-000000000000/versions')) {
@@ -198,11 +233,29 @@ try {
     $exited=$second.WaitForExit(10000)
     Assert-Check ($exited -and $second.ExitCode -ne 0) 'second instance refused'
     Assert-Check ((Request 'GET' '/api/settings').apiId -eq 12345) 'second instance preserves first instance'
-    Stop-TestBackend
+    if($desktopPreferences.traySupported) {
+        $nativeTray=Request 'PUT' '/api/settings/desktop' @{trayEnabled=$true}
+        Assert-Check ($nativeTray.trayEnabled -and $nativeTray.trayActive) 'isolated workspace can install the real Windows tray'
+    }
+    Stop-TestBackend -ExpectEnabledTray ([bool]$desktopPreferences.traySupported)
     Start-TestBackend
     $persisted = Request 'GET' '/api/settings'
     Assert-Check ($persisted.apiId -eq 12345 -and $persisted.apiHashStored -and $persisted.proxy.passwordStored) 'settings survive full process restart'
-    Stop-TestBackend
+    $persistedDefaults=Request 'GET' '/api/settings/transfers'
+    Assert-Check ($persistedDefaults.downloadConcurrency -eq 3 -and $persistedDefaults.defaultDownloadDirectory -eq $smokeDownloadDirectory) 'transfer defaults survive full process restart'
+    Assert-Check ((Request 'GET' '/api/settings/thumbnail-cache').maximumBytes -eq 536870912) 'cache quota survives full process restart'
+    if($desktopPreferences.traySupported) {
+        for($attempt=0;$attempt -lt 30;$attempt++) {
+            $nativeTray=Request 'GET' '/api/settings/desktop'
+            if($nativeTray.trayActive){break};Start-Sleep -Milliseconds 100
+        }
+        Assert-Check ($nativeTray.trayEnabled -and $nativeTray.trayActive) 'explicit tray preference restores after a full process restart'
+        $nativeTray=Request 'PUT' '/api/settings/desktop' @{trayEnabled=$false}
+        Assert-Check (!$nativeTray.trayEnabled -and !$nativeTray.trayActive) 'real tray can be removed without closing the backend'
+        $nativeTray=Request 'PUT' '/api/settings/desktop' @{trayEnabled=$true}
+        Assert-Check ($nativeTray.trayEnabled -and $nativeTray.trayActive) 'real tray is enabled again before the final HTTP exit, without clearing its saved preference'
+    }
+    Stop-TestBackend -ExpectEnabledTray ([bool]$desktopPreferences.traySupported)
     Assert-Check (!(Test-Path -LiteralPath (Join-Path $testRoot 'runtime.json'))) 'handshake removed after shutdown'
     Write-Output "$script:checks smoke checks passed. Test data: $testRoot"
 } finally {

@@ -71,6 +71,30 @@ class VideoUploadPreparerTest {
         }
     }
 
+    @Test void anamorphicDisplayGeometryIsNormalizedBeforeApplyingRightAngleRotation() throws Exception {
+        String anamorphic=VIDEO.replace("1920","720").replace("1080","576");
+        anamorphic=anamorphic.substring(0,anamorphic.length()-1)+",\"sample_aspect_ratio\":\"64:45\"}";
+        for(int rotation:List.of(0,90,270)){
+            String stream=anamorphic.substring(0,anamorphic.length()-1)+",\"side_data_list\":[{\"rotation\":"+rotation+"}]}";
+            var fixture=new Fixture(probe(stream),jpeg(160,90,Color.BLUE));var prepared=fixture.prepare(mp4(true,"isom"));
+            assertEquals(rotation==0?1024:576,prepared.width());assertEquals(rotation==0?576:1024,prepared.height());
+            assertEquals(rotation==0?"scale=320:180,setsar=1":"scale=180:320,setsar=1",argument(fixture.commands.get(1),"-vf"));
+            assertArrayEquals(mp4(true,"isom"),Files.readAllBytes(fixture.video));
+        }
+    }
+
+    @Test void unknownPixelAspectRatiosUseSquarePixelsButInvalidExplicitRatiosAreRejected()throws Exception{
+        for(String sar:List.of("N/A","0:1","1:1")){
+            String stream=VIDEO.substring(0,VIDEO.length()-1)+",\"sample_aspect_ratio\":\""+sar+"\"}";
+            assertEquals(1920,new Fixture(probe(stream),jpeg(160,90,Color.BLUE)).prepare(mp4(true,"isom")).width());
+        }
+        for(String sar:List.of("1:0","-1:1","1:2:3","NaN","100:1")){
+            String stream=VIDEO.substring(0,VIDEO.length()-1)+",\"sample_aspect_ratio\":\""+sar+"\"}";
+            var fixture=new Fixture(probe(stream),jpeg(160,90,Color.BLUE));assertThrows(IOException.class,()->fixture.prepare(mp4(true,"isom")));
+            assertEquals(1,fixture.commands.size());
+        }
+    }
+
     @Test void nonRightAngleOrConflictingRotationFailsWithoutInventingDisplayDimensions() throws Exception {
         for (String rotation : List.of(
                 ",\"side_data_list\":[{\"rotation\":45}]",

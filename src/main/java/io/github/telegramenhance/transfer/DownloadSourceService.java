@@ -68,7 +68,7 @@ public final class DownloadSourceService {
             }
             var page = reader.comments(previous.post(), cursor);
             requireCurrent(session);
-            var result = result(id, previous.post(), page, pageNumber + 1, previous.observedMessages(), cursor, previous.warnings());
+            var result = result(id, previous.post(), page, Math.incrementExact(pageNumber), previous.observedMessages(), cursor, previous.warnings());
             previews.put(id, new Entry(session, result, clock.getAsLong(), remember(entry.thumbnails(), result)));
             return result;
         });
@@ -109,9 +109,9 @@ public final class DownloadSourceService {
     }
     public record Selection(Post post, List<Media> media) { public Selection { media = List.copyOf(media); } }
     public CompletableFuture<Selection> selection(String id, List<String> keys, boolean includeMain) {
-        if (id == null || !id.matches("[0-9a-f-]{36}") || keys == null || keys.isEmpty() || keys.size() > 100
+        if (id == null || !id.matches("[0-9a-f-]{36}") || keys == null || keys.isEmpty()
                 || keys.stream().anyMatch(key -> key == null || key.isBlank() || key.length() > 512)
-                || new java.util.HashSet<>(keys).size() != keys.size()) throw new IllegalArgumentException("请选择1至100个已加载媒体");
+                || new java.util.HashSet<>(keys).size() != keys.size()) throw new IllegalArgumentException("请选择已加载媒体");
         Session session = capture();
         return submit(session, () -> {
             prune(session); var entry = previews.get(id);
@@ -136,7 +136,6 @@ public final class DownloadSourceService {
             var compact = new Media(media.key(), ref, media.source(), media.type(), "", 0, "");
             grants.remove(media.key()); grants.put(media.key(), new ThumbnailGrant(compact, value.pageNumber()));
         }
-        while (grants.size() > 1024) grants.remove(grants.keySet().iterator().next());
         return java.util.Collections.unmodifiableMap(grants);
     }
     private DownloadSourcePreview result(String id, io.github.telegramenhance.library.ResourceModels.Post post,

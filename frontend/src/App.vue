@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import AppIcon from './components/AppIcon.vue'
 import LibraryWorkspace from './components/LibraryWorkspace.vue'
 import TransferComposer from './components/TransferComposer.vue'
@@ -7,8 +7,10 @@ import TransferTasks from './components/TransferTasks.vue'
 import RuleWorkspace from './components/RuleWorkspace.vue'
 import ThumbnailCacheSettings from './components/ThumbnailCacheSettings.vue'
 import DownloadSettings from './components/DownloadSettings.vue'
+import LocalPreferencesSettings from './components/LocalPreferencesSettings.vue'
 import { validTaskCategory, type TaskCategory } from './taskCategories'
-import { api, ApiError, clearAppToken, hasAppToken, type Bootstrap, type Diagnostics, type ProxyType, type Settings, type TelegramStatus } from './api'
+import { api, ApiError, clearAppToken, hasAppToken, type Bootstrap, type Diagnostics, type ProxyType, type Settings, type TelegramStatus, type TransferPreferences } from './api'
+import { invalidateThumbnails } from './thumbnailMemory'
 
 type Page = 'library' | 'tasks' | 'rules' | 'settings'
 type AuthKind = 'phone' | 'code' | 'password' | 'email' | 'emailCode'
@@ -18,9 +20,22 @@ const navigation: { id: Page; label: string; icon: string }[] = [
   { id: 'rules', label: '自动规则', icon: 'rules' },
   { id: 'settings', label: '设置', icon: 'settings' },
 ]
-const page = ref<Page>('settings')
+function readPreference(key:string) { try { return window.sessionStorage?.getItem(key) ?? '' } catch { return '' } }
+function storePreference(key:string,value:string) { try { window.sessionStorage?.setItem(key,value) } catch { /* The page remains usable without browser storage. */ } }
+const rememberedPage = readPreference('workbench-page')
+const page = ref<Page>(navigation.some(item=>item.id===rememberedPage) ? rememberedPage as Page : 'settings')
+const libraryVisited = ref(page.value === 'library')
+const rulesVisited = ref(page.value === 'rules')
+const pageScroll:Partial<Record<Page,number>>={}
+const railCollapsed = ref(readPreference('workbench-navigation-collapsed') === 'true')
+function toggleNavigation(){railCollapsed.value=!railCollapsed.value;storePreference('workbench-navigation-collapsed',String(railCollapsed.value))}
+let pageChosen = !!rememberedPage
 const settingsVisited = ref(page.value === 'settings')
+type SettingsTab='connection'|'storage'|'diagnostics'
+const settingsTab=ref<SettingsTab>(['connection','storage','diagnostics'].includes(readPreference('workbench-settings-tab'))?readPreference('workbench-settings-tab') as SettingsTab:'connection')
+function selectSettingsTab(value:SettingsTab){settingsTab.value=value;storePreference('workbench-settings-tab',value)}
 const currentPage = computed(() => navigation.find(item => item.id === page.value)!)
+const pageDescription = computed(() => ({library:'浏览自己的频道主帖与评论媒体，让整理好的资源更容易找到。',tasks:'查看执行进度，处理需要核对的结果，继续未完成的传输。',rules:'管理持续处理的来源、条件与时段，执行进度在任务中心查看。',settings:'管理 Telegram 连接、传输偏好与本机存储。'}[page.value]))
 const loading = ref(hasAppToken)
 const busy = ref('')
 const error = ref('')
@@ -29,8 +44,13 @@ const serviceReachable = ref(false)
 const accessInvalid = ref(!hasAppToken)
 const exited = ref(false)
 const telegram = ref<TelegramStatus | null>(null)
+watch([() => telegram.value?.userId ?? null, () => telegram.value?.authState === 'READY', accessInvalid, exited],
+  ([account, ready, invalid, closed], [previousAccount, wasReady, wasInvalid, wasClosed]) => {
+    if (account !== previousAccount || wasReady && !ready || invalid && !wasInvalid || closed && !wasClosed) invalidateThumbnails()
+  }, { flush: 'sync' })
 const diagnostics = ref<Diagnostics | null>(null)
 const savedSettings = ref<Settings | null>(null)
+const transferPreferences = ref<TransferPreferences>({defaultDownloadDirectory:'',downloadConcurrency:1})
 const form = reactive({ apiId: '', apiHash: '', proxyType: 'DIRECT' as ProxyType, host: '', port: '', username: '', password: '' })
 const authValue = ref('')
 const currentTime = ref(Date.now())
@@ -48,20 +68,26 @@ function openTransfer(direction:'download'|'upload'='download',mode:'ONCE'|'RULE
 function openRule(direction:'download'|'upload'){openTransfer(direction,'RULE')}
 function ruleSaved(direction:'download'|'upload'){
   if(!['download','upload'].includes(direction))return
-  newTransferOpen.value=false;ruleCategory.value=direction;ruleRefresh.value++;page.value='rules'
+  newTransferOpen.value=false;ruleCategory.value=direction;ruleRefresh.value++;navigate('rules')
 }
 const taskRefresh = ref(0)
-const taskCategory = ref<TaskCategory>('download')
+const taskCategory = ref<TaskCategory>('all')
 function navigate(next: Page) {
+  pageChosen = true
   if (!navigation.some(item => item.id === next) || page.value === next) return
+  pageScroll[page.value]=Number.isFinite(window.scrollY)?window.scrollY:0
   page.value = next
+  storePreference('workbench-page',next)
+  if (next === 'library') libraryVisited.value = true
+  if (next === 'rules') rulesVisited.value = true
+  void nextTick(()=>window.scrollTo?.({top:pageScroll[next]??0,behavior:'auto'}))
   if (next === 'settings') settingsVisited.value = true
   settingsReadGeneration++
   if (next === 'settings') void refreshSettingsPage()
 }
 function openTasks(category: TaskCategory = 'download') {
   if (!validTaskCategory(category)) return
-  taskCategory.value = category; taskRefresh.value++; newTransferOpen.value = false; page.value = 'tasks'
+  taskCategory.value = category; taskRefresh.value++; newTransferOpen.value = false; navigate('tasks')
 }
 const canOperate = computed(() => !loading.value && !busy.value && !accessInvalid.value && !exited.value && serviceReachable.value)
 let pollTimer: number | undefined
@@ -92,7 +118,8 @@ const connectionLabel = computed(() => {
 })
 const connected = computed(() => serviceReachable.value && !exited.value && telegram.value?.authState === 'READY')
 const nativeLabel = computed(() => telegram.value ? (telegram.value.nativeLoaded ? '原生库已加载' : '原生库未加载') : '等待检查')
-const activeSession = computed(() => !!telegram.value && !['DISCONNECTED', 'CLOSED', 'ERROR'].includes(telegram.value.authState))
+// Initialization errors still own a native client; disconnect it before changing settings or reconnecting.
+const activeSession = computed(() => !!telegram.value && !['DISCONNECTED', 'CLOSED'].includes(telegram.value.authState))
 const authStep = computed<{ kind: AuthKind; label: string; placeholder: string; type: string; autocomplete: string; help: string } | null>(() => {
   switch (telegram.value?.authState) {
     case 'WAIT_PHONE': return { kind: 'phone', label: 'Telegram 手机号', placeholder: '+86 …', type: 'tel', autocomplete: 'tel', help: '填写已有 Telegram 账号的手机号，包含国际区号。' }
@@ -134,6 +161,7 @@ function applyTelegram(status: TelegramStatus) {
   if (telegram.value?.authState !== status.authState) authValue.value = ''
   currentTime.value = Date.now()
   telegram.value = status
+  if(status.authState==='READY'&&!pageChosen)navigate('library')
 }
 function applySettings(settings: Settings) {
   settingsVersion++
@@ -195,6 +223,7 @@ async function bootstrap() {
   error.value = ''
   try {
     const initial = await api<Bootstrap>('/bootstrap')
+    if(initial.transferPreferences)transferPreferences.value=initial.transferPreferences
     applySettings(initial.settings)
     applyTelegram(initial.telegram)
     diagnostics.value = initial.diagnostics
@@ -303,12 +332,12 @@ onBeforeUnmount(() => { disposed = true; stopPolling(); window.clearInterval(clo
 
 <template>
   <a class="skip-link" href="#main">跳到主内容</a>
-  <div class="shell">
+  <div :class="['shell',{'rail-collapsed':railCollapsed}]">
     <aside class="rail" aria-label="主导航">
       <div class="brand"><span class="brand-mark"><AppIcon name="telegram" /></span><div><span class="brand-name">Telegram 资源台</span><small>RESOURCE WORKBENCH</small></div></div>
       <p class="nav-caption">工作空间</p>
       <nav>
-        <button v-for="item in navigation" :key="item.id" :class="['nav-item', { active: page === item.id }]" :aria-current="page === item.id ? 'page' : undefined" :aria-label="item.label" @click="navigate(item.id)">
+        <button v-for="item in navigation" :key="item.id" :class="['nav-item', { active: page === item.id }]" :aria-current="page === item.id ? 'page' : undefined" :aria-label="item.label" :title="item.label" @click="navigate(item.id)">
           <AppIcon :name="item.icon" /><span>{{ item.label }}</span>
         </button>
       </nav>
@@ -318,18 +347,19 @@ onBeforeUnmount(() => { disposed = true; stopPolling(); window.clearInterval(clo
       </div>
     </aside>
     <div class="workspace">
-      <header class="topbar"><div class="breadcrumb"><span>工作空间</span><AppIcon name="chevron" /><strong>{{ currentPage.label }}</strong></div><div class="top-actions"><button class="btn new-transfer" :disabled="!canOperate" @click="openTransfer()"><AppIcon name="plus" />新建传输</button></div></header>
+      <header class="topbar"><div class="topbar-leading"><button type="button" class="icon-btn navigation-toggle" :aria-label="railCollapsed?'展开导航':'折叠导航'" :aria-expanded="!railCollapsed" @click="toggleNavigation"><AppIcon name="chevron" /></button><div class="breadcrumb"><span>工作空间</span><AppIcon name="chevron" /><strong>{{ currentPage.label }}</strong></div></div><div class="top-actions"><button class="btn primary new-transfer" :disabled="!canOperate" @click="openTransfer()"><AppIcon name="plus" />新建传输</button><button class="icon-btn" type="button" aria-label="账号与代理设置" title="账号与代理设置" @click="navigate('settings')"><AppIcon name="settings" /></button></div></header>
       <main id="main" tabindex="-1">
-        <div :class="['page-heading',{'settings-heading':page==='settings'}]"><div><div class="eyebrow">{{ page === 'settings' ? 'PREFERENCES' : 'WORKSPACE' }}</div><h1>{{ currentPage.label }}</h1></div><button v-if="page === 'settings'" type="button" class="btn close-project" :disabled="!canOperate" @click="exitProject"><AppIcon name="power" />{{ busy === 'exit' ? '正在关闭…' : '关闭项目' }}</button></div>
+        <div v-if="page !== 'library'" :class="['page-heading',{'settings-heading':page==='settings'}]"><div><h1>{{ currentPage.label }}</h1><p>{{pageDescription}}</p></div><button v-if="page === 'settings'" type="button" class="btn close-project" :disabled="!canOperate" @click="exitProject"><AppIcon name="power" />{{ busy === 'exit' ? '正在关闭…' : '关闭项目' }}</button></div>
         <div v-if="exited" class="notice success service-notice" role="status"><AppIcon name="check" /><div><strong>已请求关闭项目</strong><p>后台正在保存并退出，Telegram 会话保留。再次使用时，请重新运行项目启动脚本。</p></div></div>
         <div v-else-if="accessInvalid" class="notice warning service-notice" role="alert"><AppIcon name="lock" /><div><strong>请从项目启动脚本打开界面</strong><p>当前页面缺少有效的本机访问令牌。请使用启动脚本打开的新链接进入。</p></div></div>
         <div v-else-if="!loading && !serviceReachable" class="notice warning service-notice" role="alert"><AppIcon name="info" /><div><strong>本机服务连接中断</strong><p>请确认 Java 后台仍在运行。恢复后会自动重查 Telegram 状态。</p></div><button class="btn" :disabled="!!busy" @click="bootstrap">重新读取</button></div>
         <div v-if="error" class="notice danger" role="alert"><AppIcon name="info" /><span>{{ error }}</span><button class="icon-btn dismiss" aria-label="关闭错误提示" @click="error = ''"><AppIcon name="close" /></button></div>
         <div v-if="notice" class="notice success" role="status"><AppIcon name="check" /><span>{{ notice }}</span><button class="icon-btn dismiss" aria-label="关闭提示" @click="notice = ''"><AppIcon name="close" /></button></div>
         <section v-if="settingsVisited" v-show="page === 'settings'" class="settings-page" aria-label="设置">
+          <nav class="settings-section-nav" aria-label="设置分组" role="tablist"><button type="button" role="tab" :aria-selected="settingsTab==='connection'" @click="selectSettingsTab('connection')">账号与连接</button><button type="button" role="tab" :aria-selected="settingsTab==='storage'" @click="selectSettingsTab('storage')">传输与存储</button><button type="button" role="tab" :aria-selected="settingsTab==='diagnostics'" @click="selectSettingsTab('diagnostics')">本机诊断</button></nav>
           <div v-if="loading" class="loading-panel" role="status"><span class="spinner" />正在读取本机配置与 Telegram 状态…</div>
-          <div v-else class="settings-grid">
-            <div class="settings-primary">
+          <div v-else :class="['settings-grid',{'settings-grid-wide':settingsTab!=='connection','settings-grid-storage':settingsTab==='storage'}]">
+            <div v-show="settingsTab==='connection'" class="settings-primary">
               <form id="settings-form" autocomplete="off" @submit.prevent="save" @input="proxyTestCurrent = false">
                 <fieldset :disabled="!canOperate">
                   <section class="settings-section" aria-labelledby="credentials-heading">
@@ -376,22 +406,24 @@ onBeforeUnmount(() => { disposed = true; stopPolling(); window.clearInterval(clo
               </section>
             </div>
             <aside class="settings-secondary" aria-label="下载与本机设置">
-              <DownloadSettings :active="page==='settings'" :available="serviceReachable && !loading && !accessInvalid && !exited" @access-error="reportError" />
-              <ThumbnailCacheSettings :available="serviceReachable && !loading && !accessInvalid && !exited" @access-error="reportError" />
-              <details class="settings-section runtime-section settings-disclosure"><summary>本机诊断<span :class="{'ready':telegram?.nativeLoaded}">{{ nativeLabel }}</span></summary><div class="settings-disclosure-body"><dl class="runtime-list"><dt>原生版本</dt><dd>{{ telegram?.nativeVersion || '等待读取' }}</dd><dt>Java</dt><dd>{{ diagnostics?.javaVersion || '等待检查' }}</dd><dt>平台</dt><dd>{{ diagnostics ? `${diagnostics.os} · ${diagnostics.architecture}` : '等待检查' }}</dd><dt>SQLite 模式</dt><dd>{{ diagnostics?.database.journalMode || '等待检查' }}</dd><dt>同步策略</dt><dd>{{ diagnostics?.database.synchronous || '等待检查' }}</dd><dt>数据库完整性</dt><dd>{{ diagnostics?.database.integrity || '等待检查' }}</dd><dt>数据库版本</dt><dd>{{ diagnostics?.database.schemaVersion ?? '等待检查' }}</dd><dt>Windows 保护</dt><dd>{{ diagnostics?.dpapi || '等待检查' }}</dd></dl><details class="data-directory"><summary>应用数据位置</summary><p>默认保存在项目的 data 文件夹中，包含设置、资源库、任务记录和 Telegram 会话；用户媒体另存。</p><code>{{ diagnostics?.dataDirectory || '等待检查' }}</code></details><button type="button" class="btn full-width" :disabled="!canOperate" @click="refreshDiagnostics"><AppIcon name="refresh" />{{ busy === 'diagnostics' ? '正在检查…' : '刷新本机诊断' }}</button></div></details>
-              <details class="settings-section settings-disclosure"><summary>首次连接帮助</summary><div class="settings-disclosure-body"><ol class="setup-steps"><li><span>1</span><div><strong>填写应用凭证</strong><p>配置你的 API ID 和 API Hash。</p></div></li><li><span>2</span><div><strong>确认网络方式</strong><p>选择直连，或软件独立代理。</p></div></li><li><span>3</span><div><strong>完成 Telegram 验证</strong><p>手机号、验证码与必要的两步验证。</p></div></li></ol><p class="section-footnote">普通资源元数据与 Telegram 会话分开保存。Windows 保护覆盖敏感配置，不代表媒体或整个数据库已加密。</p></div></details>
+              <LocalPreferencesSettings v-show="settingsTab==='storage'" :active="page==='settings'&&settingsTab==='storage'" :available="serviceReachable && !loading && !accessInvalid && !exited" @updated="transferPreferences=$event" @access-error="reportError" />
+              <DownloadSettings v-show="settingsTab==='storage'" :active="page==='settings'&&settingsTab==='storage'" :available="serviceReachable && !loading && !accessInvalid && !exited" @access-error="reportError" />
+              <ThumbnailCacheSettings v-show="settingsTab==='storage'" :active="page==='settings'&&settingsTab==='storage'" :available="serviceReachable && !loading && !accessInvalid && !exited" @access-error="reportError" />
+              <details v-show="settingsTab==='diagnostics'" :open="settingsTab==='diagnostics'" class="settings-section runtime-section settings-disclosure"><summary>本机诊断<span :class="{'ready':telegram?.nativeLoaded}">{{ nativeLabel }}</span></summary><div class="settings-disclosure-body"><dl class="runtime-list"><dt>原生版本</dt><dd>{{ telegram?.nativeVersion || '等待读取' }}</dd><dt>Java</dt><dd>{{ diagnostics?.javaVersion || '等待检查' }}</dd><dt>平台</dt><dd>{{ diagnostics ? `${diagnostics.os} · ${diagnostics.architecture}` : '等待检查' }}</dd><dt>SQLite 模式</dt><dd>{{ diagnostics?.database.journalMode || '等待检查' }}</dd><dt>同步策略</dt><dd>{{ diagnostics?.database.synchronous || '等待检查' }}</dd><dt>数据库完整性</dt><dd>{{ diagnostics?.database.integrity || '等待检查' }}</dd><dt>数据库版本</dt><dd>{{ diagnostics?.database.schemaVersion ?? '等待检查' }}</dd><dt>Windows 保护</dt><dd>{{ diagnostics?.dpapi || '等待检查' }}</dd></dl><details class="data-directory"><summary>应用数据位置</summary><p>默认保存在项目的 data 文件夹中，包含设置、资源库、任务记录和 Telegram 会话；用户媒体另存。</p><code>{{ diagnostics?.dataDirectory || '等待检查' }}</code></details><button type="button" class="btn full-width" :disabled="!canOperate" @click="refreshDiagnostics"><AppIcon name="refresh" />{{ busy === 'diagnostics' ? '正在检查…' : '刷新本机诊断' }}</button></div></details>
+              <details v-show="settingsTab==='connection'" class="settings-section settings-disclosure"><summary>首次连接帮助</summary><div class="settings-disclosure-body"><ol class="setup-steps"><li><span>1</span><div><strong>填写应用凭证</strong><p>配置你的 API ID 和 API Hash。</p></div></li><li><span>2</span><div><strong>确认网络方式</strong><p>选择直连，或软件独立代理。</p></div></li><li><span>3</span><div><strong>完成 Telegram 验证</strong><p>手机号、验证码与必要的两步验证。</p></div></li></ol><p class="section-footnote">普通资源元数据与 Telegram 会话分开保存。Windows 保护覆盖敏感配置，不代表媒体或整个数据库已加密。</p></div></details>
             </aside>
           </div>
         </section>
-        <LibraryWorkspace v-if="page === 'library'" :authorized="telegram?.authState === 'READY'" :available="serviceReachable && !loading && !accessInvalid && !exited" :account-id="telegram?.userId ?? null" @settings="navigate('settings')" @access-error="reportError" />
-        <RuleWorkspace @tasks="openTasks" v-else-if="page === 'rules'" :category="ruleCategory" :refresh-version="ruleRefresh" :authorized="telegram?.authState === 'READY'" :available="serviceReachable && !loading && !accessInvalid && !exited" :account-id="telegram?.userId ?? null" @create="openRule" @access-error="reportError" />
-        <section v-else-if="page !== 'tasks' && page !== 'settings'" class="empty-state"><span class="empty-state-icon"><AppIcon :name="currentPage.icon" /></span><h2>{{ currentPage.label }}暂不可用</h2><p>请在设置中检查本机服务与 Telegram 连接状态。</p><button class="btn primary" @click="navigate('settings')">返回设置<AppIcon name="arrow" /></button></section>
+        <LibraryWorkspace v-if="libraryVisited" v-show="page === 'library'" :authorized="telegram?.authState === 'READY'" :available="page==='library' && serviceReachable && !loading && !accessInvalid && !exited" :account-id="telegram?.userId ?? null" @settings="navigate('settings')" @access-error="reportError" />
+        <section v-if="rulesVisited" v-show="page === 'rules'" class="rules-page" aria-label="自动规则">
+          <RuleWorkspace @tasks="openTasks" :active="page==='rules'" :category="ruleCategory" :refresh-version="ruleRefresh" :authorized="telegram?.authState === 'READY'" :available="serviceReachable && !loading && !accessInvalid && !exited" :account-id="telegram?.userId ?? null" @create="openRule" @access-error="reportError" />
+        </section>
         <TransferTasks v-show="page === 'tasks'" :active="page === 'tasks'" v-model:category="taskCategory" :refresh-version="taskRefresh" :authorized="telegram?.authState === 'READY'" :available="serviceReachable && !loading && !accessInvalid && !exited" :account-id="telegram?.userId ?? null" @access-error="reportError" />
       </main>
-      <footer class="statusbar"><span><span :class="['connection-dot', { online: connected && telegram?.connectionState === 'READY' }]" />{{ connectionLabel }}</span><span>本机单账号<span class="footer-divider">|</span>会话与媒体目录分开管理</span></footer>
+      <footer class="statusbar"><span><span :class="['connection-dot', { online: connected && telegram?.connectionState === 'READY' }]" />{{ connectionLabel }}</span><span>本机工作空间<span class="footer-divider">|</span>关闭网页后后台继续运行</span></footer>
     </div>
   </div>
-  <TransferComposer v-if="newTransferOpen" :initial-direction="transferDirection" :initial-mode="transferMode" :authorized="telegram?.authState === 'READY'" :available="serviceReachable && !loading && !accessInvalid && !exited" :account-id="telegram?.userId ?? null" @close="newTransferOpen = false" @settings="newTransferOpen = false; navigate('settings')" @saved="ruleSaved" @tasks="openTasks" @access-error="reportError" />
+  <TransferComposer v-if="newTransferOpen" :initial-direction="transferDirection" :initial-mode="transferMode" :default-download-directory="transferPreferences.defaultDownloadDirectory" :authorized="telegram?.authState === 'READY'" :available="serviceReachable && !loading && !accessInvalid && !exited" :account-id="telegram?.userId ?? null" @close="newTransferOpen = false" @settings="newTransferOpen = false; navigate('settings')" @saved="ruleSaved" @tasks="openTasks" @access-error="reportError" />
   <dialog ref="dialog" class="confirmation-dialog" aria-labelledby="confirmation-heading" @cancel="confirmation = null">
     <div class="dialog-heading"><span class="dialog-icon"><AppIcon name="shield" /></span><h2 id="confirmation-heading">注销本机 Telegram 会话？</h2></div>
     <p>这会让当前设备的 Telegram 会话失效。下次连接需要重新输入手机号、验证码及必要的两步验证。</p>

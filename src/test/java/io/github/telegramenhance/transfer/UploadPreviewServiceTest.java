@@ -19,9 +19,60 @@ import org.junit.jupiter.api.io.TempDir;
 
 class UploadPreviewServiceTest {
     @TempDir Path directory;
+    @Test void customAlbumSizeSurvivesPreviewVerificationAndFrozenTaskPersistence() throws Exception {
+        try (var f = new Fixture(); var db = new io.github.telegramenhance.storage.Database(new AppPaths(directory.resolve("tasks")))) {
+            for (int i = 1; i <= 11; i++) f.file("clip" + i + ".mp4", "video-" + i);
+            var input = new Input("link", f.source.toString(), f.archive.toString(), true, "FILENAME", 4);
+            var preview = f.service.preview(input).get(10, TimeUnit.SECONDS);
+            assertEquals(4, preview.albumSize());
+            assertEquals(List.of(4, 4, 3), preview.groups().stream().map(g -> g.files().size()).toList());
+            assertEquals(preview.groups(), f.service.verify(preview.id()).get().groups());
+            var frozen = f.service.freeze(preview.id()).get();
+            assertEquals(input, frozen.input()); assertEquals(preview.groups(), frozen.groups());
+            var repository = new UploadRepository(db);
+            var task = repository.create("1", java.util.UUID.randomUUID().toString(), "custom-grouping", frozen);
+            var restored = new UploadRepository(db).task("1", task.id());
+            assertEquals(frozen, restored.prepared());
+            assertEquals(List.of(4, 4, 3), restored.groups().stream().map(g -> g.items().size()).toList());
+            assertEquals("READY", restored.state()); assertFalse(Files.exists(f.archive));
+        }
+    }
+    @Test void choosingOneSendsEveryMediaIndividually() throws Exception {
+        try (var f = new Fixture()) {
+            for (String name : List.of("1.mp4", "2.mp4", "1.jpg", "2.jpg", "1.mp3", "2.mp3", "1.txt", "2.txt", "1.gif", "2.gif")) f.file(name, name);
+            var preview = f.service.preview(new Input("link", f.source.toString(), f.archive.toString(), true, "EMPTY", 1)).get();
+            assertEquals(1, preview.albumSize()); assertEquals(10, preview.groups().size());
+            assertTrue(preview.groups().stream().allMatch(g -> g.mode().equals("SINGLE") && g.files().size() == 1));
+            assertTrue(preview.groups().stream().flatMap(g -> g.files().stream()).allMatch(m -> m.caption().isEmpty()));
+        }
+    }
+    @Test void legacyInputsDefaultToTenAndOutOfRangeSizesAreRejectedBeforeReading() throws Exception {
+        var json = tools.jackson.databind.json.JsonMapper.builder().build();
+        var legacy = json.readValue("{\"link\":\"link\",\"sourceDirectory\":\"source\",\"archiveDirectory\":\"archive\",\"recursive\":true,\"captionMode\":\"FILENAME\"}", Input.class);
+        assertEquals(10, legacy.albumSize());
+        assertEquals(new Input("link", "source", "archive", true, "FILENAME"), legacy);
+        assertEquals(10, new Input("link", "source", "archive", true, "FILENAME", null).albumSize());
+        try (var f = new Fixture()) {
+            for (int invalid : List.of(-1, 0, 11, Integer.MAX_VALUE))
+                assertThrows(IllegalArgumentException.class, () -> f.service.preview(new Input("link", f.source.toString(), f.archive.toString(), true, "FILENAME", invalid)));
+            verifyNoInteractions(f.targets);
+        }
+    }
+    @Test void backfillingPublicationDateDoesNotInvalidateAPreviouslyFrozenTarget() throws Exception {
+        try (var f = new Fixture()) {
+            f.file("clip.mp4", "clip");
+            var preview = f.service.preview(f.input()).get();
+            var old = f.service.target(preview.id());
+            when(f.targets.read(eq("link"), eq("1"), eq(1L), anySet())).thenReturn(new Target(
+                    old.post().withPublishedAt(1_700_000_123_000L), old.discussionTitle(), old.permission(), old.slowModeSeconds(), 2));
+            assertEquals(preview.groups(), f.service.verify(preview.id()).get().groups());
+            assertEquals(preview.groups(), f.service.freeze(preview.id()).get().groups());
+            assertNull(f.service.target(preview.id()).post().publishedAt(), "Verification must not rewrite the authorized snapshot");
+        }
+    }
     @Test void previewFreezesTwentyThreeMembersAsTenTenThreeAndVerificationKeepsTheSameSnapshot() throws Exception {
         try (var f = new Fixture()) { for (int i = 1; i <= 23; i++) f.file("clip" + i + ".mp4", "synthetic-" + i);
-            var result = f.service.preview(f.input()).get(10, TimeUnit.SECONDS); assertEquals("PREVIEW_ONLY", result.state()); assertEquals(List.of(10,10,3), result.groups().stream().map(g -> g.files().size()).toList());
+            var result = f.service.preview(f.input()).get(10, TimeUnit.SECONDS); assertEquals("PREVIEW_ONLY", result.state()); assertEquals(10, result.albumSize()); assertEquals(List.of(10,10,3), result.groups().stream().map(g -> g.files().size()).toList());
             assertEquals("clip10.mp4", result.groups().getFirst().files().get(9).caption()); var checked = f.service.verify(result.id()).get(10, TimeUnit.SECONDS);
             assertEquals(result.id(), checked.id()); assertEquals(result.groups(), checked.groups()); assertFalse(Files.exists(f.archive)); verify(f.targets, times(2)).read("link", "1", 1, java.util.Set.of("VIDEO"));
         }

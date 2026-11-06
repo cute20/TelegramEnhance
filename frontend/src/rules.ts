@@ -1,6 +1,6 @@
 import type { UploadPreview } from './uploadPreview'
 export interface RuleWindow {mode:'ALL_DAY'|'WINDOW';start:string|null;end:string|null;timezone:'Asia/Shanghai'}
-export interface RuleInput {name:string;link:string;sourceDirectory:string;archiveDirectory:string;recursive:boolean;captionMode:'FILENAME'|'EMPTY';window:RuleWindow;executionMode?:'OBSERVE_ONLY'|'AUTO_UPLOAD'}
+export interface RuleInput {name:string;link:string;sourceDirectory:string;archiveDirectory:string;recursive:boolean;captionMode:'FILENAME'|'EMPTY';albumSize:number;window:RuleWindow;executionMode?:'OBSERVE_ONLY'|'AUTO_UPLOAD'}
 export interface RuleObservation {version:number;revision:number;checkedAt:number;scanAt:number;outcome:'OBSERVED'|'ERROR';scan:null|{files:{relativePath:string;mediaType:string;size:number;sha256:string}[];observed:unknown[];duplicateFiles:number;deferredFiles:number;linkedEntries:number};added:number;changed:number;unobserved:number;error:string|null;upload?:{state:string;message:string;taskId:string|null;claimed:number;checkedAt:number}|null}
 export interface AutoRule {id:string;accountId:string;version:number;revision:number;enabled:boolean;nextScanAt:number;createdAt:number;updatedAt:number;input:RuleInput;observation:RuleObservation|null}
 export interface RuleJob {taskId:string;ruleVersion:number;state:string;total:number;confirmed:number;archived:number;manualTakeover:boolean;error:string|null}
@@ -11,6 +11,7 @@ export function validRule(x:unknown,account:string|null):x is RuleView {
   return ['OBSERVE_ONLY','AUTO_UPLOAD'].includes(v.mode)&&v.mode===(r?.input?.executionMode??'OBSERVE_ONLY')&&['PAUSED','OBSERVING','WAITING_WINDOW'].includes(v.state)&&typeof v.scanning==='boolean'&&Number.isSafeInteger(v.nextAllowedAt)
     &&!!r&&r.accountId===account&&typeof r.id==='string'&&!!r.id&&Number.isSafeInteger(r.version)&&r.version>0&&Number.isSafeInteger(r.revision)&&r.revision>0&&typeof r.enabled==='boolean'
     &&!!r.input&&typeof r.input.name==='string'&&typeof r.input.link==='string'&&typeof r.input.sourceDirectory==='string'&&typeof r.input.archiveDirectory==='string'
+    &&(r.input.albumSize==null||Number.isInteger(r.input.albumSize)&&r.input.albumSize>=1&&r.input.albumSize<=10)
     &&r.input.window?.timezone==='Asia/Shanghai'&&['ALL_DAY','WINDOW'].includes(r.input.window.mode)
     &&(r.observation===null||!!r.observation&&r.observation.version===r.version&&['OBSERVED','ERROR'].includes(r.observation.outcome)
       &&Number.isSafeInteger(r.observation.scanAt)&&Number.isSafeInteger(r.observation.checkedAt)

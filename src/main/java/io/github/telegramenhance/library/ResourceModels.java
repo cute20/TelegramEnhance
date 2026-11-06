@@ -22,13 +22,22 @@ public final class ResourceModels {
                        List<MessageRef> mainMessages, List<Media> mainMedia,
                        String discussionChatId, String discussionRootMessageId,
                        List<MessageRef> discussionRoots, boolean canReadComments,
-                       String coverage, List<String> warnings, AlbumEvidence albumEvidence, String mainCoverage) {
+                       String coverage, List<String> warnings, AlbumEvidence albumEvidence, String mainCoverage,
+                       Long publishedAt) {
         public Post {
             mainMessages = immutable(mainMessages);
             mainMedia = immutable(mainMedia);
             discussionRoots = immutable(discussionRoots);
             warnings = immutable(warnings);
             mainCoverage = mainCoverage == null ? "PARTIAL" : mainCoverage;
+            publishedAt = publishedAt == null || publishedAt <= 0 ? null : publishedAt;
+        }
+        public Post(String key, String accountId, String channelId, String channelTitle, String mainMessageId,
+                    String title, String text, String albumId, List<MessageRef> mainMessages, List<Media> mainMedia,
+                    String discussionChatId, String discussionRootMessageId, List<MessageRef> discussionRoots,
+                    boolean canReadComments, String coverage, List<String> warnings, AlbumEvidence albumEvidence, String mainCoverage) {
+            this(key, accountId, channelId, channelTitle, mainMessageId, title, text, albumId, mainMessages, mainMedia,
+                    discussionChatId, discussionRootMessageId, discussionRoots, canReadComments, coverage, warnings, albumEvidence, mainCoverage, null);
         }
         public Post(String key, String accountId, String channelId, String channelTitle, String mainMessageId,
                     String title, String text, String albumId, List<MessageRef> mainMessages, List<Media> mainMedia,
@@ -39,7 +48,15 @@ public final class ResourceModels {
         }
         public Post withCoverage(String value) {
             return new Post(key, accountId, channelId, channelTitle, mainMessageId, title, text, albumId, mainMessages,
-                    mainMedia, discussionChatId, discussionRootMessageId, discussionRoots, canReadComments, value, warnings, albumEvidence, mainCoverage);
+                    mainMedia, discussionChatId, discussionRootMessageId, discussionRoots, canReadComments, value, warnings, albumEvidence, mainCoverage, publishedAt);
+        }
+        public Post withPublishedAt(Long value) {
+            return new Post(key, accountId, channelId, channelTitle, mainMessageId, title, text, albumId, mainMessages,
+                    mainMedia, discussionChatId, discussionRootMessageId, discussionRoots, canReadComments, coverage, warnings, albumEvidence, mainCoverage, value);
+        }
+        /** Publication metadata can be backfilled without invalidating a frozen transfer target. */
+        public boolean sameContent(Post other) {
+            return other != null && withPublishedAt(null).equals(other.withPublishedAt(null));
         }
         @Override public String toString() { return "Post[key=" + key + ", coverage=" + coverage + "]"; }
     }

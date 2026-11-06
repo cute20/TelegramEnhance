@@ -16,15 +16,15 @@ public final class BotReplyScope {
     private static final int MAX_MESSAGES = 200;
     private static final BigInteger MAX_ID = BigInteger.valueOf(Long.MAX_VALUE);
     private static final Pattern ID = Pattern.compile("[1-9][0-9]{0,18}");
-    private static final Pattern RANGE = Pattern.compile("(?<!\\d)(\\d{1,7})\\s*[-–—~～至]\\s*(\\d{1,7})\\s*/\\s*(\\d{1,7})(?!\\d)");
-    private static final Pattern PAGE_PAIR = Pattern.compile("(?:页码|頁碼|当前页|當前頁|page|group|batch|第)\\s*[:：]?\\s*(\\d{1,7})\\s*(?:页|頁|组|組|批)?\\s*(?:/|of)\\s*(\\d{1,7})(?!\\d)");
-    private static final Pattern CURRENT = Pattern.compile("(?:第\\s*(\\d{1,7})\\s*(?:页|頁|组|組|批)|(?:当前页|當前頁|当前组|當前組)\\s*[:：]?\\s*(\\d{1,7}))(?!\\d)");
-    private static final Pattern TOTAL = Pattern.compile("(?:共(?:收到|获取到|獲取到|有)?\\s*(\\d{1,7})\\s*(?:页|頁|组|組|批))");
-    private static final Pattern BUTTON_PAIR = Pattern.compile("(?<!\\d)(\\d{1,7})\\s*/\\s*(\\d{1,7})(?!\\d)");
-    private static final Pattern MARKED_NUMBER = Pattern.compile("^[·•●\\[({（【「〈]\\s*(\\d{1,7})\\s*[·•●\\])}）】」〉]$");
+    private static final Pattern RANGE = Pattern.compile("(?<!\\d)(\\d+)\\s*[-–—~～至]\\s*(\\d+)\\s*/\\s*(\\d+)(?!\\d)");
+    private static final Pattern PAGE_PAIR = Pattern.compile("(?:页码|頁碼|当前页|當前頁|page|group|batch|第)\\s*[:：]?\\s*(\\d+)\\s*(?:页|頁|组|組|批)?\\s*(?:/|of)\\s*(\\d+)(?!\\d)");
+    private static final Pattern CURRENT = Pattern.compile("(?:第\\s*(\\d+)\\s*(?:页|頁|组|組|批)|(?:当前页|當前頁|当前组|當前組)\\s*[:：]?\\s*(\\d+))(?!\\d)");
+    private static final Pattern TOTAL = Pattern.compile("(?:共(?:收到|获取到|獲取到|有)?\\s*(\\d+)\\s*(?:页|頁|组|組|批))");
+    private static final Pattern BUTTON_PAIR = Pattern.compile("(?<!\\d)(\\d+)\\s*/\\s*(\\d+)(?!\\d)");
+    private static final Pattern MARKED_NUMBER = Pattern.compile("^[·•●\\[({（【「〈]\\s*(\\d+)\\s*[·•●\\])}）】」〉]$");
     private static final Pattern BATCH_DONE = Pattern.compile("(?:当前批次|當前批次|本批次)\\s*(?:已)?\\s*(?:发送|發送|推送)\\s*(?:完成|完毕|完畢|结束|結束)");
-    private static final Pattern SENT = Pattern.compile("(?:已发送|已發送)\\s*[:：]?\\s*(\\d{1,7})\\s*/\\s*(\\d{1,7})\\s*[条條]\\s*(?:消息|信息|訊息)");
-    private static final Pattern SENT_TOTAL = Pattern.compile("共\\s*(?:发送|發送|推送)\\s*[:：]?\\s*(\\d{1,7})\\s*[条條]\\s*(?:消息|信息|訊息)");
+    private static final Pattern SENT = Pattern.compile("(?:已发送|已發送)\\s*[:：]?\\s*(\\d+)\\s*/\\s*(\\d+)\\s*[条條]\\s*(?:消息|信息|訊息)");
+    private static final Pattern SENT_TOTAL = Pattern.compile("共\\s*(?:发送|發送|推送)\\s*[:：]?\\s*(\\d+)\\s*[条條]\\s*(?:消息|信息|訊息)");
     private static final Pattern NOTICE_PREFIX = Pattern.compile("[\\p{So}\\p{P}\\p{Z}\\p{Cf}\\s]*(?:(?:提示|通知|状态|狀態|result|status|notice)\\s*[:：]\\s*)?");
     private static final Pattern NOTICE_SUFFIX = Pattern.compile("[\\p{So}\\p{P}\\p{Z}\\p{Cf}\\s]*");
     private static final Pattern QUOTED_OR_NEGATIVE = Pattern.compile("[>\"'“‘「『`❌🚫]");
@@ -110,13 +110,13 @@ public final class BotReplyScope {
         Position position = Position.UNKNOWN;
         if (range.relevant()) {
             if (range.proven() && !range.conflict()) {
-                position = range.start() == 1 ? Position.FIRST : Position.LATER;
-                if (page.current() != null && (page.current() == 1) != (position == Position.FIRST)) {
+                position = BigInteger.ONE.equals(range.start()) ? Position.FIRST : Position.LATER;
+                if (page.exactCurrent() != null && BigInteger.ONE.equals(page.exactCurrent()) != (position == Position.FIRST)) {
                     position = Position.UNKNOWN; reliable = false;
                 }
             }
-        } else if (page.current() != null) {
-            if (page.current() > 1) position = Position.LATER;
+        } else if (page.exactCurrent() != null) {
+            if (page.exactCurrent().compareTo(BigInteger.ONE)>0) position = Position.LATER;
             else if (reliable) position = Position.FIRST;
         }
         boolean boundary = candidate && reliable;
@@ -131,8 +131,8 @@ public final class BotReplyScope {
             var matcher = RANGE.matcher(normalize(button.text()));
             while (matcher.find()) {
                 found = true;
-                Integer start = count(matcher.group(1)), end = count(matcher.group(2)), total = count(matcher.group(3));
-                if (start == null || end == null || total == null || start > end || end > total) invalidRange = true;
+                BigInteger start = count(matcher.group(1)), end = count(matcher.group(2)), total = count(matcher.group(3));
+                if (start == null || end == null || total == null || start.compareTo(end)>0 || end.compareTo(total)>0) invalidRange = true;
                 else ranges.add(new RangeValue(start, end, total));
             }
         }
@@ -140,14 +140,14 @@ public final class BotReplyScope {
         var sent = pairs(body, SENT);
         var totals = totals(body);
         boolean relevant = found;
-        if (!relevant) return new RangeEvidence(false, false, false, 0);
+        if (!relevant) return new RangeEvidence(false, false, false, BigInteger.ZERO);
         boolean conflict = invalidRange || ranges.size() != 1 || sent.invalid() || totals.invalid()
                 || sent.values().size() > 1 || totals.values().size() > 1 || pageConflict;
-        if (conflict) return new RangeEvidence(true, false, true, 0);
+        if (conflict) return new RangeEvidence(true, false, true, BigInteger.ZERO);
         RangeValue range = ranges.iterator().next();
         boolean partial = batch && sent.values().size() == 1
-                && sent.values().contains(new CountPair(range.end(), range.total())) && range.end() < range.total();
-        boolean completed = "END".equals(page.status()) && range.end() == range.total() && totals.values().size() == 1
+                && sent.values().contains(new CountPair(range.end(), range.total())) && range.end().compareTo(range.total())<0;
+        boolean completed = "END".equals(page.status()) && range.end().equals(range.total()) && totals.values().size() == 1
                 && totals.values().contains(range.total());
         if (!sent.values().isEmpty() && !sent.values().contains(new CountPair(range.end(), range.total()))) conflict = true;
         if (!totals.values().isEmpty() && !totals.values().contains(range.total())) conflict = true;
@@ -170,22 +170,22 @@ public final class BotReplyScope {
             if ("NEXT".equals(page.buttons().get(index).kind())) {
                 var target = BUTTON_PAIR.matcher(label);
                 while (target.find()) {
-                    Integer at = count(target.group(1)), size = count(target.group(2));
-                    if (at == null || size == null || at > size) counters.conflict = true;
-                    else { counters.total(target.group(2)); if (at > 1) counters.current(Integer.toString(at - 1)); }
+                    BigInteger at = count(target.group(1)), size = count(target.group(2));
+                    if (at == null || size == null || at.compareTo(size)>0) counters.conflict = true;
+                    else { counters.total(target.group(2)); if (at.compareTo(BigInteger.ONE)>0) counters.current(at.subtract(BigInteger.ONE).toString()); }
                 }
             }
         }
-        Integer at = counters.current.size() == 1 ? counters.current.iterator().next() : null;
-        Integer size = counters.total.size() == 1 ? counters.total.iterator().next() : null;
+        BigInteger at = counters.current.size() == 1 ? counters.current.iterator().next() : null;
+        BigInteger size = counters.total.size() == 1 ? counters.total.iterator().next() : null;
         boolean forward = page.buttons().stream().anyMatch(button -> "NEXT".equals(button.kind()) || "WINDOW".equals(button.kind())
-                || "PAGE".equals(button.kind()) && at != null && button.page() > at);
+                || "PAGE".equals(button.kind()) && at != null && button.exactPage().compareTo(at)>0);
         // Remove recognized counters only to ask the existing parser about affirmative terminal notices.
         String notices = TOTAL.matcher(CURRENT.matcher(PAGE_PAIR.matcher(body).replaceAll("")).replaceAll("")).replaceAll("");
         boolean explicitEnd = "END".equals(BotPagination.analyze(notices, List.of()).status());
-        return counters.conflict || at != null && size != null && (at > size || at.equals(size) && forward)
-                || size != null && page.buttons().stream().anyMatch(button -> "PAGE".equals(button.kind()) && button.page() > size)
-                || explicitEnd && (forward || at != null && size != null && at < size);
+        return counters.conflict || at != null && size != null && (at.compareTo(size)>0 || at.equals(size) && forward)
+                || size != null && page.buttons().stream().anyMatch(button -> "PAGE".equals(button.kind()) && button.exactPage().compareTo(size)>0)
+                || explicitEnd && (forward || at != null && size != null && at.compareTo(size)<0);
     }
 
     private static PairEvidence pairs(String body, Pattern pattern) {
@@ -194,8 +194,8 @@ public final class BotReplyScope {
         for (String line : body.split("\\R")) {
             var matcher = pattern.matcher(line);
             while (matcher.find()) if (affirmative(line, matcher.start(), matcher.end())) {
-                Integer sent = count(matcher.group(1)), total = count(matcher.group(2));
-                if (sent == null || total == null || sent > total) invalid = true;
+                BigInteger sent = count(matcher.group(1)), total = count(matcher.group(2));
+                if (sent == null || total == null || sent.compareTo(total)>0) invalid = true;
                 else values.add(new CountPair(sent, total));
             }
         }
@@ -203,12 +203,12 @@ public final class BotReplyScope {
     }
 
     private static TotalEvidence totals(String body) {
-        var values = new LinkedHashSet<Integer>();
+        var values = new LinkedHashSet<BigInteger>();
         boolean invalid = false;
         for (String line : body.split("\\R")) {
             var matcher = SENT_TOTAL.matcher(line);
             while (matcher.find()) if (affirmative(line, matcher.start(), matcher.end())) {
-                Integer total = count(matcher.group(1));
+                BigInteger total = count(matcher.group(1));
                 if (total == null) invalid = true;
                 else values.add(total);
             }
@@ -241,8 +241,8 @@ public final class BotReplyScope {
         return identity;
     }
 
-    private static Integer count(String value) {
-        try { int count = Integer.parseInt(value); return count > 0 && count <= 1_000_000 ? count : null; }
+    private static BigInteger count(String value) {
+        try { var count = new BigInteger(value); return count.signum()>0 ? count : null; }
         catch (NumberFormatException ignored) { return null; }
     }
 
@@ -253,18 +253,18 @@ public final class BotReplyScope {
 
     private enum Position { FIRST, LATER, UNKNOWN }
     private record Footer(Message message, BigInteger id, boolean candidate, boolean reliableBoundary, Position position) { }
-    private record RangeValue(int start, int end, int total) { }
-    private record CountPair(int sent, int total) { }
+    private record RangeValue(BigInteger start, BigInteger end, BigInteger total) { }
+    private record CountPair(BigInteger sent, BigInteger total) { }
     private record PairEvidence(Set<CountPair> values, boolean invalid) { }
-    private record TotalEvidence(Set<Integer> values, boolean invalid) { }
-    private record RangeEvidence(boolean relevant, boolean proven, boolean conflict, int start) { }
+    private record TotalEvidence(Set<BigInteger> values, boolean invalid) { }
+    private record RangeEvidence(boolean relevant, boolean proven, boolean conflict, BigInteger start) { }
     private static final class Counters {
-        final Set<Integer> current = new LinkedHashSet<>(), total = new LinkedHashSet<>();
+        final Set<BigInteger> current = new LinkedHashSet<>(), total = new LinkedHashSet<>();
         boolean conflict;
         void current(String value) { add(current, value); }
         void total(String value) { add(total, value); }
-        void add(Set<Integer> values, String text) {
-            Integer value = count(text);
+        void add(Set<BigInteger> values, String text) {
+            BigInteger value = count(text);
             if (value == null) conflict = true;
             else { values.add(value); if (values.size() > 1) conflict = true; }
         }

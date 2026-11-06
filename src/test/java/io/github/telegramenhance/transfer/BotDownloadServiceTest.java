@@ -19,6 +19,26 @@ import org.junit.jupiter.api.io.TempDir;
 import tools.jackson.databind.json.JsonMapper;
 
 class BotDownloadServiceTest {
+    @Test void countersBeyondIntegerConfirmSameMessageEditsAndAllowTheFollowingCallbackWithoutMediaChanges()throws Exception{
+        try(var f=new Fixture()){
+            var total=new java.math.BigInteger("999999999999999999999999999999");var ref=new MessageRef("9","100",null);
+            var next=new BotReader.Button(0,0,"下一页","CALLBACK",new byte[]{1});
+            var firstReply=new BotReader.Message(ref,"页码"+total.subtract(java.math.BigInteger.TWO)+"/"+total,List.of(),List.of(next));
+            when(f.reader.history(TARGET,null,1)).thenReturn(new BotReader.Snapshot(TARGET,List.of(firstReply),false,"100","50"));
+            var first=f.open();assertEquals("MORE",first.paginationStatus());assertNull(first.currentPage());assertNull(first.totalPages());assertNotNull(first.recommendedButtonId());
+            f.service.press(first.id(),f.press(first)).get();
+            var middleReply=new BotReader.Message(ref,"页码"+total.subtract(java.math.BigInteger.ONE)+"/"+total,List.of(),List.of(next));
+            when(f.reader.history(TARGET,null,1)).thenReturn(new BotReader.Snapshot(TARGET,List.of(middleReply),false,"100","50"));
+            f.advance(5);var arriving=f.service.refresh(first.id()).get();assertTrue(arriving.waitInfo().progressObserved());assertEquals("WAITING",arriving.state());
+            f.advance(5);var stable=f.service.refresh(first.id()).get();assertEquals("READY",stable.state());assertEquals("MORE",stable.paginationStatus());assertNotNull(stable.recommendedButtonId());assertTrue(stable.media().isEmpty());
+            assertEquals("WAITING",f.service.press(first.id(),f.press(stable)).get().state());
+            var lastReply=new BotReader.Message(ref,"页码"+total+"/"+total,List.of(),List.of(new BotReader.Button(0,0,"上一页","CALLBACK",new byte[]{2})));
+            when(f.reader.history(TARGET,null,1)).thenReturn(new BotReader.Snapshot(TARGET,List.of(lastReply),false,"100","50"));
+            f.advance(5);assertTrue(f.service.refresh(first.id()).get().waitInfo().progressObserved());f.advance(5);var done=f.service.refresh(first.id()).get();
+            assertEquals("READY",done.state());assertEquals("END",done.paginationStatus());assertNull(done.currentPage());assertNull(done.totalPages());assertNull(done.recommendedButtonId());
+            verify(f.reader,times(2)).press(eq(TARGET),eq("100"),any(),eq(1L));verifyNoInteractions(f.files);assertTrue(f.repository.list("1",20,0).isEmpty());
+        }
+    }
     @TempDir Path directory;
     private static final BotReader.Target TARGET=new BotReader.Target("9","9","合成机器人");
     private static BotReader.Message message(String id,String text,String button){
@@ -441,6 +461,46 @@ class BotDownloadServiceTest {
             assertThrows(IllegalArgumentException.class,()->f.service.create(new BotDownloadService.Create(input.operationId(),input.sourceId(),input.revision(),input.mediaKeys(),directory.resolve("other").toString())));
         }
     }
+    @Test void moreThanOneHundredPaginationOperationsCanAccumulateAndDownloadOverFiveHundredMedia()throws Exception{
+        try(var f=new Fixture()){
+            when(f.reader.history(TARGET,null,1)).thenReturn(resourcePage(1,102));
+            var view=f.open();
+            for(int page=2;page<=102;page++){
+                var press=f.press(view);
+                var waiting=f.service.press(view.id(),press).get();assertEquals("WAITING",waiting.state());
+                assertEquals(waiting,f.service.press(view.id(),press).get(),"an accepted pagination operation remains idempotent");
+                when(f.reader.history(TARGET,null,1)).thenReturn(resourcePage(page,102));
+                f.advance(5);var arriving=f.service.refresh(view.id()).get();assertTrue(arriving.waitInfo().progressObserved());
+                f.advance(5);view=f.service.refresh(view.id()).get();assertEquals("READY",view.state());
+                assertEquals(page*5,view.media().size(),"refreshing a page must preserve and deduplicate all previously read media");
+            }
+            assertEquals("END",view.paginationStatus());assertNull(view.recommendedButtonId());
+            var request=f.input(view);var task=f.service.create(request).get();
+            assertEquals(510,task.total());assertEquals(510,f.repository.task("1",task.id()).items().size());
+            assertEquals(task,f.service.create(request).get());assertEquals(task,f.service.lookup(request.operationId()).task());
+            verify(f.reader,times(101)).press(eq(TARGET),anyString(),any(),eq(1L));
+            verify(f.files,times(1)).freeze(any(),argThat(items->items.size()==510),eq(1L));
+        }
+    }
+    @Test void removingTheSelectionCountCapStillRejectsEmptyDuplicateAndMalformedKeys()throws Exception{
+        try(var f=new Fixture()){
+            var view=f.open();var request=f.input(view);String key=request.mediaKeys().getFirst();
+            for(List<String> keys:List.of(List.<String>of(),List.of(key,key),List.of(" "),List.of("x".repeat(513)),Arrays.asList((String)null))){
+                assertThrows(IllegalArgumentException.class,()->f.service.create(new BotDownloadService.Create(
+                        request.operationId(),request.sourceId(),request.revision(),keys,request.targetDirectory())));
+            }
+            verifyNoInteractions(f.files);assertTrue(f.repository.list("1",20,0).isEmpty());
+        }
+    }
+    private static BotReader.Snapshot resourcePage(int page,int totalPages){
+        var messages=new ArrayList<BotReader.Message>();
+        for(int item=0;item<5;item++){
+            String id=Integer.toString(90+page*10+item);
+            String text=item==4?"页码:"+page+"/"+totalPages:"本页媒体";
+            messages.add(message(id,text,item==4&&page<totalPages?"下一页":null));
+        }
+        return new BotReader.Snapshot(TARGET,List.copyOf(messages),false,messages.getFirst().ref().messageId(),"50");
+    }
     @Test void observedMediaCanBeDownloadedWithoutWaitingForPaginationOrReplayingAnyCallback()throws Exception{
         for(String state:List.of("READY","WAITING","NEEDS_REVIEW","TIMED_OUT"))try(var f=new Fixture()){
             var view=f.open();BotDownloadService.Press press=null;
@@ -470,8 +530,8 @@ class BotDownloadServiceTest {
         try(var f=new Fixture()){
             var view=f.open();var input=f.input(view);
             assertThrows(ExecutionException.class,()->f.service.create(new BotDownloadService.Create(input.operationId(),input.sourceId(),input.revision(),List.of("not-observed"),input.targetDirectory())).get());
-            when(f.files.freeze(any(),anyList(),anyLong())).thenThrow(new IllegalArgumentException("protected"));assertThrows(ExecutionException.class,()->f.service.create(input).get());
-            doAnswer(call->{f.generation.incrementAndGet();return List.of();}).when(f.files).freeze(any(),anyList(),anyLong());assertThrows(ExecutionException.class,()->f.service.create(input).get());
+            var protectedRequest=f.input(view);when(f.files.freeze(any(),anyList(),anyLong())).thenThrow(new IllegalArgumentException("protected"));assertThrows(ExecutionException.class,()->f.service.create(protectedRequest).get());
+            var changedSessionRequest=f.input(view);doAnswer(call->{f.generation.incrementAndGet();return List.of();}).when(f.files).freeze(any(),anyList(),anyLong());assertThrows(ExecutionException.class,()->f.service.create(changedSessionRequest).get());
             assertTrue(f.repository.list("1",20,0).isEmpty());assertFalse(Files.exists(f.output));
         }
     }
@@ -483,7 +543,182 @@ class BotDownloadServiceTest {
             var view=service.open(new BotDownloadService.Open("@synthetic_bot")).get();var input=f.input(view);
             var failure=assertThrows(ExecutionException.class,()->service.create(input).get());assertInstanceOf(IllegalStateException.class,failure.getCause());
             assertEquals(1,f.repository.list("1",20,0).size());var task=service.lookup(input.operationId()).task();assertNotNull(task);assertEquals(task,service.create(input).get());
+            service.close();
         }
+    }
+    @Test void preparationReturnsPendingWithoutHoldingTheResourceWorkerAndBothRoutesShareOneOperation()throws Exception{
+        try(var f=new Fixture();var resources=Executors.newSingleThreadExecutor()){
+            when(f.work.readWork(any())).thenAnswer(call->CompletableFuture.supplyAsync(()->((Supplier<?>)call.getArgument(0)).get(),resources));
+            var entered=new CountDownLatch(1);var release=new CountDownLatch(1);
+            when(f.files.freeze(any(),anyList(),eq(1L))).thenAnswer(call->{
+                assertTrue(Thread.currentThread().getName().startsWith("bot-download-preparation"));entered.countDown();assertTrue(release.await(5,TimeUnit.SECONDS));
+                List<Media> media=call.getArgument(1);return media.stream().map(m->new FrozenFile(m,"uid:"+m.key(),m.size(),m.fileName())).toList();
+            });
+            var view=f.open();var request=f.input(view);
+            try{
+                var pending=f.service.prepare(request).get(2,TimeUnit.SECONDS);
+                assertEquals("PREPARING",pending.state());assertNull(pending.task());assertNull(pending.error());assertTrue(entered.await(2,TimeUnit.SECONDS));
+                assertEquals(pending,f.service.prepare(request).get(2,TimeUnit.SECONDS));
+                var legacy=f.service.create(request);assertFalse(legacy.isDone());assertEquals(pending,f.service.preparation(request.operationId()));
+                assertEquals(view,f.service.refresh(view.id()).get(2,TimeUnit.SECONDS),"Slow native file checks must not occupy the shared resource reader");
+                assertThrows(IllegalArgumentException.class,()->f.service.prepare(new BotDownloadService.Create(request.operationId(),request.sourceId(),request.revision(),request.mediaKeys(),directory.resolve("different").toString())));
+                f.clock.addAndGet(TimeUnit.HOURS.toNanos(2));assertEquals("PREPARING",f.service.preparation(request.operationId()).state(),"Pending work never expires with the preview or receipt TTL");
+                release.countDown();var task=legacy.get(5,TimeUnit.SECONDS);
+                var ready=f.service.preparation(request.operationId());assertEquals("READY",ready.state());assertEquals(task,ready.task());assertNull(ready.error());
+                assertEquals(ready,f.service.prepare(request).get(2,TimeUnit.SECONDS));assertEquals(1,f.repository.list("1",20,0).size());
+                verify(f.files,times(1)).freeze(any(),anyList(),eq(1L));
+            }finally{release.countDown();}
+        }
+    }
+    @Test void preparationCopiesItsSelectionAndRetainsAFailureWithoutCreatingATaskOrReplayingChecks()throws Exception{
+        try(var f=new Fixture()){
+            var view=f.open();var keys=new ArrayList<>(view.media().stream().map(Media::key).toList());
+            var request=new BotDownloadService.Create(UUID.randomUUID().toString(),view.id(),view.revision(),keys,f.output.toString());keys.clear();
+            assertEquals(1,request.mediaKeys().size());assertThrows(UnsupportedOperationException.class,()->request.mediaKeys().clear());
+            when(f.files.freeze(any(),anyList(),eq(1L))).thenThrow(new IllegalArgumentException("文件“original.mp4”：Telegram 暂时未完成读取，请稍后重新核对"));
+            f.service.prepare(request).get(2,TimeUnit.SECONDS);assertThrows(ExecutionException.class,()->f.service.create(request).get(2,TimeUnit.SECONDS));
+            var failed=f.service.preparation(request.operationId());assertEquals("FAILED",failed.state());assertNull(failed.task());assertTrue(failed.error().contains("original.mp4"));
+            assertEquals(failed,f.service.prepare(request).get(2,TimeUnit.SECONDS));assertEquals(failed,f.service.preparation(request.operationId()));
+            assertTrue(f.repository.list("1",20,0).isEmpty());verify(f.files,times(1)).freeze(any(),anyList(),eq(1L));
+        }
+    }
+    @Test void sessionChangesDuringPreparationCannotCommitAndCannotBeReadByAnotherAccount()throws Exception{
+        try(var f=new Fixture()){
+            var entered=new CountDownLatch(1);var release=new CountDownLatch(1);
+            when(f.files.freeze(any(),anyList(),eq(1L))).thenAnswer(call->{entered.countDown();assertTrue(release.await(5,TimeUnit.SECONDS));List<Media> media=call.getArgument(1);return media.stream().map(m->new FrozenFile(m,"uid:"+m.key(),m.size(),m.fileName())).toList();});
+            var view=f.open();var request=f.input(view);
+            try{
+                assertEquals("PREPARING",f.service.prepare(request).get(2,TimeUnit.SECONDS).state());assertTrue(entered.await(2,TimeUnit.SECONDS));
+                when(f.telegram.accountId()).thenReturn("2");assertNull(f.service.preparation(request.operationId()),"Preparation receipts are account scoped");
+                when(f.telegram.accountId()).thenReturn("1");f.generation.incrementAndGet();
+                var failed=f.service.preparation(request.operationId());assertEquals("FAILED",failed.state());assertTrue(failed.error().contains("会话已变化"));
+                release.countDown();assertThrows(ExecutionException.class,()->f.service.create(request).get(2,TimeUnit.SECONDS));
+            }finally{release.countDown();}
+            f.service.close();assertTrue(f.repository.list("1",20,0).isEmpty());
+        }
+    }
+    @Test void incompleteFrozenListsNeverCreatePartialTasksAndPersistedTasksSurvivePreparationCacheLoss()throws Exception{
+        try(var f=new Fixture()){
+            var view=f.open();var failedRequest=f.input(view);
+            when(f.files.freeze(any(),anyList(),eq(1L))).thenReturn(List.of());f.service.prepare(failedRequest).get(2,TimeUnit.SECONDS);
+            assertThrows(ExecutionException.class,()->f.service.create(failedRequest).get(2,TimeUnit.SECONDS));assertEquals("FAILED",f.service.preparation(failedRequest.operationId()).state());assertTrue(f.repository.list("1",20,0).isEmpty());
+            when(f.files.freeze(any(),anyList(),eq(1L))).thenAnswer(call->{List<Media> media=call.getArgument(1);return media.stream().map(m->new FrozenFile(m,"uid:"+m.key(),m.size(),m.fileName())).toList();});
+            var request=f.input(view);var task=f.service.create(request).get(5,TimeUnit.SECONDS);
+            var restarted=new BotDownloadService(f.work,f.reader,f.telegram,f.files,f.repository,new DownloadPaths(f.paths),f.clock::get);
+            try{
+                var ready=restarted.preparation(request.operationId());assertEquals("READY",ready.state());assertEquals(task,ready.task());
+                assertEquals(ready,restarted.prepare(request).get(2,TimeUnit.SECONDS));assertNull(restarted.preparation(UUID.randomUUID().toString()));
+            }finally{restarted.close();}
+        }
+    }
+    @Test void aSessionChangeRacingTheCommitCanOnlyPublishReadyWithTheSavedTaskNeverFailed()throws Exception{
+        try(var f=new Fixture();var polling=Executors.newSingleThreadExecutor()){
+            var enteringCommit=new CountDownLatch(1);var release=new CountDownLatch(1);var repository=spy(f.repository);
+            doAnswer(call->{enteringCommit.countDown();assertTrue(release.await(5,TimeUnit.SECONDS));return call.callRealMethod();})
+                    .when(repository).create(anyString(),anyString(),anyString(),any(),any(),anyList());
+            var service=new BotDownloadService(f.work,f.reader,f.telegram,f.files,repository,new DownloadPaths(f.paths),f.clock::get);
+            try{
+                var view=service.open(new BotDownloadService.Open("@synthetic_bot")).get();var request=f.input(view);
+                assertEquals("PREPARING",service.prepare(request).get(2,TimeUnit.SECONDS).state());assertTrue(enteringCommit.await(2,TimeUnit.SECONDS));
+                f.generation.incrementAndGet();var receipt=CompletableFuture.supplyAsync(()->service.preparation(request.operationId()),polling);
+                release.countDown();var ready=receipt.get(5,TimeUnit.SECONDS);assertEquals("READY",ready.state());assertNotNull(ready.task());assertNull(ready.error());
+                assertEquals(1,f.repository.list("1",20,0).size());assertEquals(ready,service.preparation(request.operationId()));
+            }finally{release.countDown();service.close();}
+        }
+    }
+    @Test void aPostCommitDatabaseFailurePreservesTheOperationUntilTheDurableTaskCanBeConfirmed()throws Exception{
+        try(var f=new Fixture()){
+            var repository=spy(f.repository);var lookupUnavailable=new java.util.concurrent.atomic.AtomicBoolean();
+            doAnswer(call->{if(lookupUnavailable.get())throw new IllegalStateException("temporary lookup failure");return call.callRealMethod();}).when(repository).byOperation(anyString(),anyString());
+            doAnswer(call->{call.callRealMethod();lookupUnavailable.set(true);throw new IllegalStateException("lost commit acknowledgement");}).when(repository).create(anyString(),anyString(),anyString(),any(),any(),anyList());
+            var service=new BotDownloadService(f.work,f.reader,f.telegram,f.files,repository,new DownloadPaths(f.paths),f.clock::get);
+            try{
+                var view=service.open(new BotDownloadService.Open("@synthetic_bot")).get();var request=f.input(view);
+                // The legacy waiting future can end uncertain, while the preparation remains pending rather than refusing a saved operation.
+                var legacy=service.create(request);
+                var uncertain=assertThrows(ExecutionException.class,()->legacy.get(2,TimeUnit.SECONDS));assertInstanceOf(IllegalStateException.class,uncertain.getCause());
+                assertThrows(IllegalStateException.class,()->service.preparation(request.operationId()),"An unavailable lookup must not publish FAILED for a possibly committed task");
+                lookupUnavailable.set(false);assertEquals(1,f.repository.list("1",20,0).size());var ready=service.preparation(request.operationId());assertEquals("READY",ready.state());assertNotNull(ready.task());assertNull(ready.error());
+                assertEquals(ready,service.prepare(request).get(2,TimeUnit.SECONDS));verify(f.files,times(1)).freeze(any(),anyList(),eq(1L));
+            }finally{service.close();}
+        }
+    }
+    @Test void sessionChangesWhenAcknowledgingAnAcceptedPreparationAreUnknownRatherThanADefinitiveRefusal()throws Exception{
+        try(var f=new Fixture()){
+            var view=f.open();var request=f.input(view);
+            when(f.work.readWork(any())).thenAnswer(call->{var result=((Supplier<?>)call.getArgument(0)).get();f.generation.incrementAndGet();return CompletableFuture.completedFuture(result);});
+            var failure=assertThrows(ExecutionException.class,()->f.service.prepare(request).get(2,TimeUnit.SECONDS));
+            assertInstanceOf(IllegalStateException.class,failure.getCause());assertTrue(failure.getCause().getMessage().contains("原操作号"));
+            f.service.close();assertTrue(f.repository.list("1",20,0).isEmpty());
+        }
+    }
+    @Test void capturesFromEarlierPagesSurviveShorterHistoryWindowsAndOnlySelectedCapturesReachPreparation()throws Exception{
+        try(var f=new Fixture()){
+            var firstMessage=captured(message("100","页码:1/2","下一页"),7,"private-first-remote","private-first-unique");
+            when(f.reader.history(TARGET,null,1)).thenReturn(new BotReader.Snapshot(TARGET,List.of(firstMessage),false,"100","50"));
+            var first=f.open();f.service.press(first.id(),f.press(first)).get();
+            var nextMessage=captured(message("110","页码:2/2",null),8,"private-next-remote","private-next-unique");
+            when(f.reader.history(TARGET,null,1)).thenReturn(new BotReader.Snapshot(TARGET,List.of(nextMessage),false,"110","50"));
+            f.advance(5);f.service.refresh(first.id()).get();f.advance(5);var latest=f.service.refresh(first.id()).get();assertEquals(2,latest.media().size());
+            var oldKey=firstMessage.media().getFirst().key();var request=new BotDownloadService.Create(UUID.randomUUID().toString(),latest.id(),latest.revision(),List.of(oldKey),f.output.toString());
+            when(f.files.freezeObservedBot(any(),anyList(),anyMap(),eq(1L))).thenAnswer(call->{Map<String,FrozenFile> captures=call.getArgument(2);assertEquals(Set.of(oldKey),captures.keySet());assertThrows(UnsupportedOperationException.class,captures::clear);return List.of(captures.get(oldKey));});
+            var task=f.service.create(request).get(3,TimeUnit.SECONDS);var stored=f.repository.task("1",task.id()).items().getFirst().file();
+            assertEquals("private-first-unique",stored.uniqueId());assertEquals(new BotFileReference(7,"private-first-remote"),stored.botReference());
+            var json=JsonMapper.builder().build();for(String value:List.of(json.writeValueAsString(latest),json.writeValueAsString(task)))for(String secret:List.of("private-first-remote","private-first-unique","private-next-remote","botReference","observedFiles"))assertFalse(value.contains(secret),secret);
+            verify(f.files,never()).freeze(any(),anyList(),anyLong());verify(f.files,times(1)).freezeObservedBot(any(),anyList(),anyMap(),eq(1L));
+        }
+    }
+    @Test void aNewCapturedUniqueIdentityChangesRevisionEvenWhenPublicMetadataIsUnchanged()throws Exception{
+        try(var f=new Fixture()){
+            var original=message("100","页码:1/2","下一页");
+            when(f.reader.history(TARGET,null,1)).thenReturn(new BotReader.Snapshot(TARGET,List.of(captured(original,7,"remote-a","unique-a")),false,"100","50"));
+            var first=f.open();var stale=f.input(first);
+            when(f.reader.history(TARGET,null,1)).thenReturn(new BotReader.Snapshot(TARGET,List.of(captured(original,8,"remote-b","unique-b")),false,"100","50"));
+            var latest=f.service.refresh(first.id()).get();assertEquals(first.media(),latest.media());assertTrue(latest.revision()>first.revision());
+            assertThrows(ExecutionException.class,()->f.service.create(stale).get());
+            when(f.files.freezeObservedBot(any(),anyList(),anyMap(),eq(1L))).thenAnswer(call->{Map<String,FrozenFile> captures=call.getArgument(2);return new ArrayList<>(captures.values());});
+            var task=f.service.create(f.input(latest)).get(3,TimeUnit.SECONDS);assertEquals("unique-b",f.repository.task("1",task.id()).items().getFirst().file().uniqueId());
+            verify(f.files,times(1)).freezeObservedBot(any(),anyList(),anyMap(),eq(1L));verify(f.files,never()).freeze(any(),anyList(),anyLong());
+        }
+    }
+    @Test void aChangedMediaVersionWithoutANewCaptureCannotReuseTheOldFileReference()throws Exception{
+        try(var f=new Fixture()){
+            var original=message("100","页码:1/2","下一页");when(f.reader.history(TARGET,null,1)).thenReturn(new BotReader.Snapshot(TARGET,List.of(captured(original,7,"remote-a","unique-a")),false,"100","50"));
+            var first=f.open();var previous=original.media().getFirst();var changed=new Media(previous.key(),previous.message(),"BOT",previous.type(),"changed.mp4",previous.size(),previous.caption());
+            var edited=new BotReader.Message(original.ref(),original.text(),List.of(changed),original.buttons());when(f.reader.history(TARGET,null,1)).thenReturn(new BotReader.Snapshot(TARGET,List.of(edited),false,"100","50"));
+            var latest=f.service.refresh(first.id()).get();var task=f.service.create(f.input(latest)).get(3,TimeUnit.SECONDS);
+            assertNull(f.repository.task("1",task.id()).items().getFirst().file().botReference());verify(f.files).freeze(any(),anyList(),eq(1L));verify(f.files,never()).freezeObservedBot(any(),anyList(),anyMap(),anyLong());
+        }
+    }
+    @Test void unrelatedOrMismatchedCapturedReferencesCannotEnterTheObservedResource()throws Exception{
+        for(boolean extra:List.of(true,false))try(var f=new Fixture()){
+            var original=message("100","页码:1/2","下一页");var file=captured(original,7,"private-remote","private-unique").observedFiles().values().iterator().next();
+            if(!extra){var media=file.media();var foreign=new Media(media.key(),new MessageRef("99",media.message().messageId(),null),"BOT",media.type(),media.fileName(),media.size(),media.caption());file=new FrozenFile(foreign,file.uniqueId(),file.size(),file.fileName(),file.botReference());}
+            var malformed=new BotReader.Message(original.ref(),original.text(),original.media(),original.buttons(),Map.of(extra?"unobserved-key":original.media().getFirst().key(),file));
+            when(f.reader.history(TARGET,null,1)).thenReturn(new BotReader.Snapshot(TARGET,List.of(malformed),false,"100","50"));
+            assertThrows(ExecutionException.class,f::open);assertTrue(f.repository.list("1",20,0).isEmpty());verifyNoInteractions(f.files);
+        }
+    }
+    @Test void frozenResultsMustKeepTheCapturedUniqueIdentityAndReference()throws Exception{
+        for(boolean changeReference:List.of(true,false))try(var f=new Fixture()){
+            var original=captured(message("100","页码:1/2","下一页"),7,"private-remote","private-unique");when(f.reader.history(TARGET,null,1)).thenReturn(new BotReader.Snapshot(TARGET,List.of(original),false,"100","50"));
+            var view=f.open();var request=f.input(view);var expected=original.observedFiles().values().iterator().next();
+            when(f.files.freezeObservedBot(any(),anyList(),anyMap(),eq(1L))).thenReturn(List.of(new FrozenFile(expected.media(),changeReference?expected.uniqueId():"other-unique",expected.size(),expected.fileName(),changeReference?new BotFileReference(8,"other-remote"):expected.botReference())));
+            assertThrows(ExecutionException.class,()->f.service.create(request).get(3,TimeUnit.SECONDS));assertEquals("FAILED",f.service.preparation(request.operationId()).state());assertTrue(f.repository.list("1",20,0).isEmpty());
+        }
+    }
+    @Test void aPresentMessageWithoutAFreshSafeCaptureInvalidatesItsPreviousReference()throws Exception{
+        for(boolean hasMedia:List.of(true,false))try(var f=new Fixture()){
+            var original=message("100","页码:1/2","下一页");when(f.reader.history(TARGET,null,1)).thenReturn(new BotReader.Snapshot(TARGET,List.of(captured(original,7,"remote-a","unique-a")),false,"100","50"));
+            var first=f.open();var noCapture=new BotReader.Message(original.ref(),original.text(),hasMedia?original.media():List.of(),original.buttons());
+            when(f.reader.history(TARGET,null,1)).thenReturn(new BotReader.Snapshot(TARGET,List.of(noCapture),false,"100","50"));
+            var latest=f.service.refresh(first.id()).get();assertTrue(latest.revision()>first.revision());
+            var task=f.service.create(f.input(latest)).get(3,TimeUnit.SECONDS);assertNull(f.repository.task("1",task.id()).items().getFirst().file().botReference());
+            verify(f.files).freeze(any(),anyList(),eq(1L));verify(f.files,never()).freezeObservedBot(any(),anyList(),anyMap(),anyLong());
+        }
+    }
+    private static BotReader.Message captured(BotReader.Message message,int fileId,String remoteId,String uniqueId){
+        var media=message.media().getFirst();return new BotReader.Message(message.ref(),message.text(),message.media(),message.buttons(),Map.of(media.key(),new FrozenFile(media,uniqueId,media.size(),media.fileName(),new BotFileReference(fileId,remoteId))));
     }
     private final class Fixture implements AutoCloseable {
         final AppPaths paths=new AppPaths(directory.resolve(UUID.randomUUID().toString()));final Database database=new Database(paths);final DownloadRepository repository=new DownloadRepository(database);
@@ -500,6 +735,6 @@ class BotDownloadServiceTest {
         BotDownloadService.Press press(BotDownloadService.View view){return new BotDownloadService.Press(UUID.randomUUID().toString(),view.revision(),view.recommendedButtonId());}
         void advance(long seconds){clock.addAndGet(TimeUnit.SECONDS.toNanos(seconds));}
         BotDownloadService.Create input(BotDownloadService.View view){return new BotDownloadService.Create(UUID.randomUUID().toString(),view.id(),view.revision(),view.media().stream().map(Media::key).toList(),output.toString());}
-        public void close(){database.close();}
+        public void close(){service.close();database.close();}
     }
 }

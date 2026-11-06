@@ -1,11 +1,14 @@
 package io.github.telegramenhance.api;
 
 import io.github.telegramenhance.config.AppPaths;
+import io.github.telegramenhance.desktop.WorkbenchTray;
 import io.github.telegramenhance.storage.Database;
 import io.github.telegramenhance.storage.SettingsService;
+import io.github.telegramenhance.storage.TransferPreferences;
 import io.github.telegramenhance.telegram.TelegramService;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.atomic.AtomicBoolean;
 import org.springframework.context.ConfigurableApplicationContext;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
@@ -17,10 +20,20 @@ public class WorkbenchController {
     private final Database database;
     private final AppPaths paths;
     private final ConfigurableApplicationContext context;
+    private final TransferPreferences preferences;
+    private final WorkbenchTray tray;
+    private final AtomicBoolean exitRequested = new AtomicBoolean();
     public WorkbenchController(SettingsService settings, TelegramService telegram, Database database, AppPaths paths, ConfigurableApplicationContext context) {
-        this.settings = settings; this.telegram = telegram; this.database = database; this.paths = paths; this.context = context;
+        this(settings, telegram, database, paths, context, null);
     }
-    @GetMapping("/bootstrap") public Map<String, Object> bootstrap() { return Map.of("stage", "M5", "settings", settings.view(), "telegram", telegram.status(), "diagnostics", diagnostics()); }
+    public WorkbenchController(SettingsService settings, TelegramService telegram, Database database, AppPaths paths, ConfigurableApplicationContext context, TransferPreferences preferences) {
+        this(settings, telegram, database, paths, context, preferences, null);
+    }
+    @org.springframework.beans.factory.annotation.Autowired
+    public WorkbenchController(SettingsService settings, TelegramService telegram, Database database, AppPaths paths, ConfigurableApplicationContext context, TransferPreferences preferences, WorkbenchTray tray) {
+        this.settings = settings; this.telegram = telegram; this.database = database; this.paths = paths; this.context = context; this.preferences = preferences; this.tray = tray;
+    }
+    @GetMapping("/bootstrap") public Map<String, Object> bootstrap() { return Map.of("stage", "M5", "settings", settings.view(), "telegram", telegram.status(), "diagnostics", diagnostics(), "transferPreferences", preferences == null ? new TransferPreferences.View("",1) : preferences.view()); }
     @GetMapping("/settings") public SettingsService.SettingsView settings() { return settings.view(); }
     @PutMapping("/settings") public SettingsService.SettingsView save(@RequestBody SettingsService.SettingsUpdate update) {
         if (telegram.isActive()) throw new IllegalArgumentException("请先断开 Telegram，再修改连接设置");
@@ -39,7 +52,8 @@ public class WorkbenchController {
                 "architecture", System.getProperty("os.arch"), "dataDirectory", paths.root().toString(), "database", database.diagnostics(), "dpapi", "Windows CurrentUser（API Hash、代理密码、TDLib 密钥）");
     }
     @PostMapping("/app/exit") public Map<String, String> exit() {
-        Thread.ofPlatform().name("workbench-exit").start(() -> {
+        if (tray != null) tray.requestExit();
+        else if (exitRequested.compareAndSet(false, true)) Thread.ofPlatform().name("workbench-exit").start(() -> {
             try { Thread.sleep(500); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
             context.close();
         });

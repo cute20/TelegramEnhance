@@ -26,14 +26,14 @@ function mount(t,initialProps={}){
 test('readonly rule channel browsing preserves filters, reads at most ten steps and cannot prepare a batch',async t=>{
   const f=mount(t,{readOnly:true,initialSource:{source:'-1001',tags:'旅行',keywords:''}});await flush()
   assert.equal(f.calls.length,0);assert.equal(f.state.tags.value,'旅行')
-  f.expect('/transfers/download/channels/preview',{...initial(),tags:['旅行']},'POST',{source:'-1001',tags:'旅行',keywords:''})
+  f.expect('/transfers/download/channels/preview',{...initial(),tags:['旅行']},'POST',{source:'-1001',tags:'旅行',keywords:'',startDate:null,endDate:null})
   for(let n=1;n<=10;n++)f.expect('/transfers/download/channels/preview/'+ID+'/next',{...progress(n,false),tags:['旅行'],rows:progress(n,false).rows.map(r=>({...r,post:{...r.post,mainCoverage:'COMPLETE'}}))},'POST',{revision:n})
   f.mounted();await flush();await flush()
   assert.equal(f.calls.length,11);assert.equal(f.state.scan.value.scanned,10);assert.equal(f.state.running.value,false)
   f.state.selectPost(f.state.scan.value.rows[0]);f.state.selectBatch();assert.deepEqual(f.state.selectedPosts.value,[])
   assert.ok(f.calls.every(call=>call.path.includes('/preview')));assert.match(f.state.notice.value,/继续浏览/)
 })
-function prepare(f,result=progress(1)){f.state.source.value='-1001';f.expect('/transfers/download/channels/preview',initial(),'POST',{source:'-1001',tags:'',keywords:''});f.expect('/transfers/download/channels/preview/'+ID+'/next',result,'POST',{revision:1})}
+function prepare(f,result=progress(1)){f.state.source.value='-1001';f.expect('/transfers/download/channels/preview',initial(),'POST',{source:'-1001',tags:'',keywords:'',startDate:null,endDate:null});f.expect('/transfers/download/channels/preview/'+ID+'/next',result,'POST',{revision:1})}
 test('hidden channel mode does not make reads and only explicit mode activation loads readable sources',async t=>{const f=mount(t,{active:false});await flush();assert.equal(f.calls.length,0);f.expect('/transfers/download/channels',listing(),'GET');f.props.active=true;await flush();assert.equal(f.calls.length,1)})
 test('channel scan uses only preview APIs and never imports a post or starts a transfer',async t=>{const f=mount(t);await flush();prepare(f);await f.state.begin();assert.equal(f.state.scan.value.exhausted,true);assert.equal(f.state.scan.value.scanned,1);assert.equal(f.state.scan.value.rows[0].comments,'NOT_READ');assert.equal(f.calls.length,3);assert.equal(f.calls.some(c=>c.path.includes('/tasks')||c.path.includes('/library')),false)})
 test('stop accepts the current readonly step but never starts another until explicitly continued',async t=>{const f=mount(t);await flush();let release;prepare(f,new Promise(r=>release=r));const pending=f.state.begin();await flush();f.state.stop();release(progress(1,false));await pending;assert.equal(f.state.scan.value.scanned,1);assert.equal(f.state.running.value,false);assert.equal(f.calls.length,3);f.expect('/transfers/download/channels/preview/'+ID+'/next',progress(2),'POST',{revision:2});await f.state.continueScan();assert.equal(f.state.scan.value.rows.length,2)})
@@ -74,8 +74,41 @@ test('scan summary distinguishes excluded posts and unverified albums from actua
   assert.equal(f.state.excludedCount.value,199);assert.match(f.state.filterSummary.value,/标签：旅行；关键词：周末/);assert.equal(f.state.hasFilters.value,true);assert.equal(f.calls.length,1)
 })
 
-test('batch selection only uses verified matches, caps at20 and respects a pending batch lock',async t=>{
+test('batch selection only uses verified matches, has no business count cap and respects a pending batch lock',async t=>{
   const f=mount(t);await flush();f.state.source.value='-1001';const value=progress(25);value.rows.forEach(row=>row.post.mainCoverage='COMPLETE');value.rows[0].match='UNVERIFIED';value.rows[1].post.mainCoverage='PARTIAL';f.state.scan.value=value
-  f.state.selectPost(value.rows[0]);f.state.selectPost(value.rows[1]);assert.deepEqual(f.state.selectedPosts.value,[]);f.state.selectBatch();assert.equal(f.state.selectedPosts.value.length,20);assert.equal(f.state.selectedPosts.value.includes(value.rows[0].post.key),false)
-  f.state.lockBatch(true);f.state.selectPost(value.rows[2]);await f.state.begin();assert.equal(f.state.selectedPosts.value.length,20);assert.equal(f.calls.length,1);f.state.lockBatch(false);f.state.selectPost(value.rows[2]);assert.equal(f.state.selectedPosts.value.length,19)
+  f.state.selectPost(value.rows[0]);f.state.selectPost(value.rows[1]);assert.deepEqual(f.state.selectedPosts.value,[]);f.state.selectBatch();assert.equal(f.state.selectedPosts.value.length,23);assert.equal(f.state.selectedPosts.value.includes(value.rows[0].post.key),false)
+  f.state.lockBatch(true);f.state.selectPost(value.rows[2]);await f.state.begin();assert.equal(f.state.selectedPosts.value.length,23);assert.equal(f.calls.length,1);f.state.lockBatch(false);f.state.selectPost(value.rows[2]);assert.equal(f.state.selectedPosts.value.length,22)
+})
+
+test('ordinary channel scanning crosses 200 steps and twenty minutes without stopping or truncating posts',async t=>{
+  const f=mount(t);await flush();let time=0;t.mock.method(Date,'now',()=>time+=60000)
+  f.state.source.value='-1001';f.expect('/transfers/download/channels/preview',initial())
+  for(let n=1;n<=205;n++)f.expect('/transfers/download/channels/preview/'+ID+'/next',{
+    ...progress(n,n===205),rows:Array.from({length:n},(_,i)=>({...row(10000-i),post:{...row(10000-i).post,mainCoverage:'COMPLETE'}})),
+  },'POST',{revision:n})
+  await f.state.begin();assert.equal(f.state.scan.value.scanned,205);assert.equal(f.state.scan.value.exhausted,true)
+  assert.equal(f.calls.length,207);f.state.selectBatch();assert.equal(f.state.selectedPosts.value.length,205)
+  assert.equal(f.state.notice.value,'');assert.ok(f.calls.every(call=>!call.path.includes('/tasks')))
+})
+
+test('date bounds are normalized in the initial request and frozen throughout every scan receipt',async t=>{
+  const f=mount(t);await flush();f.state.source.value='-1001';f.state.startDate.value='2024-02-29';f.state.endDate.value='2024-03-01'
+  const dates={startDate:'2024-02-29',endDate:'2024-03-01'}
+  f.expect('/transfers/download/channels/preview',{...initial(),...dates},'POST',{source:'-1001',tags:'',keywords:'',...dates})
+  f.expect('/transfers/download/channels/preview/'+ID+'/next',{...progress(1),...dates},'POST',{revision:1})
+  await f.state.begin();assert.equal(f.state.scan.value.startDate,dates.startDate);assert.match(f.state.filterSummary.value,/2024-02-29.*2024-03-01.*北京时间/)
+  assert.equal(channels.validChannelScan({...progress(2),...dates,endDate:null},'1',f.state.scan.value,true),false)
+  f.state.source.value='-2002';assert.equal(f.state.startDate.value,dates.startDate);assert.equal(f.state.endDate.value,dates.endDate)
+  assert.equal(f.state.scan.value,null);assert.equal(f.state.hasFilters.value,true)
+})
+
+test('invalid or reversed date ranges make no scan request and a missing date receipt never discards requested dates',async t=>{
+  const f=mount(t);await flush();f.state.source.value='-1001';f.state.startDate.value='2025-02-29'
+  await f.state.begin();assert.equal(f.calls.length,1);assert.match(f.state.error.value,/有效/)
+  f.state.startDate.value='2024-04-02';f.state.endDate.value='2024-04-01';await f.state.begin();assert.equal(f.calls.length,1);assert.match(f.state.error.value,/不能晚于/)
+  f.state.endDate.value='';f.expect('/transfers/download/channels/preview',initial());await f.state.begin()
+  assert.equal(f.calls.length,2);assert.equal(f.state.scan.value,null);assert.match(f.state.error.value,/发布时间筛选/)
+  for(const date of ['2025-02-29','2024-13-01','2024-04-31','2024-2-01','2024-01-01T00:00:00Z',''])assert.equal(channels.validChannelScan({...initial(),startDate:date},'1'),false,date)
+  assert.equal(channels.validChannelScan({...initial(),startDate:'0000-02-29',endDate:'9999-12-31'},'1'),true)
+  assert.equal(channels.validChannelScan({...initial(),startDate:'2024-04-02',endDate:'2024-04-01'},'1'),false)
 })

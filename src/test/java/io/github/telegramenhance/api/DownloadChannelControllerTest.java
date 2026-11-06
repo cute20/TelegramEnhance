@@ -8,6 +8,14 @@ import java.util.concurrent.CompletableFuture;
 import org.junit.jupiter.api.Test;
 import org.springframework.test.web.servlet.setup.MockMvcBuilders;
 class DownloadChannelControllerTest{
+    @Test void advancedPublicationDatesReachThePreviewContractWithoutChangingLegacyRoutes()throws Exception{
+        var service=mock(DownloadChannelService.class);var input=new Input("@synthetic","旅行","周末","2026-11-01","2026-11-02");when(service.start(input)).thenReturn(CompletableFuture.completedFuture(null));
+        var mvc=MockMvcBuilders.standaloneSetup(new DownloadChannelController(service)).setControllerAdvice(new ApiErrors()).build();
+        var response=mvc.perform(post("/api/transfers/download/channels/preview").contentType("application/json").content("""
+                {"source":"@synthetic","tags":"旅行","keywords":"周末","startDate":"2026-11-01","endDate":"2026-11-02"}
+                """)).andExpect(request().asyncStarted()).andReturn();
+        mvc.perform(asyncDispatch(response)).andExpect(status().isOk());verify(service).start(input);
+    }
     @Test void routesOnlyUseIndependentPreviewServiceAndRevisionIsExplicit()throws Exception{
         var service=mock(DownloadChannelService.class);var input=new Input("@synthetic","旅行","周末");when(service.start(input)).thenReturn(CompletableFuture.completedFuture(null));when(service.next("id",new Position(1))).thenReturn(CompletableFuture.completedFuture(null));var mvc=MockMvcBuilders.standaloneSetup(new DownloadChannelController(service)).setControllerAdvice(new ApiErrors()).build();
         var request=mvc.perform(post("/api/transfers/download/channels/preview").contentType("application/json").content("{\"source\":\"@synthetic\",\"tags\":\"旅行\",\"keywords\":\"周末\"}")).andExpect(request().asyncStarted()).andReturn();mvc.perform(asyncDispatch(request)).andExpect(status().isOk());verify(service).start(input);

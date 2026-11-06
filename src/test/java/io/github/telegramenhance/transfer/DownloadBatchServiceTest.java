@@ -19,6 +19,12 @@ import org.junit.jupiter.api.io.TempDir;
 
 class DownloadBatchServiceTest{
     @TempDir Path directory;
+    @Test void pausingMediaPreparationFinishesTheCurrentStepAndResumesTheSameFrozenPosition()throws Exception{try(var f=new Fixture()){
+        var history=new ScanTaskStore(f.db,f.telegram,f.clock::get);f.service.trackScans(history);var initial=f.start();String historyId=history.list().getFirst().id();var once=new java.util.concurrent.atomic.AtomicBoolean();
+        doAnswer(call->{((Runnable)call.getArgument(3)).run();if(once.compareAndSet(false,true))assertEquals("PAUSING",history.action(historyId,"pause").state());return f.posts.stream().filter(post->post.mainMessageId().equals(call.getArgument(1))).findFirst().orElseThrow();}).when(f.reader).downloadChannelPost(anyString(),anyString(),anyLong(),any());
+        var checkpoint=f.step(initial);assertEquals(2,checkpoint.revision());assertEquals("PAUSED",history.list().getFirst().state());assertThrows(ScanTaskStore.Paused.class,()->f.service.next(checkpoint.id(),new Position(checkpoint.revision())));
+        f.clock.addAndGet(900000);assertEquals(checkpoint.revision(),f.service.get(checkpoint.id()).revision());history.action(historyId,"resume");var resumed=f.service.get(checkpoint.id());assertEquals(checkpoint.revision(),resumed.revision());assertTrue(resumed.expiresAt()>f.clock.get());assertTrue(f.finish(resumed).exhausted());assertEquals("COMPLETED",history.list().getFirst().state());
+    }}
     static Post post(int id){return new Post("1:-1001:"+id,"1","-1001","channel",String.valueOf(id),"post "+id,"#旅行 body","0",List.of(new MessageRef("-1001",String.valueOf(id),"https://t.me/synthetic/"+id)),List.of(media(id,true)),"-2001","5"+id,List.of(new MessageRef("-2001","5"+id,"")),true,"PARTIAL",List.of(),new AlbumEvidence(true,"test","1","2"),"COMPLETE");}
     static Media media(int id,boolean main){String chat=main?"-1001":"-2001";return new Media("1:"+chat+":"+id+":0",new MessageRef(chat,String.valueOf(id),"https://t.me/synthetic/"+id),main?"MAIN":"COMMENT","DOCUMENT","file-"+id+".txt",37,"");}
     static Page page(Post p,int id,boolean eof){var media=eof?List.<Media>of():List.of(media(id,false));var refs=media.stream().map(Media::message).toList();return new Page(p.key(),media,refs,refs.size(),String.valueOf(id),eof,eof?"COMPLETE":"PARTIAL",List.of());}
@@ -49,6 +55,14 @@ class DownloadBatchServiceTest{
         var request=new Create(UUID.randomUUID().toString(),v.id(),v.revision());var receipt=f.service.create(request);assertEquals(2,receipt.taskIds().size());assertEquals(2,f.repository.list("1",50,0).size());assertFalse(Files.exists(f.output));
         f.clock.addAndGet(600001);assertEquals(receipt,f.service.create(request));assertEquals(receipt,f.service.lookup(request.operationId()).batch());assertNull(f.repository.batchByOperation("2",request.operationId(),null));
         assertThrows(IllegalArgumentException.class,()->f.service.create(new Create(request.operationId(),request.previewId(),request.revision()+1)));
+    }}
+    @Test void anExpiredUncommittedPlanIsAnExplicitCreationRejection()throws Exception{try(var f=new Fixture()){
+        var view=f.finish(f.start());
+        var input=new Create(UUID.randomUUID().toString(),view.id(),view.revision());
+        f.clock.addAndGet(600001);
+        assertThrows(CreationRejectedException.class,()->f.service.create(input));
+        assertNull(f.service.lookup(input.operationId()).batch());
+        assertTrue(f.repository.list("1",50,0).isEmpty());
     }}
     @Test void emptyNonEofPagesAndMainAttachmentsDoNotFinishTheCommentRange()throws Exception{try(var f=new Fixture()){
         var p=f.posts.getFirst();f.pages.put(p.key(),new ArrayDeque<>(List.of(new Page(p.key(),List.of(),List.of(),0,"9000",false,"PARTIAL",List.of()),page(p,8999,true))));
@@ -90,9 +104,48 @@ class DownloadBatchServiceTest{
         var p=f.posts.getFirst();f.pages.put(p.key(),new ArrayDeque<>(List.of(many(p,10000,50),many(p,9950,50),many(p,9900,1),page(p,9899,true))));var second=f.posts.get(1);f.pages.put(second.key(),new ArrayDeque<>(List.of(page(second,8999,true))));
         var v=f.finish(f.start());assertEquals(101,v.total());var receipt=f.service.create(new Create(UUID.randomUUID().toString(),v.id(),v.revision()));assertEquals(2,receipt.taskIds().size());assertEquals(List.of(100,1),receipt.taskIds().stream().map(id->f.repository.task("1",id).items().size()).toList());assertTrue(receipt.taskIds().stream().allMatch(id->f.repository.task("1",id).duplicatePolicy().equals(DownloadModels.KEEP_DUPLICATES)));assertFalse(Files.exists(f.output));
     }}
-    @Test void reaching1000MediaDoesNotSilentlyTruncateOrPermitAnIncompleteBatch()throws Exception{try(var f=new Fixture()){
-        var p=f.posts.getFirst();var pages=new ArrayDeque<Page>();for(int n=0;n<21;n++)pages.add(many(p,10000-50*n,50));f.pages.put(p.key(),pages);var v=f.step(f.start());for(int n=0;n<20;n++)v=f.step(v);assertEquals(1000,v.total());String id=v.id();long revision=v.revision();assertThrows(ExecutionException.class,()->f.service.next(id,new Position(revision)).get());assertEquals(1000,f.service.get(id).total());assertFalse(f.service.get(id).exhausted());assertThrows(IllegalArgumentException.class,()->f.service.create(new Create(UUID.randomUUID().toString(),id,revision)));assertTrue(f.repository.list("1",50,0).isEmpty());
+    @Test void moreThan1000MediaArePreparedAndPersistedWithoutTruncatingTheLastPage()throws Exception{try(var f=new Fixture()){
+        var p=f.posts.getFirst();var pages=new ArrayDeque<Page>();for(int n=0;n<21;n++)pages.add(many(p,10000-50*n,50));pages.add(page(p,8949,true));f.pages.put(p.key(),pages);
+        var second=f.posts.get(1);f.pages.put(second.key(),new ArrayDeque<>(List.of(page(second,8999,true))));var v=f.start();while(v.canContinue())v=f.step(v);
+        assertEquals(1050,v.total());assertEquals(1050*37L,v.totalBytes());assertTrue(v.exhausted());
+        var request=new Create(UUID.randomUUID().toString(),v.id(),v.revision());var receipt=f.service.create(request);assertEquals(11,receipt.taskIds().size());
+        assertEquals(1050,f.repository.batchStatus("1",receipt.id()).snapshot().total());assertEquals(1050,receipt.taskIds().stream().mapToInt(id->f.repository.task("1",id).items().size()).sum());assertEquals(receipt,f.service.create(request));
     }}
+    @Test void moreThan20PostsAnd29ChildrenUseTheSameAtomicBatchReceipt()throws Exception{try(var f=new Fixture()){
+        var selected=java.util.stream.IntStream.range(0,31).mapToObj(i->post(100-i)).toList();
+        var rows=selected.stream().map(p->new DownloadChannelModels.Row(p,"MATCH",p.mainMessages().getFirst().link(),"NOT_READ")).toList();
+        when(f.scans.selection(anyString(),anyLong(),anyList())).thenReturn(new DownloadChannelModels.View(f.scanId,"1",new ManagedChannel("-1001","channel"),List.of("旅行"),List.of(),3,31,31,0,rows,true,false,false,false,null,List.of(),1,600001));
+        doAnswer(i->{((Runnable)i.getArgument(3)).run();return selected.stream().filter(p->p.mainMessageId().equals(i.getArgument(1))).findFirst().orElseThrow();}).when(f.reader).downloadChannelPost(anyString(),anyString(),anyLong(),any());
+        for(int n=0;n<selected.size();n++){var p=selected.get(n);int newest=100000-n*1000;f.pages.put(p.key(),new ArrayDeque<>(List.of(many(p,newest,35),page(p,newest-35,true))));}
+        var input=f.input(false);var v=f.service.start(new Input(input.scanId(),input.revision(),selected.stream().map(Post::key).toList(),input.types(),false,input.targetDirectory()));
+        while(v.canContinue())v=f.step(v);assertEquals(31,v.posts().size());assertEquals(1085,v.total());
+        var receipt=f.service.create(new Create(UUID.randomUUID().toString(),v.id(),v.revision()));assertEquals(31,receipt.taskIds().size());assertEquals(31,receipt.snapshot().postCount());
+        var status=f.repository.batchStatus("1",receipt.id());assertEquals(31,status.totalTasks());assertEquals(1085,status.snapshot().total());assertEquals("QUEUED",status.state());
+        assertEquals(31,f.repository.pauseBatch("1",receipt.id()).pausedTasks());assertEquals(31,f.repository.resumeBatch("1",receipt.id()).queuedTasks());
+    }}
+    @Test void moreThan2000PreparationStepsRemainBoundedAndCanReachTheRealCommentBoundary()throws Exception{try(var f=new Fixture()){
+        var p=f.posts.getFirst();var pages=new ArrayDeque<Page>();for(int n=0;n<2001;n++)pages.add(new Page(p.key(),List.of(),List.of(),0,String.valueOf(10000-n),false,"PARTIAL",List.of()));pages.add(page(p,7998,true));f.pages.put(p.key(),pages);
+        var second=f.posts.get(1);f.pages.put(second.key(),new ArrayDeque<>(List.of(page(second,8999,true))));
+        var v=f.service.start(f.input(true));for(int n=0;n<2002;n++)v=f.step(v);assertTrue(v.canContinue());assertFalse(v.exhausted());assertNull(v.error());
+        while(v.canContinue())v=f.step(v);assertEquals(2,v.total());assertTrue(v.exhausted());assertEquals(2,f.service.create(new Create(UUID.randomUUID().toString(),v.id(),v.revision())).taskIds().size());
+    }}
+    @Test void datesAreFrozenFromTheScanIntoPreparationAndTheDurableReceipt()throws Exception{try(var f=new Fixture()){
+        long stamp=java.time.Instant.parse("2026-11-01T00:00:00Z").toEpochMilli();var selected=f.posts.stream().map(post->post.withPublishedAt(stamp)).toList();var rows=selected.stream().map(p->new DownloadChannelModels.Row(p,"MATCH",p.mainMessages().getFirst().link(),"NOT_READ")).toList();
+        when(f.scans.selection(anyString(),anyLong(),anyList())).thenReturn(new DownloadChannelModels.View(f.scanId,"1",new ManagedChannel("-1001","channel"),List.of("旅行"),List.of(),3,2,2,0,rows,true,false,false,false,null,List.of(),1,600001,"2026-11-01","2026-11-01"));
+        doAnswer(i->{((Runnable)i.getArgument(3)).run();return selected.stream().filter(p->p.mainMessageId().equals(i.getArgument(1))).findFirst().orElseThrow();}).when(f.reader).downloadChannelPost(anyString(),anyString(),anyLong(),any());
+        var v=f.finish(f.start());assertEquals("2026-11-01",v.startDate());assertEquals("2026-11-01",f.service.get(v.id()).endDate());
+        var receipt=f.service.create(new Create(UUID.randomUUID().toString(),v.id(),v.revision()));assertEquals("2026-11-01",receipt.snapshot().startDate());assertEquals("2026-11-01",f.repository.batchStatus("1",receipt.id()).snapshot().endDate());
+    }}
+    @Test void anUnknownOrChangedPublicationTimeCannotReuseADateFilteredSelection()throws Exception{
+        for(Long refreshed:Arrays.asList(null,java.time.Instant.parse("2026-11-01T00:00:01Z").toEpochMilli(),java.time.Instant.parse("2026-11-02T00:00:00Z").toEpochMilli()))try(var f=new Fixture()){
+            var selected=f.posts.getFirst().withPublishedAt(java.time.Instant.parse("2026-11-01T00:00:00Z").toEpochMilli());
+            var row=new DownloadChannelModels.Row(selected,"MATCH",selected.mainMessages().getFirst().link(),"NOT_READ");
+            when(f.scans.selection(anyString(),anyLong(),anyList())).thenReturn(new DownloadChannelModels.View(f.scanId,"1",new ManagedChannel("-1001","channel"),List.of("旅行"),List.of(),3,1,1,0,List.of(row),true,false,false,false,null,List.of(),1,600001,"2026-11-01","2026-11-01"));
+            doReturn(selected.withPublishedAt(refreshed)).when(f.reader).downloadChannelPost(anyString(),anyString(),anyLong(),any());
+            var original=f.input(false);var v=f.service.start(new Input(original.scanId(),original.revision(),List.of(selected.key()),original.types(),false,original.targetDirectory()));
+            assertThrows(ExecutionException.class,()->f.service.next(v.id(),new Position(v.revision())).get());assertEquals(v.revision(),f.service.get(v.id()).revision());verifyNoInteractions(f.files);assertTrue(f.repository.list("1",50,0).isEmpty());
+        }
+    }
     @Test void previewCapacityAndQueueRejectionNeverLeaveTheBusyFlagStuck(){try(var f=new Fixture()){
         var oldest=f.start();for(int i=0;i<4;i++)f.start();assertThrows(IllegalArgumentException.class,()->f.service.get(oldest.id()));var current=f.start();doThrow(new IllegalArgumentException("queue full")).when(f.work).readWork(any());assertThrows(IllegalArgumentException.class,()->f.service.next(current.id(),new Position(1)));assertFalse(f.service.get(current.id()).busy());verifyNoInteractions(f.reader,f.files);
     }}

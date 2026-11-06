@@ -31,7 +31,33 @@ class AutoUploadRuleTest{
     static Window night(){return new Window("WINDOW","22:00","08:00","Asia/Shanghai");}
     @Test void oldJsonDefaultsToObservationAndAutoRequiresARealBoundPreviewBeforeEnable()throws Exception{try(var f=new Fixture(all())){
         String old="{\"name\":\"old\",\"link\":\"https://t.me/synthetic/1\",\"sourceDirectory\":\"source\",\"archiveDirectory\":\"archive\",\"recursive\":true,\"captionMode\":\"FILENAME\",\"window\":{\"mode\":\"ALL_DAY\",\"timezone\":\"Asia/Shanghai\"}}";
-        assertEquals("OBSERVE_ONLY",JsonMapper.builder().build().readValue(old,Input.class).executionMode());assertFalse(f.rule().enabled());assertThrows(IllegalArgumentException.class,()->f.service.toggle(f.id,new RuleService.Toggle(f.rule().revision(),true)));assertEquals(0,f.tasks().size());assertFalse(Files.exists(f.archive));
+        var legacy=JsonMapper.builder().build().readValue(old,Input.class);assertEquals("OBSERVE_ONLY",legacy.executionMode());assertEquals(10,legacy.albumSize());assertFalse(f.rule().enabled());assertThrows(IllegalArgumentException.class,()->f.service.toggle(f.id,new RuleService.Toggle(f.rule().revision(),true)));assertEquals(0,f.tasks().size());assertFalse(Files.exists(f.archive));
+    }}
+    @Test void selectedAlbumSizeSurvivesRuleVersionsPreviewAndAutomaticTaskPersistence()throws Exception{
+        for(int size:List.of(1,3))try(var f=new Fixture(all())){
+            for(int n=1;n<=7;n++)f.file(n+".txt","document-"+n,0);
+            var selected=new Input("custom grouping",LINK,f.source.toString(),f.archive.toString(),true,"FILENAME",all(),"AUTO_UPLOAD",size);
+            f.service.update(f.id,new RuleService.Update(f.rule().revision(),selected));
+            assertEquals(size,f.rule().input().albumSize());assertEquals(10,f.service.versions(f.id).getLast().input().albumSize());
+            assertEquals(size,f.service.versions(f.id).getFirst().input().albumSize());
+            var preview=f.service.preview(f.id,new RuleService.Position(f.rule().revision())).get().preview();
+            assertEquals(size,preview.albumSize());assertTrue(preview.groups().stream().allMatch(g->g.files().size()<=size));
+            f.enable();f.tick();var task=f.tasks().getFirst();
+            assertEquals(size,task.prepared().input().albumSize());assertEquals(size,task.groups().getFirst().items().size());
+            assertEquals(size==1?"SINGLE":"ALBUM",task.groups().getFirst().mode());
+            assertEquals(java.util.stream.IntStream.rangeClosed(1,size).mapToObj(n->n+".txt").toList(),task.groups().getFirst().items().stream().map(i->i.file().relativePath()).toList());
+            var persisted=new UploadRepository(f.db,f.policy).task("1",task.id());assertEquals(task.prepared(),persisted.prepared());assertFalse(Files.exists(f.archive));
+        }
+    }
+    @Test void legacyRuleCreationReceiptsStillMatchTheDefaultAfterAddingAlbumSize()throws Exception{try(var f=new Fixture(all())){
+        String operation=f.db.read(c->{try(var q=c.createStatement();var r=q.executeQuery("SELECT create_operation FROM auto_rules")){r.next();return r.getString(1);}});
+        f.db.write(c->{try(var q=c.createStatement()){q.execute("UPDATE auto_rules SET create_fingerprint=json_remove(create_fingerprint,'$.albumSize')");q.execute("UPDATE auto_rule_versions SET config_json=json_remove(config_json,'$.albumSize')");}return null;});
+        var existing=f.rule();assertEquals(10,existing.input().albumSize());
+        assertEquals(existing.id(),f.rules.create("1",operation,existing.input(),f.clock.millis()).id());assertEquals(1,f.count("auto_rules"));
+        var changed=new Input("old name",LINK,f.source.toString(),f.archive.toString(),true,"FILENAME",all(),"AUTO_UPLOAD",3);
+        assertThrows(IllegalArgumentException.class,()->f.rules.create("1",operation,changed,f.clock.millis()));
+        assertThrows(IllegalArgumentException.class,()->new Input("invalid",LINK,"source","archive",true,"FILENAME",all(),"AUTO_UPLOAD",0));
+        assertThrows(IllegalArgumentException.class,()->new Input("invalid",LINK,"source","archive",true,"FILENAME",all(),"AUTO_UPLOAD",11));
     }}
     @Test void disabledAutoRuleNeverProducesAndManualObserveAndPreviewNeverCreateTasks()throws Exception{try(var f=new Fixture(all())){
         f.file("one.txt","one",0);f.service.monitorOnce(()->{}).get();f.service.observe(f.id,new RuleService.Position(f.rule().revision())).get();f.service.preview(f.id,new RuleService.Position(f.rule().revision())).get();assertTrue(f.tasks().isEmpty());assertFalse(Files.exists(f.archive));assertEquals(0,f.count("auto_rule_authorizations"));
@@ -98,6 +124,106 @@ class AutoUploadRuleTest{
         var task=f.tasks().getFirst();assertEquals(List.of("1.mp4"),task.groups().getFirst().items().stream().map(i->i.file().relativePath()).toList());
         assertEquals(5*gib,task.groups().getFirst().items().getFirst().file().size());assertFalse(Files.exists(f.archive));
     }}
+    @Test void cancellingAutomaticContentDoesNotReplayItDuringScansRegroupingOrRestart() throws Exception {
+        try (var f = new Fixture(all())) {
+            f.file("1.txt", "cancelled content", 0); f.enable(); f.tick();
+            var first = f.tasks().getFirst(); cancelThroughTaskService(f, first.id());
+            assertEquals(0, f.count("upload_claims"));
+            assertFalse(f.uploads.view(f.uploads.task("1", first.id())).automation().manualTakeover());
+            f.clock.advance(31); f.tick();
+            assertEquals(1, f.tasks().size()); assertEquals("IDLE", f.rule().observation().upload().state());
+            // A different natural-order group must not bring the cancelled member back.
+            f.file("2.txt", "new content", 0); f.clock.advance(31); f.tick();
+            var second = f.tasks().stream().filter(task -> !task.id().equals(first.id())).findFirst().orElseThrow();
+            assertEquals(List.of("2.txt"), second.groups().getFirst().items().stream().map(item -> item.file().relativePath()).toList());
+            cancelThroughTaskService(f, second.id());
+            new UploadRepository(f.db, f.policy);
+            f.clock.advance(31); f.tick();
+            assertEquals(2, f.tasks().size()); assertTrue(f.tasks().stream().allMatch(task -> task.state().equals("CANCELLED")));
+            assertTrue(Files.exists(f.source.resolve("1.txt"))); assertFalse(Files.exists(f.archive));
+        }
+    }
+    @Test void explicitPreviewAndReenableCanCreateANewTaskForTheSameCancelledFiles() throws Exception {
+        try (var f = new Fixture(all())) {
+            f.file("1.txt", "same content", 0); f.enable(); f.tick();
+            var first = f.tasks().getFirst(); long version = f.rule().version();
+            cancelThroughTaskService(f, first.id());
+            f.service.toggle(f.id, new RuleService.Toggle(f.rule().revision(), false)); f.enable(); f.tick();
+            assertEquals(version, f.rule().version()); assertEquals(2, f.tasks().size());
+            var next = f.tasks().stream().filter(task -> !task.id().equals(first.id())).findFirst().orElseThrow();
+            assertEquals("QUEUED", next.state()); assertNotEquals(first.operationId(), next.operationId());
+            assertEquals(first.prepared().scan().files(), next.prepared().scan().files());
+            assertEquals("CANCELLED", f.uploads.task("1", first.id()).state());
+            assertEquals(1, f.count("upload_claims"));
+            f.clock.advance(31); f.tick(); assertEquals(2, f.tasks().size());
+        }
+    }
+    @Test void legacyCancelledOperationsStaySuppressedUntilAnEnableAfterCancellation() throws Exception {
+        try (var f = new Fixture(all())) {
+            f.file("legacy.txt", "legacy content", 0); f.enable();
+            var scan = f.scan(); var rule = f.rule();
+            var prepared = new UploadPreviewService.Prepared(rule.input().uploadInput(), f.target, scan, UploadPreviewService.groups(scan.files(), "FILENAME"));
+            var mapper = JsonMapper.builder().build();
+            String fingerprint = DownloadPaths.hash(rule.id()+":"+rule.version()+":"+mapper.writeValueAsString(rule.input())+":"+UploadRepository.targetKey(f.target.post())+":"+mapper.writeValueAsString(scan.files()));
+            String operation = UUID.nameUUIDFromBytes(("auto-upload:"+fingerprint).getBytes(java.nio.charset.StandardCharsets.UTF_8)).toString();
+            var legacy = f.uploads.create("1", operation, fingerprint, prepared, rule);
+            cancelThroughTaskService(f, legacy.id());
+            // Simulate an already-cancelled task upgraded from before cancellation revisions existed.
+            f.db.write(c -> { try (var q = c.prepareStatement("UPDATE auto_upload_bindings SET pause_kind=NULL WHERE task_id=?")) {
+                q.setString(1, legacy.id()); q.executeUpdate();
+            } return null; });
+            new UploadRepository(f.db, f.policy);
+            f.clock.advance(31); f.tick(); assertEquals(1, f.tasks().size());
+            f.service.toggle(f.id, new RuleService.Toggle(f.rule().revision(), false));
+            f.clock.now = Instant.ofEpochMilli(f.uploads.task("1", legacy.id()).updatedAt()+1);
+            var preview = f.service.preview(f.id, new RuleService.Position(f.rule().revision())).get(10, TimeUnit.SECONDS);
+            f.service.toggle(f.id, new RuleService.Toggle(f.rule().revision(), true, preview.preview().id())); f.tick();
+            assertEquals(2, f.tasks().size());
+            assertEquals(1, f.tasks().stream().filter(task -> task.state().equals("QUEUED")).count());
+            assertEquals("CANCELLED", f.uploads.task("1", legacy.id()).state());
+        }
+    }
+    @Test void reenableDoesNotReplaceAnAutomaticTaskWithAnUncertainSend() throws Exception {
+        try (var f = new Fixture(all())) {
+            f.file("one.txt", "uncertain content", 0); f.enable(); f.tick();
+            var task = f.uploads.next("1"); var group = task.groups().getFirst();
+            f.uploads.preparing(task, group);
+            for (var item : group.items()) f.files.stage(task, item, () -> {});
+            task = f.uploads.task("1", task.id()); group = task.groups().getFirst();
+            f.uploads.intent(task, group, "test-native"); f.uploads.dispatch(task, group, "test-native");
+            f.uploads.uncertain(group, "synthetic uncertain send"); f.uploads.state(task, "NEEDS_REVIEW", "synthetic uncertain send");
+            f.service.toggle(f.id, new RuleService.Toggle(f.rule().revision(), false)); f.enable(); f.tick();
+            assertEquals(1, f.tasks().size()); assertEquals("NEEDS_REVIEW", f.tasks().getFirst().state());
+            assertEquals("UNCERTAIN", f.tasks().getFirst().groups().getFirst().state()); assertEquals(1, f.count("upload_claims"));
+            assertTrue(Files.exists(f.source.resolve("one.txt"))); assertFalse(Files.exists(f.archive));
+        }
+    }
+    @Test void cancellingAnOlderTaskAfterReauthorizationSuppressesTheCurrentAuthorizationToo() throws Exception {
+        try (var f = new Fixture(all())) {
+            f.file("one.txt", "reused content", 0); f.enable(); f.tick();
+            var original = f.tasks().getFirst(); long originalRevision = f.rule().revision();
+            f.service.toggle(f.id, new RuleService.Toggle(originalRevision, false)); f.enable(); f.tick();
+            long cancellationRevision = f.rule().revision();
+            assertTrue(cancellationRevision > originalRevision);
+            assertEquals(1, f.tasks().size()); assertEquals(original.id(), f.tasks().getFirst().id());
+            cancelThroughTaskService(f, original.id());
+            assertEquals("CANCELLED_REVISION:"+cancellationRevision, f.policy.pauseKind("1", original.id()));
+            f.clock.advance(31); f.tick(); assertEquals(1, f.tasks().size());
+            assertEquals("IDLE", f.rule().observation().upload().state());
+            // A repeated cancellation must preserve its original epoch, even after another enable.
+            f.service.toggle(f.id, new RuleService.Toggle(f.rule().revision(), false)); f.enable();
+            cancelThroughTaskService(f, original.id());
+            assertEquals("CANCELLED_REVISION:"+cancellationRevision, f.policy.pauseKind("1", original.id()));
+            f.tick(); assertEquals(2, f.tasks().size());
+            assertEquals(1, f.tasks().stream().filter(task -> task.state().equals("QUEUED")).count());
+            assertEquals("CANCELLED", f.uploads.task("1", original.id()).state());
+        }
+    }
+    private void cancelThroughTaskService(Fixture f, String task) {
+        var actions = new UploadTaskService(f.previews, f.uploads, f.telegram, mock(UploadEngine.class), mock(UploadTransport.class), f.reads);
+        if (f.uploads.task("1", task).state().equals("QUEUED")) actions.action(task, "pause");
+        assertEquals("CANCELLED", actions.action(task, "cancel").state());
+    }
     static void until(BooleanSupplier value)throws Exception{long end=System.nanoTime()+TimeUnit.SECONDS.toNanos(6);while(!value.getAsBoolean()&&System.nanoTime()<end)Thread.sleep(20);assertTrue(value.getAsBoolean());}
     static final class MutableClock extends Clock{Instant now=Instant.now();public ZoneId getZone(){return ZoneOffset.UTC;}public Clock withZone(ZoneId z){return this;}public Instant instant(){return now;}void advance(long seconds){now=now.plusSeconds(seconds);}void at(String value){at(value,0);}void at(String value,int days){now=LocalDate.of(2026,10,28).plusDays(days).atTime(LocalTime.parse(value)).atZone(RuleModels.ZONE).toInstant();}}
     final class Fixture implements AutoCloseable{

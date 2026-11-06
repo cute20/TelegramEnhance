@@ -18,7 +18,8 @@ public final class UploadTransport implements AutoCloseable {
     interface Gateway { <R extends TdApi.Object> CompletableFuture<R> call(long session,TdApi.Function<R> query); }
     private final Gateway gateway; private final TelegramService telegram; private final UploadRepository repository;private final UploadFiles files;
     private final UploadRetryRepository retries;
-    private final String run=UUID.randomUUID().toString(); private final AutoCloseable subscription;
+    private final String run=UUID.randomUUID().toString(); private final AutoCloseable subscription,fileSubscription;
+    private final UploadProgress progress=new UploadProgress();
     private final ThreadPoolExecutor receipts=new ThreadPoolExecutor(1,1,0,TimeUnit.MILLISECONDS,new ArrayBlockingQueue<>(128),Thread.ofPlatform().name("upload-receipts").factory());
     private record Active(String account,long session,long group,String chat) { }
     private final AtomicReference<Active> active=new AtomicReference<>(); private volatile boolean lost;
@@ -29,7 +30,8 @@ public final class UploadTransport implements AutoCloseable {
     public UploadTransport(TelegramService telegram,UploadRepository repository,UploadFiles files,UploadRetryRepository retries){this(telegram,repository,files,retries,new Gateway(){public <R extends TdApi.Object>CompletableFuture<R>call(long session,TdApi.Function<R> query){return telegram.readInSession(session,query);}});}
     public UploadTransport(TelegramService telegram,UploadRepository repository,UploadFiles files){this(telegram,repository,files,null,new Gateway(){public <R extends TdApi.Object>CompletableFuture<R>call(long session,TdApi.Function<R> query){return telegram.readInSession(session,query);}});}
     UploadTransport(TelegramService telegram,UploadRepository repository,UploadFiles files,Gateway gateway){this(telegram,repository,files,null,gateway);}
-    UploadTransport(TelegramService telegram,UploadRepository repository,UploadFiles files,UploadRetryRepository retries,Gateway gateway){this.telegram=telegram;this.repository=repository;this.files=files;this.retries=retries;this.gateway=gateway;this.subscription=telegram.observeSends(this::update);}
+    UploadTransport(TelegramService telegram,UploadRepository repository,UploadFiles files,UploadRetryRepository retries,Gateway gateway){this.telegram=telegram;this.repository=repository;this.files=files;this.retries=retries;this.gateway=gateway;this.subscription=telegram.observeSends(this::update);this.fileSubscription=telegram.observeFiles(progress::update);}
+    public Progress progress(Task task,long generation){check(task.accountId(),generation);return progress.snapshot(task,generation);}
     public String owner(long generation){return run+":"+generation;}
     public boolean lostEvidence(){return lost;}
     /** Native FAILED + canRetry is required. Missing/pending/successful messages never become retry candidates. */
@@ -65,6 +67,7 @@ public final class UploadTransport implements AutoCloseable {
             var message=result.messages[0];String id=Long.toString(message.id);var proof=evidence(message,id,message.sendingState==null);var root=task.prepared().target().post().discussionRootMessageId();
             if(message.id==0||id.equals(item.temporaryId())||id.equals(attempt.failedId())||!message.isOutgoing||!context.chat().equals(proof.chatId())||!item.file().mediaType().equals(proof.mediaType())||!item.caption().equals(proof.caption())||!(root.equals(proof.threadId())||root.equals(proof.replyId()))||proof.threadId()!=null&&!root.equals(proof.threadId())||proof.replyId()!=null&&!root.equals(proof.replyId()))throw new IllegalArgumentException("重试回执与原成员不符，需核对");
             retries.bind(attempt,owner(session),id);
+            progress.bind(task.accountId(),session,item,nativeFile(message));
             if(message.sendingState==null)repository.event(group.id(),proof);
             else if(message.sendingState instanceof TdApi.MessageSendingStateFailed){retries.failure(group.id(),failure(message,id));repository.event(group.id(),proof);}
             else if(!(message.sendingState instanceof TdApi.MessageSendingStatePending))throw new IllegalArgumentException("重试状态无法确认");
@@ -87,6 +90,7 @@ public final class UploadTransport implements AutoCloseable {
                 lease=files.lease(List.of(item.staged()),()->{check(task.accountId(),generation);if(System.nanoTime()>=deadline)throw new IllegalArgumentException("核对时间已到，请刷新任务");});
                 var message=call(task.accountId(),generation,new TdApi.GetMessage(Long.parseLong(key.chat()),Long.parseLong(item.temporaryId())));
                 if(!matchesPending(task,group,item,message))continue;
+                progress.bind(task.accountId(),generation,item,nativeFile(message));
                 check(task.accountId(),generation);
                 synchronized(recovered){if(recovered.size()>=128)return bound;var previous=recovered.get(key);if(previous==null){recovered.put(key,new RecoveryBinding(group.id(),System.nanoTime()+TimeUnit.MINUTES.toNanos(20),lease));lease=null;bound++;}else if(previous.group()==group.id())bound++;}
             }catch(java.io.IOException|RuntimeException unavailable){check(task.accountId(),generation);/* Unknown, changed or missing inputs stay unresolved; never resend. */}
@@ -125,6 +129,7 @@ public final class UploadTransport implements AutoCloseable {
             else {var result=call(task.accountId(),generation,new TdApi.SendMessageAlbum(chat,topic,reply,options,content));if(result==null||result.messages==null)throw new IllegalArgumentException("未得到相册初始回执，需核对发送结果");messages=Arrays.asList(result.messages);}
             var initial=new ArrayList<Initial>();for(var message:messages){if(message==null||message.chatId!=chat||!message.isOutgoing)throw new IllegalArgumentException("初始消息身份不符，需核对");boolean pending=message.sendingState instanceof TdApi.MessageSendingStatePending;int sending=pending?((TdApi.MessageSendingStatePending)message.sendingState).sendingId:0;if(!pending&&message.sendingState!=null)throw new IllegalArgumentException("原生发送未确认，请核对");initial.add(new Initial(Long.toString(message.id),sending,pending,evidence(message,Long.toString(message.id),!pending)));}
             repository.initial(task,group,initial);
+            for(int index=0;index<messages.size();index++)progress.bind(task.accountId(),generation,group.items().get(index),nativeFile(messages.get(index)));
         } finally {active.compareAndSet(context,null);}
     }
     private TdApi.InputMessageContent content(Item item){
@@ -170,5 +175,5 @@ public final class UploadTransport implements AutoCloseable {
     private void check(String account,long generation){if(Thread.currentThread().isInterrupted()||!account.equals(telegram.accountId())||generation!=telegram.sessionGeneration())throw new IllegalArgumentException("账号或会话已变化，发送结果需核对");}
     private boolean current(String account,long generation){try{return account.equals(telegram.accountId())&&generation==telegram.sessionGeneration();}catch(RuntimeException unavailable){return false;}}
     private <R extends TdApi.Object>R call(String account,long generation,TdApi.Function<R>query){check(account,generation);try{var result=gateway.call(generation,query).get(16,TimeUnit.SECONDS);check(account,generation);return result;}catch(InterruptedException stopped){Thread.currentThread().interrupt();throw new IllegalArgumentException("发送已中断，需核对，不能直接重发");}catch(ExecutionException|TimeoutException failure){throw new IllegalArgumentException("发送请求结果未确认，请先核对，不能直接重发");}}
-    @Override @PreDestroy public void close(){try{if(subscription!=null)subscription.close();}catch(Exception ignored){}receipts.shutdown();try{if(!receipts.awaitTermination(5,TimeUnit.SECONDS))receipts.shutdownNow();}catch(InterruptedException stopped){Thread.currentThread().interrupt();receipts.shutdownNow();}synchronized(recovered){recovered.values().forEach(b->b.lease().close());recovered.clear();}}
+    @Override @PreDestroy public void close(){try{if(subscription!=null)subscription.close();}catch(Exception ignored){}try{if(fileSubscription!=null)fileSubscription.close();}catch(Exception ignored){}receipts.shutdown();try{if(!receipts.awaitTermination(5,TimeUnit.SECONDS))receipts.shutdownNow();}catch(InterruptedException stopped){Thread.currentThread().interrupt();receipts.shutdownNow();}synchronized(recovered){recovered.values().forEach(b->b.lease().close());recovered.clear();}}
 }

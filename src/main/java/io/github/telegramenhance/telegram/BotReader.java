@@ -2,12 +2,14 @@ package io.github.telegramenhance.telegram;
 
 import io.github.telegramenhance.library.ResourceModels.Media;
 import io.github.telegramenhance.library.ResourceModels.MessageRef;
+import io.github.telegramenhance.transfer.DownloadModels.FrozenFile;
 import it.tdlight.jni.TdApi;
 import java.net.URI;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
@@ -40,8 +42,10 @@ public class BotReader {
         @Override public byte[] data() { return data.clone(); }
         @Override public String toString() { return "BotButton[row=" + row + ", column=" + column + ", type=" + type + "]"; }
     }
-    public record Message(MessageRef ref, String text, List<Media> media, List<Button> buttons) {
-        public Message { media = List.copyOf(media); buttons = List.copyOf(buttons); }
+    public record Message(MessageRef ref, String text, List<Media> media, List<Button> buttons,
+            @com.fasterxml.jackson.annotation.JsonIgnore Map<String,FrozenFile> observedFiles) {
+        public Message(MessageRef ref,String text,List<Media> media,List<Button> buttons){this(ref,text,media,buttons,Map.of());}
+        public Message { media = List.copyOf(media); buttons = List.copyOf(buttons); observedFiles=Map.copyOf(observedFiles); }
         @Override public String toString() { return "BotMessage[redacted]"; }
     }
     public record Snapshot(Target target, List<Message> messages, boolean historyEnd, String nextCursor, String requestBoundary) {
@@ -87,10 +91,12 @@ public class BotReader {
             // Protected and self-destructing content is never offered as a downloadable item.
             var media = message.selfDestructType != null || message.selfDestructIn > 0 || message.ephemeralContent != null
                     ? List.<Media>of() : MediaMapper.map(context.account(), message, "BOT", ref, new ArrayList<>());
+            var observedFiles=new LinkedHashMap<String,FrozenFile>();
+            for(var item:media){var observed=DownloadFileReader.observeBotFile(context.account(),current,message,item);if(observed!=null)observedFiles.put(item.key(),observed);}
             var keyboard = buttonBudget == 0 ? List.<Button>of() : buttons(message);
             if (keyboard.size() > buttonBudget) keyboard = List.copyOf(keyboard.subList(0, buttonBudget));
             buttonBudget -= keyboard.size();
-            messages.put(message.id, new Message(ref, MediaMapper.text(message), media, keyboard));
+            messages.put(message.id, new Message(ref, MediaMapper.text(message), media, keyboard,observedFiles));
         }
         if (history.messages.length > 0 && oldest == Long.MAX_VALUE) throw new IllegalArgumentException("机器人历史游标未前进，请重新读取");
         check(context);

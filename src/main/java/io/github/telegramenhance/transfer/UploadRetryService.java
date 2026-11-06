@@ -43,7 +43,7 @@ public final class UploadRetryService {
         Runnable check=()->{running.run();current(original.accountId(),session);};Group group=original.groups().stream().filter(g->g.id()==attempts.getFirst().groupId()).findFirst().orElseThrow();
         try{
             check.run();var freshTarget=reads.readWork(()->targets.read(original.prepared().input().link(),original.accountId(),session,Set.of(group.mediaType()))).get(100,TimeUnit.SECONDS);
-            if(!original.prepared().target().post().equals(freshTarget.post()))throw new IllegalArgumentException("目标主帖或讨论映射发生变化，请重新核对");
+            if(!original.prepared().target().post().sameContent(freshTarget.post()))throw new IllegalArgumentException("目标主帖或讨论映射发生变化，请重新核对");
             for(var attempt:attempts){check.run();var task=uploads.task(original.accountId(),original.id());var item=find(task,attempt.itemId());if(item.formalId()==null)files.stage(task,item,check);}
             var frozen=uploads.task(original.accountId(),original.id());var staged=attempts.stream().map(a->find(frozen,a.itemId())).filter(i->i.formalId()==null).map(Item::staged).toList();
             try(var lease=files.lease(staged,check)){

@@ -11,6 +11,7 @@ import io.github.telegramenhance.storage.Database;
 import io.github.telegramenhance.telegram.ChannelReader;
 import io.github.telegramenhance.telegram.ResourceReader;
 import io.github.telegramenhance.telegram.TelegramService;
+import io.github.telegramenhance.transfer.ScanTaskStore;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
@@ -24,6 +25,22 @@ import org.junit.jupiter.api.io.TempDir;
 
 class ChannelImportRunServiceTest {
     @TempDir Path directory;
+    @Test void importPauseSavesTheAdmittedBatchAndRequiresResumeBeforeTheSameRevisionContinues()throws Exception{try(var f=fixture()){
+        var history=new ScanTaskStore(f.database,f.telegram);f.service.trackScans(history);var initial=await(f.service.start("-1001",false,null,null));String historyId=history.list().getFirst().id();
+        when(f.channels.historyPage("-1001",null)).thenAnswer(call->{assertEquals("PAUSING",history.action(historyId,"pause").state());return page(List.of(candidate("100",null)),null,true,false);});
+        var checkpoint=f.step(initial);assertEquals(1,checkpoint.revision());assertEquals("PAUSED",history.list().getFirst().state());assertInstanceOf(ScanTaskStore.Paused.class,assertThrows(ExecutionException.class,()->f.step(checkpoint)).getCause());verifyNoInteractions(f.reader);
+        history.action(historyId,"resume");assertEquals(checkpoint,f.service.state("-1001"));verifyNoInteractions(f.reader);var done=f.step(checkpoint);assertEquals("COMPLETE",done.status());assertEquals("COMPLETED",history.list().getFirst().state());verify(f.channels,times(1)).historyPage("-1001",null);
+    }}
+    @Test void restartHistoryCannotResumeFromTheCenterAndAnExplicitOriginalStartReclaimsTheDurableCheckpoint()throws Exception{try(var f=fixture()){
+        var first=new ScanTaskStore(f.database,f.telegram);f.service.trackScans(first);var initial=await(f.service.start("-1001",false,null,null));var old=first.list().getFirst();
+        var restarted=new ScanTaskStore(f.database,f.telegram);f.service.trackScans(restarted);assertEquals("EXPIRED",restarted.list().getFirst().state());assertThrows(IllegalArgumentException.class,()->restarted.action(old.id(),"resume"));
+        assertEquals(initial,f.service.state("-1001"));assertEquals(1,restarted.list().size(),"GET does not claim or resume an old checkpoint");assertThrows(ExecutionException.class,()->f.step(initial));
+        assertEquals(initial,await(f.service.start("-1001",false,null,null)));assertEquals(2,restarted.list().size());verify(f.channels,times(2)).managedChannel("-1001");verify(f.channels,never()).historyPage(anyString(),nullable(String.class));verifyNoInteractions(f.reader);
+    }}
+    @Test void pollingTheOriginalImportStateCannotEraseAFailedStepReceiptWithoutProgress()throws Exception{try(var f=fixture()){
+        var history=new ScanTaskStore(f.database,f.telegram);f.service.trackScans(history);var initial=await(f.service.start("-1001",false,null,null));when(f.channels.historyPage("-1001",null)).thenThrow(new IllegalArgumentException("Synthetic native failure"));assertThrows(ExecutionException.class,()->f.step(initial));
+        var failed=history.list().getFirst();assertEquals("FAILED",failed.state());assertNotNull(failed.error());assertEquals(initial,f.service.state("-1001"));assertEquals(failed,history.list().getFirst(),"GET observes the original checkpoint without rewriting its error history");verify(f.channels,times(1)).historyPage("-1001",null);
+    }}
 
     @Test void explicitStepsFetchOneBatchThenOnePostAtATimeWithoutStartingABackgroundLoop() throws Exception {
         try (Fixture f = fixture()) {
@@ -92,7 +109,7 @@ class ChannelImportRunServiceTest {
                 assertTrue(entered.await(2, TimeUnit.SECONDS));
                 var queued = f.service.step("-1001", start.runId(), start.revision());
                 if (changeAccount) f.account.set("2"); else f.generation.incrementAndGet();
-                release.countDown(); await(blocked); assertThrows(ExecutionException.class, () -> await(queued));
+                release.countDown(); assertThrows(ExecutionException.class, () -> await(blocked)); assertThrows(ExecutionException.class, () -> await(queued));
                 verifyNoInteractions(f.channels, f.reader); assertEquals(start, f.repository.state("1", "-1001"));
             }
         }

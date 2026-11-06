@@ -88,7 +88,7 @@ public class VideoUploadPreparer {
         tick(deadline, bounded);
         var probe = new ArrayList<>(List.of(ffprobe.toString(), "-v", "error", "-protocol_whitelist", "file,pipe",
                 "-format_whitelist", FORMATS, "-threads", "2", "-show_entries",
-                "stream=index,codec_type,codec_name,profile,pix_fmt,width,height,duration:stream_disposition=attached_pic:stream_tags=rotate:stream_side_data=rotation:format=duration,format_name",
+                "stream=index,codec_type,codec_name,profile,pix_fmt,width,height,sample_aspect_ratio,duration:stream_disposition=attached_pic:stream_tags=rotate:stream_side_data=rotation:format=duration,format_name",
                 "-of", "json", input.toString()));
         Metadata metadata = metadata(run(probe, PROBE_LIMIT, deadline, bounded));
         tick(deadline, bounded);
@@ -102,7 +102,7 @@ public class VideoUploadPreparer {
             var command = List.of(ffmpeg.toString(), "-hide_banner", "-loglevel", "error", "-nostdin",
                     "-threads", "2", "-filter_threads", "1", "-protocol_whitelist", "file,pipe", "-format_whitelist", FORMATS,
                     "-ss", String.format(Locale.ROOT, "%.6f", seek), "-i", input.toString(), "-map", "0:" + metadata.streamIndex(),
-                    "-an", "-sn", "-dn", "-frames:v", "1", "-vf", "scale=320:320:force_original_aspect_ratio=decrease,setsar=1",
+                    "-an", "-sn", "-dn", "-frames:v", "1", "-vf", thumbnailFilter(metadata),
                     "-c:v", "mjpeg", "-threads", "2", "-q:v", "5", "-f", "image2pipe", "pipe:1");
             Thumbnail next;
             try { next = thumbnail(run(command, JPEG_LIMIT, deadline, bounded)); }
@@ -151,6 +151,9 @@ public class VideoUploadPreparer {
             int width = video.path("width").asInt(0), height = video.path("height").asInt(0), index = video.path("index").asInt(-1);
             if (width < 1 || height < 1 || width > 32768 || height > 32768 || index < 0 || index > 1023)
                 throw new IOException("无法读取有效的视频尺寸或流编号");
+            // Telegram dimensions and JPEG pixels describe the displayed image, rather than
+            // the encoded samples. Apply SAR before swapping axes for the display matrix.
+            width = displayWidth(width, video.path("sample_aspect_ratio").asText(""));
             double seconds = positiveDouble(video.path("duration"));
             if (!Double.isFinite(seconds)) seconds = positiveDouble(root.path("format").path("duration"));
             if (!Double.isFinite(seconds) || seconds > Integer.MAX_VALUE) throw new IOException("无法读取有效的视频时长");
@@ -168,6 +171,26 @@ public class VideoUploadPreparer {
     private static double positiveDouble(JsonNode value) {
         try { double parsed = Double.parseDouble(value.asText("")); return Double.isFinite(parsed) && parsed > 0 ? parsed : Double.NaN; }
         catch (NumberFormatException invalid) { return Double.NaN; }
+    }
+    private static int displayWidth(int width, String sar) throws IOException {
+        if (sar.isBlank() || sar.equals("N/A") || sar.equals("0:1")) return width;
+        try {
+            String[] parts = sar.split(":", -1);
+            if (parts.length != 2) throw new NumberFormatException();
+            long numerator = Long.parseLong(parts[0]), denominator = Long.parseLong(parts[1]);
+            if (numerator <= 0 || denominator <= 0) throw new NumberFormatException();
+            double displayed = width * ((double) numerator / denominator);
+            if (!Double.isFinite(displayed) || displayed < 1 || displayed > 32768) throw new NumberFormatException();
+            return (int) Math.round(displayed);
+        } catch (NumberFormatException invalid) { throw new IOException("视频像素宽高比无效或显示尺寸超限"); }
+    }
+    private static String thumbnailFilter(Metadata metadata) {
+        double scale = Math.min((double) THUMBNAIL_SIDE / metadata.width(), (double) THUMBNAIL_SIDE / metadata.height());
+        int width = Math.max(1, (int) Math.round(metadata.width() * scale));
+        int height = Math.max(1, (int) Math.round(metadata.height() * scale));
+        // FFmpeg autorotates the decoded frame; size it to the same square-pixel display
+        // geometry as the metadata, including anamorphic videos rotated by 90/270 degrees.
+        return "scale=" + width + ":" + height + ",setsar=1";
     }
     private static int rotation(JsonNode stream) throws IOException {
         Double angle = null;

@@ -6,7 +6,7 @@ import { GROUP_BYTES, byteSplitCounts, byteSplitGroups } from './fixtures/upload
 const clone=value=>JSON.parse(JSON.stringify(value))
 function preview(groups=byteSplitGroups()){
   const files=groups.flatMap(group=>group.files)
-  return{id:'00000000-0000-4000-8000-000000000001',accountId:'1',state:'PREVIEW_ONLY',sourceDirectory:'D:/synthetic-source',archiveDirectory:'D:/synthetic-archive',recursive:true,captionMode:'FILENAME',channelTitle:'Synthetic',postTitle:'Synthetic',postText:'',postLink:'https://t.me/synthetic/1',discussionTitle:'Synthetic',permission:'MEDIA_ALLOWED_AT_CHECK',slowModeSeconds:0,fileCount:files.length,totalBytes:files.reduce((sum,file)=>sum+file.size,0),groups,otherFiles:0,deferredFiles:0,linkedEntries:0,duplicateFiles:0,warnings:[],targetCheckedAt:1,createdAt:1,expiresAt:600001}
+  return{id:'00000000-0000-4000-8000-000000000001',accountId:'1',state:'PREVIEW_ONLY',sourceDirectory:'D:/synthetic-source',archiveDirectory:'D:/synthetic-archive',recursive:true,captionMode:'FILENAME',albumSize:10,channelTitle:'Synthetic',postTitle:'Synthetic',postText:'',postLink:'https://t.me/synthetic/1',discussionTitle:'Synthetic',permission:'MEDIA_ALLOWED_AT_CHECK',slowModeSeconds:0,fileCount:files.length,totalBytes:files.reduce((sum,file)=>sum+file.size,0),groups,otherFiles:0,deferredFiles:0,linkedEntries:0,duplicateFiles:0,warnings:[],targetCheckedAt:1,createdAt:1,expiresAt:600001}
 }
 const file=(name,size,type='VIDEO')=>({relativePath:name,fileName:name,mediaType:type,caption:name,size})
 const group=(number,files,type='VIDEO')=>({number,mediaType:type,mode:files.length===1?'SINGLE':'ALBUM',files})
@@ -42,4 +42,14 @@ test('byte-sized grouping retains mode, type order, count, path, caption and tot
     const value=clone(preview());change(value);assert.equal(validUploadPreview(value,'1'),false)
   }
   assert.equal(validUploadPreview(preview([group(1,[file('video',1)]),group(2,[file('photo',1,'PHOTO')],'PHOTO')]),'1'),false)
+})
+
+test('preview groups obey the selected maximum and accept individual sends when it is one',()=>{
+  const custom=preview([group(1,[file('a',1),file('b',1),file('c',1)]),group(2,[file('d',1)])]);custom.albumSize=3
+  assert.equal(validUploadPreview(custom,'1'),true)
+  custom.albumSize=2;assert.equal(validUploadPreview(custom,'1'),false)
+  custom.albumSize=4;assert.equal(validUploadPreview(custom,'1'),false,'a short group cannot end before the chosen maximum without a byte limit')
+  const individual=preview([group(1,[file('a',1)]),group(2,[file('b',1)])]);individual.albumSize=1
+  assert.equal(validUploadPreview(individual,'1'),true)
+  for(const invalid of [undefined,null,0,11,1.5,'3']){individual.albumSize=invalid;assert.equal(validUploadPreview(individual,'1'),false)}
 })

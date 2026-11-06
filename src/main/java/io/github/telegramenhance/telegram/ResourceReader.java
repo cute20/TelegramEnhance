@@ -150,7 +150,8 @@ public class ResourceReader {
         return new Post(key, accountId, Long.toString(main.chatId), chat.title,
                 Long.toString(canonical), title, text, Long.toString(main.mediaAlbumId), mainRefs, mainMedia, discussionChat, root, roots,
                 readable, readable ? "PARTIAL" : "UNAVAILABLE", List.copyOf(new LinkedHashSet<>(warnings)),
-                new AlbumEvidence(album.complete(), album.method(), album.newerBoundaryId(), album.olderBoundaryId()), mainCoverage);
+                new AlbumEvidence(album.complete(), album.method(), album.newerBoundaryId(), album.olderBoundaryId()), mainCoverage,
+                members.getFirst().date > 0 ? members.getFirst().date * 1000L : null);
     }
     private static boolean validDiscussionThread(TdApi.MessageThreadInfo thread) {
         return thread != null && thread.chatId != 0 && thread.messageThreadId > 0

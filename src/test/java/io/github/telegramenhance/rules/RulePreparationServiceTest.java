@@ -11,8 +11,18 @@ import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.LongSupplier;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
+import java.nio.file.Path;
+import io.github.telegramenhance.config.AppPaths;
+import io.github.telegramenhance.storage.Database;
+import io.github.telegramenhance.transfer.ScanTaskStore;
 
 class RulePreparationServiceTest {
+    @TempDir Path directory;
+    @Test void completedSingleOperationPreparationSurvivesItsEphemeralLookupTtlAsReadOnlyHistory(){try(var f=new Fixture();var db=new Database(new AppPaths(directory))){
+        var history=new ScanTaskStore(db,f.telegram);f.service.trackScans(history);String operation=operation();f.service.start(RULE,new RulePreparationService.Request(operation,2,"observe"));var running=history.list().getFirst();assertEquals("RUNNING",running.state());assertTrue(running.actions().isEmpty());assertThrows(IllegalArgumentException.class,()->history.action(running.id(),"pause"));
+        f.queue.runNext();f.observation.complete(f.view());assertEquals("COMPLETED",history.list().getFirst().state());f.time.advance(601);assertNull(f.service.lookup(RULE,operation));assertEquals("COMPLETED",history.list().getFirst().state());assertTrue(history.list().getFirst().actions().isEmpty());verify(f.rules,never()).toggle(anyString(),any());
+    }}
     static final String RULE = "00000000-0000-4000-8000-000000000001";
     static final String OTHER = "00000000-0000-4000-8000-000000000002";
     static String operation() { return UUID.randomUUID().toString(); }

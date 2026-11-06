@@ -23,7 +23,6 @@ import tools.jackson.databind.json.JsonMapper;
 @Repository
 public final class DownloadRuleRepository {
     public static final long REVIEW_MILLIS=300_000;
-    private static final int MAX_RULES=20,MAX_POSTS=10_000,MAX_MEDIA=100_000;
     private final Database db;
     private final DownloadRepository downloads;
     private final JsonMapper json=JsonMapper.builder().build();
@@ -35,7 +34,6 @@ public final class DownloadRuleRepository {
     public Rule create(String account,String operation,String fingerprint,Input input,ManagedChannel channel,Post fixedPost,long now,Runnable guard){
         identity(account,input,channel,fixedPost);
         return db.write(c->{guard.run();var previous=byOperation(c,account,operation,fingerprint);if(previous!=null){guard.run();return previous;}
-            if(count(c,"SELECT COUNT(*) FROM download_rules WHERE account_id=?",account)>=MAX_RULES)throw new IllegalArgumentException("每个账号最多保存20条持续下载规则");
             String id=UUID.randomUUID().toString();sql(c,"INSERT INTO download_rules VALUES(?,?,?,?,1,1,0,0,?,?)",id,account,operation,fingerprint,now,now);
             sql(c,"INSERT INTO download_rule_versions VALUES(?,1,?,?,?,?)",id,encode(input),channel.id(),channel.title(),now);initialScan(c,id,1,input,fixedPost,now);guard.run();return get(c,account,id);
         });
@@ -58,7 +56,7 @@ public final class DownloadRuleRepository {
     public Rule get(String account,String id){return db.read(c->get(c,account,id));}
     public Rule byOperation(String account,String operation,String fingerprint){return db.read(c->byOperation(c,account,operation,fingerprint));}
     public Rule byOperation(String account,String operation){return byOperation(account,operation,null);}
-    public List<Rule> list(String account){return db.read(c->{var ids=new ArrayList<String>();try(var q=c.prepareStatement("SELECT id FROM download_rules WHERE account_id=? ORDER BY created_at DESC,id LIMIT 20")){q.setString(1,account);try(var r=q.executeQuery()){while(r.next())ids.add(r.getString(1));}}var out=new ArrayList<Rule>();for(String id:ids)out.add(get(c,account,id));return List.copyOf(out);});}
+    public List<Rule> list(String account){return db.read(c->{var ids=new ArrayList<String>();try(var q=c.prepareStatement("SELECT id FROM download_rules WHERE account_id=? ORDER BY created_at DESC,id")){q.setString(1,account);try(var r=q.executeQuery()){while(r.next())ids.add(r.getString(1));}}var out=new ArrayList<Rule>();for(String id:ids)out.add(get(c,account,id));return List.copyOf(out);});}
     public List<Version> versions(String account,String id){return db.read(c->{get(c,account,id);var out=new ArrayList<Version>();try(var q=c.prepareStatement("SELECT version,created_at,config_json,channel_id,channel_title FROM download_rule_versions WHERE rule_id=? ORDER BY version DESC LIMIT 20")){q.setString(1,id);try(var r=q.executeQuery()){while(r.next())out.add(new Version(r.getLong(1),r.getLong(2),decode(r.getString(3),Input.class),r.getString(4),r.getString(5)));}}return List.copyOf(out);});}
     public Rule nextDue(String account,long now){return db.read(c->{try(var q=c.prepareStatement("SELECT id FROM download_rules WHERE account_id=? AND enabled=1 AND next_scan_at<=? ORDER BY next_scan_at,id LIMIT 1")){q.setString(1,account);q.setLong(2,now);try(var r=q.executeQuery()){return r.next()?get(c,account,r.getString(1)):null;}}});}
     public void schedule(Rule expected,long nextAt,String error,long now,Runnable guard){db.write(c->{guard.run();expect(c,expected);sql(c,"UPDATE download_rules SET next_scan_at=?,updated_at=? WHERE id=?",nextAt,now,expected.id());sql(c,"UPDATE download_rule_scans SET error=?,updated_at=?,turn=turn+1 WHERE rule_id=? AND version=?",boundedError(error),now,expected.id(),expected.version());guard.run();return null;});}
@@ -90,7 +88,6 @@ public final class DownloadRuleRepository {
             var previous=post(c,rule,value.key());
             if(previous!=null&&"HEAD".equals(current.phase())){finish(c,rule,current,false,now);guard.run();return scan(c,rule);}
             if(previous==null){
-                if(count(c,"SELECT COUNT(*) FROM download_rule_posts WHERE rule_id=? AND version=?",rule.id(),rule.version())>=MAX_POSTS)throw new IllegalArgumentException("本版本已扫描10000条主帖，规则暂停以保留已有范围");
                 String state=mainState(value,matched);String error="ERROR".equals(state)?"主帖或相册范围尚未核全，保留待复查。":null;
                 sql(c,"INSERT INTO download_rule_posts VALUES(?,?,?,?,?,?,NULL,0,?,?,?,0)",rule.id(),rule.version(),value.key(),value.mainMessageId(),encodePost(value),state,matched?1:0,"MAIN".equals(state)?now:now+REVIEW_MILLIS,error);
             }
@@ -104,7 +101,7 @@ public final class DownloadRuleRepository {
         if(message==null||!message.matches("[1-9][0-9]{0,18}")||Long.parseLong(message)<=0)throw new IllegalArgumentException("原候选消息身份无效，检查点保留");
         String album=candidate.albumId();boolean grouped=album!=null&&!"0".equals(album);if(grouped&&!Long.toString(Long.parseLong(album)).equals(album))throw new IllegalArgumentException("原候选相册身份无效，检查点保留");
         String key=rule.accountId()+":"+rule.channelId()+":"+(grouped?"album:"+album:message);var previous=post(c,rule,key);
-        if(previous==null){if(count(c,"SELECT COUNT(*) FROM download_rule_posts WHERE rule_id=? AND version=?",rule.id(),rule.version())>=MAX_POSTS)throw new IllegalArgumentException("本版本已扫描10000条主帖，原位置保留");sql(c,"INSERT INTO download_rule_posts VALUES(?,?,?,?,NULL,'ERROR',NULL,0,0,?,?,0)",rule.id(),rule.version(),key,message,now+REVIEW_MILLIS,boundedError(error));}
+        if(previous==null)sql(c,"INSERT INTO download_rule_posts VALUES(?,?,?,?,NULL,'ERROR',NULL,0,0,?,?,0)",rule.id(),rule.version(),key,message,now+REVIEW_MILLIS,boundedError(error));
         else sql(c,"UPDATE download_rule_posts SET state='ERROR',next_review_at=?,error=?,revision=revision+1 WHERE rule_id=? AND version=? AND post_key=?",now+REVIEW_MILLIS,boundedError(error),rule.id(),rule.version(),key);
         if(previous!=null&&"HEAD".equals(current.phase()))finish(c,rule,current,false,now);else consume(c,rule,current,now);guard.run();return scan(c,rule);
     });}
@@ -127,7 +124,6 @@ public final class DownloadRuleRepository {
             if(!fresh.isEmpty()){
                 if(!rule.enabled()||!rule.input().window().allows(java.time.Instant.ofEpochMilli(now)))throw new IllegalArgumentException("规则未启用或当前不在允许时段，原读取位置保留");
                 settleCompleted(c,rule.id(),now);if(job(c,rule,true)!=null)throw new IllegalArgumentException("此规则已有未完成下载，请先处理已有任务");
-                if(count(c,"SELECT COUNT(*) FROM download_rule_media WHERE rule_id=? AND version=?",rule.id(),rule.version())+fresh.size()>MAX_MEDIA)throw new IllegalArgumentException("本版本已达到100000媒体声明上限，原位置保留");
                 String operation=UUID.nameUUIDFromBytes(("download-rule:"+rule.id()+":"+rule.version()+":"+expected.key()+":"+expected.revision()).getBytes(java.nio.charset.StandardCharsets.UTF_8)).toString();
                 var task=downloads.createInTransaction(c,rule.accountId(),operation,operation,expected.post(),root,fresh);
                 sql(c,"INSERT INTO download_rule_tasks VALUES(?,?,?,?,?,0,0,NULL,?)",task.id(),rule.id(),rule.accountId(),rule.version(),encode(rule.input()),now);
@@ -163,7 +159,10 @@ public final class DownloadRuleRepository {
     private Job jobById(Connection c,Rule rule,String id)throws SQLException{try(var q=c.prepareStatement("SELECT b.task_id,b.rule_version,b.manual,b.held,t.state,t.error_message,COUNT(i.item_id) AS total,SUM(CASE WHEN i.state='COMPLETED' AND i.downloaded_bytes=i.size AND i.written_bytes=i.size AND l.item_id IS NOT NULL THEN 1 ELSE 0 END) AS completed FROM download_rule_tasks b JOIN download_tasks t ON t.task_id=b.task_id AND t.account_id=b.account_id LEFT JOIN download_items i ON i.task_id=t.task_id LEFT JOIN download_completion_log l ON l.item_id=i.item_id AND l.task_id=i.task_id AND l.account_id=t.account_id AND l.unique_id=i.unique_id AND l.size=i.size AND l.sha256=i.sha256 WHERE b.rule_id=? AND b.account_id=? AND b.task_id=? GROUP BY b.task_id")){q.setString(1,rule.id());q.setString(2,rule.accountId());q.setString(3,id);try(var r=q.executeQuery()){return r.next()?new Job(id,r.getLong("rule_version"),r.getString("state"),r.getInt("total"),r.getLong("completed"),r.getString("error_message"),r.getBoolean("manual"),r.getBoolean("held")):null;}}}
     private void consume(Connection c,Rule rule,Scan current,long now)throws SQLException{var page=current.pending();boolean last=current.offset()+1==page.items().size();if(last&&page.exhausted()){sql(c,"UPDATE download_rule_scans SET scanned=scanned+1 WHERE rule_id=? AND version=?",rule.id(),rule.version());finish(c,rule,current,"HISTORY".equals(current.phase()),now);}else if(last)sql(c,"UPDATE download_rule_scans SET revision=revision+1,cursor=?,pending_json=NULL,pending_offset=0,scanned=scanned+1,error=NULL,updated_at=? WHERE rule_id=? AND version=?",page.nextCursor(),now,rule.id(),rule.version());else sql(c,"UPDATE download_rule_scans SET revision=revision+1,pending_offset=pending_offset+1,scanned=scanned+1,error=NULL,updated_at=? WHERE rule_id=? AND version=?",now,rule.id(),rule.version());}
     private void finish(Connection c,Rule rule,Scan current,boolean history,long now)throws SQLException{if(history&&!"HISTORY".equals(current.phase()))throw conflict();sql(c,"UPDATE download_rule_scans SET revision=revision+1,phase='HEAD',cursor=NULL,pending_json=NULL,pending_offset=0,history_done=CASE WHEN ?=1 THEN 1 ELSE history_done END,next_head_at=?,error=NULL,updated_at=? WHERE rule_id=? AND version=?",history?1:0,now+60_000,now,rule.id(),rule.version());}
-    private void pauseManaged(Connection c,String account,String rule,long now)throws SQLException{sql(c,"UPDATE download_tasks SET state='PAUSED',pause_requested=1,error_message=?,updated_at=? WHERE account_id=? AND state='QUEUED' AND task_id IN(SELECT task_id FROM download_rule_tasks WHERE rule_id=? AND account_id=? AND manual=0)",DownloadRulePolicy.RULE_PAUSE,now,account,rule,account);}
+    private void pauseManaged(Connection c,String account,String rule,long now)throws SQLException{
+        sql(c,"DELETE FROM download_task_retries WHERE account_id=? AND task_id IN(SELECT task_id FROM download_rule_tasks WHERE rule_id=? AND account_id=? AND manual=0)",account,rule,account);
+        sql(c,"UPDATE download_tasks SET state='PAUSED',pause_requested=1,error_message=?,updated_at=? WHERE account_id=? AND state='QUEUED' AND task_id IN(SELECT task_id FROM download_rule_tasks WHERE rule_id=? AND account_id=? AND manual=0)",DownloadRulePolicy.RULE_PAUSE,now,account,rule,account);
+    }
     private void settleCompleted(Connection c,String rule,long now)throws SQLException{sql(c,"UPDATE download_rule_tasks SET settled_at=? WHERE rule_id=? AND manual=0 AND settled_at IS NULL AND task_id IN(SELECT task_id FROM download_tasks WHERE state='COMPLETED')",now,rule);}
     private boolean claimed(Connection c,Rule rule,String key,FrozenFile file)throws SQLException{return count(c,"SELECT COUNT(*) FROM download_rule_media WHERE rule_id=? AND version=? AND post_key=? AND media_key=? AND unique_id=? AND size=?",rule.id(),rule.version(),key,file.media().key(),file.uniqueId(),file.size())!=0;}
     private static void validatePost(Rule rule,Post value){if(value==null||!rule.accountId().equals(value.accountId())||!rule.channelId().equals(value.channelId())||rule.input().postSource()&&(!java.util.Objects.equals(rule.input().postKey(),value.key())||!java.util.Objects.equals(rule.input().mainMessageId(),value.mainMessageId())))throw new IllegalArgumentException("下载规则主帖身份不符");}

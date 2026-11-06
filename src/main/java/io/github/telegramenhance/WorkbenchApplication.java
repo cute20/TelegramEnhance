@@ -11,7 +11,13 @@ public class WorkbenchApplication {
     private static InstanceLock processLock;
     public static void main(String[] args) {
         processLock = new InstanceLock(new AppPaths());
-        try { SpringApplication.run(WorkbenchApplication.class, args); }
+        try {
+            var application = new SpringApplication(WorkbenchApplication.class);
+            // Windows desktop sessions may opt into the tray. Keep other platforms
+            // headless by default; an explicit java.awt.headless still takes precedence.
+            application.setHeadless(!System.getProperty("os.name", "").startsWith("Windows"));
+            application.run(args);
+        }
         catch (RuntimeException e) { processLock.close(); throw e; }
     }
     @Bean public InstanceLock instanceLock(AppPaths paths) {

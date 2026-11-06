@@ -34,7 +34,7 @@ public final class RuleService {
         if(request.enabled()&&rule.input().executionMode().equals("AUTO_UPLOAD")){
             Activation check;synchronized(activations){check=activations.get(request.previewId());}
             if(check==null||!check.rule().equals(id)||!check.account().equals(account)||check.generation()!=generation||check.version()!=rule.version()||check.revision()!=rule.revision()||check.revision()!=request.revision()||check.expires()<=clock.millis())throw new IllegalArgumentException("请重新预览并确认自动上传目标、目录和时段");
-            var preview=previews.get(request.previewId());if(!preview.postLink().equals(rule.input().link())||!DownloadPaths.key(Path.of(preview.sourceDirectory())).equals(DownloadPaths.key(Path.of(rule.input().sourceDirectory())))||!DownloadPaths.key(Path.of(preview.archiveDirectory())).equals(DownloadPaths.key(Path.of(rule.input().archiveDirectory())))||preview.recursive()!=rule.input().recursive()||!preview.captionMode().equals(rule.input().captionMode()))throw new IllegalArgumentException("启用预览与规则参数不符，请重新核对");approved=previews.target(request.previewId());
+            var preview=previews.get(request.previewId());if(!preview.postLink().equals(rule.input().link())||!DownloadPaths.key(Path.of(preview.sourceDirectory())).equals(DownloadPaths.key(Path.of(rule.input().sourceDirectory())))||!DownloadPaths.key(Path.of(preview.archiveDirectory())).equals(DownloadPaths.key(Path.of(rule.input().archiveDirectory())))||preview.recursive()!=rule.input().recursive()||!preview.captionMode().equals(rule.input().captionMode())||preview.albumSize()!=rule.input().albumSize())throw new IllegalArgumentException("启用预览与规则参数不符，请重新核对");approved=previews.target(request.previewId());
         }
         current(account,generation);return view(repository.enabled(account,id,request.revision(),request.enabled(),clock.millis(),approved));}
     public Listing list(){String account=telegram.accountId();var out=repository.list(account).stream().map(this::view).toList();currentAccount(account);return new Listing(out,"RULES",30);}
@@ -74,7 +74,7 @@ public final class RuleService {
     private Input normalize(Input input){
         if(input==null||input.name()==null||input.name().strip().isEmpty()||input.name().strip().length()>80||input.window()==null||!("FILENAME".equals(input.captionMode())||"EMPTY".equals(input.captionMode())))throw new IllegalArgumentException("请填写80字以内规则名称、目录、目标和观察时段");
         String link=checkedLink(input.link());var dirs=scanner.ruleDirectories(input.sourceDirectory());
-        return new Input(input.name().strip(),link,dirs.source().toString(),dirs.archive().toString(),input.recursive(),input.captionMode(),input.window(),input.executionMode());
+        return new Input(input.name().strip(),link,dirs.source().toString(),dirs.archive().toString(),input.recursive(),input.captionMode(),input.window(),input.executionMode(),input.albumSize());
     }
     static String checkedLink(String value){
         if(value==null||value.length()>2048)throw new IllegalArgumentException("请输入有效的Telegram频道主帖链接");String link=value.strip();

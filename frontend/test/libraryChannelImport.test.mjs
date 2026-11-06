@@ -358,7 +358,7 @@ for (const [missing, value, restored] of [['authorized', false, true], ['availab
 }
 
 test('returning from import refreshes the catalog while preserving existing filters, page and view', async t => {
-  const catalogPath = '/library/catalog?tags=&keywords=&limit=20&offset=0'
+  const catalogPath = '/library/catalog?tags=&keywords=&limit=20&offset=0&sort=published-desc'
   const catalog = { items: [], limit: 20, offset: 0, total: 0, indexedPosts: 0, indexedChannels: 0, hasMore: false, scope: 'INDEXED_ONLY' }
   const f = mount(t, evaluateWorkspace, [request('/library/channels', []), request(catalogPath, catalog)])
   await flush()
@@ -371,7 +371,7 @@ test('returning from import refreshes the catalog while preserving existing filt
   assert.equal(f.state.mode.value, 'import')
   assert.equal(f.state.selectedPostKey.value, '')
   assert.equal(f.calls.length, 2)
-  const query = new URLSearchParams({ tags: '旅行', keywords: '周末', limit: '20', offset: '40' })
+  const query = new URLSearchParams({ tags: '旅行', keywords: '周末', limit: '20', offset: '40', sort: 'published-desc' })
   query.append('channelIds', CHANNEL.id)
   f.expect(request('/library/channels', [{ ...CHANNEL, indexedPosts: 1 }]), request(`/library/catalog?${query}`, { ...catalog, offset: 40, indexedPosts: 1, indexedChannels: 1 }))
   f.state.mode.value = 'catalog'

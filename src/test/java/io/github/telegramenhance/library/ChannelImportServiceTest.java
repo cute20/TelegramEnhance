@@ -52,7 +52,7 @@ class ChannelImportServiceTest {
                 assertTrue(entered.await(2, TimeUnit.SECONDS));
                 var queued = f.service.importPost("-1001", "100");
                 if (changeAccount) f.account.set("another-account"); else f.generation.incrementAndGet();
-                release.countDown(); await(blocking); assertThrows(ExecutionException.class, () -> await(queued));
+                release.countDown(); assertThrows(ExecutionException.class, () -> await(blocking)); assertThrows(ExecutionException.class, () -> await(queued));
                 verifyNoInteractions(f.reader, f.channels, f.repository);
             }
         }

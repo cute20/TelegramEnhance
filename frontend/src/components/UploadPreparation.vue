@@ -1,32 +1,35 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, ref, watch } from 'vue'
+import { computed, getCurrentInstance, onBeforeUnmount, ref, watch } from 'vue'
 import { api, ApiError } from '../api'
 import { formatMediaBytes } from '../library'
 import { uploadTypes, validUploadPreview, type UploadPreview } from '../uploadPreview'
 import AppIcon from './AppIcon.vue'
 import { validUploadTask, type UploadTask } from '../uploadTasks'
 import { ruleArchiveDirectory } from '../rules'
-import type { UploadCreationSelection } from '../transferCreation'
-const props = defineProps<{ authorized: boolean; available: boolean; accountId: string | null; selection?: UploadCreationSelection }>()
-const emit = defineEmits<{ settings: []; tasks: []; accessError: [cause: ApiError]; transitionLocked: [value: boolean]; fieldsLocked: [value: boolean] }>()
+import type { CreationStage, UploadCreationSelection } from '../transferCreation'
+const props = defineProps<{ authorized: boolean; available: boolean; accountId: string | null; selection?: UploadCreationSelection; actionTarget?:string }>()
+const emit = defineEmits<{ settings: []; tasks: []; accessError: [cause: ApiError]; transitionLocked: [value: boolean]; fieldsLocked: [value: boolean]; stage:[value:CreationStage] }>()
 const link = ref(''), sourceDirectory = ref(''), archiveDirectory = ref('')
+const previewFormId='upload-preview-form-'+(getCurrentInstance()?.uid??'standalone')
 const recursive = ref(true), captionMode = ref<'FILENAME' | 'EMPTY'>('FILENAME')
+const albumSize = ref(10)
 const preview = ref<UploadPreview | null>(null), busy = ref(false), error = ref(''), verified = ref(false)
 const creating=ref(false),uncertain=ref(false),created=ref<UploadTask|null>(null)
 const transitionLocked=computed(()=>creating.value||uncertain.value)
 const fieldsLocked=computed(()=>busy.value||creating.value||uncertain.value||!!created.value)
+watch([preview,creating,uncertain,created],()=>emit('stage',created.value?'complete':preview.value||creating.value||uncertain.value?'confirm':'preview'),{immediate:true,flush:'sync'})
 let frozenCreate:{operationId:string;previewId:string}|null=null
 let generation = 0, disposed = false
 function reset() { generation++; preview.value = null; error.value = ''; busy.value = false; verified.value = false;creating.value=false;uncertain.value=false;created.value=null;frozenCreate=null }
-watch([link,sourceDirectory,archiveDirectory,recursive,captionMode], reset)
+watch([link,sourceDirectory,archiveDirectory,recursive,captionMode,albumSize], reset)
 function applySelection() {
   const selection=props.selection
   if(!selection||creating.value||uncertain.value||created.value)return
   link.value=selection.link;sourceDirectory.value=selection.sourceDirectory
   archiveDirectory.value=ruleArchiveDirectory(selection.sourceDirectory)
-  recursive.value=selection.recursive;captionMode.value=selection.captionMode
+  recursive.value=selection.recursive;captionMode.value=selection.captionMode;albumSize.value=selection.albumSize
 }
-watch([()=>props.selection?.link,()=>props.selection?.sourceDirectory,()=>props.selection?.recursive,()=>props.selection?.captionMode],applySelection,{immediate:true,flush:'sync'})
+watch([()=>props.selection?.link,()=>props.selection?.sourceDirectory,()=>props.selection?.recursive,()=>props.selection?.captionMode,()=>props.selection?.albumSize],applySelection,{immediate:true,flush:'sync'})
 watch([() => props.authorized, () => props.available, () => props.accountId], (value, before) => {
   const identityChanged=!before||value[0]!==before[0]||value[2]!==before[2]
   if(identityChanged){reset();if(before&&value[2]!==before[2]){link.value='';sourceDirectory.value='';archiveDirectory.value=''}return}
@@ -40,14 +43,14 @@ watch([() => props.authorized, () => props.available, () => props.accountId], (v
 watch(transitionLocked,value=>emit('transitionLocked',value),{flush:'sync'})
 watch(fieldsLocked,value=>{if(props.selection)emit('fieldsLocked',value)},{immediate:true,flush:'sync'})
 async function prepare(recheck = false) {
-  if (busy.value || creating.value || uncertain.value || created.value || !props.authorized || !props.available || !props.accountId || !link.value.trim() || !sourceDirectory.value.trim() || !archiveDirectory.value.trim() || recheck && !preview.value) return
+  if (busy.value || creating.value || uncertain.value || created.value || !props.authorized || !props.available || !props.accountId || !link.value.trim() || !sourceDirectory.value.trim() || !archiveDirectory.value.trim() || !Number.isInteger(albumSize.value) || albumSize.value < 1 || albumSize.value > 10 || recheck && !preview.value) return
   const request = ++generation, account = props.accountId, old = preview.value
-  const input = { link: link.value.trim(), sourceDirectory: sourceDirectory.value.trim(), archiveDirectory: archiveDirectory.value.trim(), recursive: recursive.value, captionMode: captionMode.value }
+  const input = { link: link.value.trim(), sourceDirectory: sourceDirectory.value.trim(), archiveDirectory: archiveDirectory.value.trim(), recursive: recursive.value, captionMode: captionMode.value, albumSize: albumSize.value }
   busy.value = true; error.value = ''; verified.value = false; if (!recheck) preview.value = null
   try {
     const result = await api<UploadPreview>(recheck ? `/transfers/upload/preview/${encodeURIComponent(old!.id)}/verify` : '/transfers/upload/preview', { method: 'POST', timeout: 150000, body: recheck ? {} : input })
     if (disposed || request !== generation || account !== props.accountId || !props.authorized || !props.available) return
-    if (!validUploadPreview(result, account) || result.postLink !== input.link || recheck && result.id !== old?.id) throw new Error('上传预览回执无法确认，请重新生成。')
+    if (!validUploadPreview(result, account) || result.postLink !== input.link || result.albumSize !== input.albumSize || recheck && result.id !== old?.id) throw new Error('上传预览回执无法确认，请重新生成。')
     if (recheck && JSON.stringify(result.groups) !== JSON.stringify(old?.groups)) throw new Error('原分组发生变化，请重新生成预览。')
     preview.value = result; verified.value = recheck
   } catch (cause) {
@@ -59,9 +62,13 @@ async function prepare(recheck = false) {
 async function createTask(retry=false){
   if(creating.value||busy.value||created.value||!preview.value||!props.authorized||!props.available||!props.accountId)return
   if(!retry){if(uncertain.value||!preview.value.fileCount)return;frozenCreate={operationId:crypto.randomUUID(),previewId:preview.value.id}}
-  if(!frozenCreate)return;const request=generation,account=props.accountId;creating.value=true;error.value=''
+  if(!frozenCreate)return;const request=generation,account=props.accountId,wasUncertain=uncertain.value;creating.value=true;error.value=''
   try{const result=await api<UploadTask>('/transfers/upload/tasks',{method:'POST',timeout:150000,body:frozenCreate});if(disposed||request!==generation||account!==props.accountId)return;if(!validUploadTask(result))throw new Error('上传任务回执无法确认');created.value=result;uncertain.value=false}
-  catch(cause){if(!disposed&&request===generation){uncertain.value=true;error.value=(cause instanceof Error?cause.message:'创建未完成')+' 请先核对任务；重试沿用同一操作号。'}}finally{if(!disposed&&request===generation)creating.value=false}
+  catch(cause){if(!disposed&&request===generation){
+    if(!wasUncertain&&cause instanceof ApiError&&cause.status===400&&cause.code==='CREATION_REJECTED'){
+      frozenCreate=null;uncertain.value=false;preview.value=null;verified.value=false;error.value=cause.message+' 本次未创建任务，可修改设置后重新生成预览。'
+    }else{uncertain.value=true;error.value=(cause instanceof Error?cause.message:'创建未完成')+' 请先核对任务；重试沿用同一操作号。'}
+  }}finally{if(!disposed&&request===generation)creating.value=false}
 }
 async function lookupTask(){if(!frozenCreate||creating.value||!props.authorized||!props.available||!props.accountId)return;const request=generation,account=props.accountId;creating.value=true;try{const result=await api<{task:UploadTask|null}>('/transfers/upload/tasks/by-operation/'+frozenCreate.operationId);if(disposed||request!==generation||account!==props.accountId)return;if(result.task&&validUploadTask(result.task)){created.value=result.task;uncertain.value=false;error.value=''}else error.value='尚未查到任务；请稍后核对，或重试同一创建操作。'}catch{if(!disposed&&request===generation)error.value='任务状态未核实，请到任务中心检查。'}finally{if(!disposed&&request===generation)creating.value=false}}
 onBeforeUnmount(() => { disposed = true; generation++;if(transitionLocked.value)emit('transitionLocked',false);if(props.selection&&fieldsLocked.value)emit('fieldsLocked',false) })
@@ -70,13 +77,14 @@ onBeforeUnmount(() => { disposed = true; generation++;if(transitionLocked.value)
   <section class="upload-preparation" aria-label="上传准备">
     <p v-if="!selection" class="upload-intro">将整理好的媒体上传到自己频道主帖的评论区。图片、视频、音频和文档分别分组，不混合发送；预览后保存任务，再到任务中心确认开始。</p>
     <div v-if="!authorized || !available" class="notice warning"><span>{{ authorized ? '请恢复本机连接后重新预览。' : '请先连接 Telegram。' }}</span><button v-if="!authorized" class="btn" @click="emit('settings')">前往设置</button></div>
-    <form @submit.prevent="prepare()">
+    <form :id="previewFormId" @submit.prevent="prepare()">
       <fieldset :disabled="busy || creating || uncertain || !!created || !authorized || !available"><template v-if="!selection"><label for="upload-link">目标频道主帖链接</label><input id="upload-link" v-model="link" class="input" type="url" placeholder="https://t.me/…" autocomplete="off" required />
         <label for="upload-source">待上传目录</label><input id="upload-source" v-model="sourceDirectory" class="input" placeholder="例如 D:\待上传" autocomplete="off" required />
         <label for="upload-archive">已上传归档目录</label><input id="upload-archive" v-model="archiveDirectory" class="input" placeholder="例如 D:\已上传" autocomplete="off" required /><small>两个目录不能相同或互相包含。预览不会创建归档目录。</small>
-        <div class="upload-options"><label><input v-model="recursive" type="checkbox" />包含子目录</label><label for="upload-caption">媒体说明<select id="upload-caption" v-model="captionMode" class="input"><option value="FILENAME">使用原文件名</option><option value="EMPTY">留空</option></select></label></div>
+        <div class="upload-options"><label><input v-model="recursive" type="checkbox" />包含子目录</label><label for="upload-caption">媒体说明<select id="upload-caption" v-model="captionMode" class="input"><option value="FILENAME">使用原文件名</option><option value="EMPTY">留空</option></select></label><label for="upload-album-size">每组媒体数量<select id="upload-album-size" v-model="albumSize" class="input"><option v-for="size in 10" :key="size" :value="size">{{size === 1 ? '1 个（逐条发送）' : `${size} 个`}}</option></select></label></div>
+        <small>每组最多按所选数量发送，默认 10 个；动图始终逐条发送。</small>
         </template>
-        <button class="btn primary" :disabled="!link.trim() || !sourceDirectory.trim() || !archiveDirectory.trim()"><AppIcon name="search" />{{ busy ? '正在核对目录与目标…' : preview ? '重新生成上传预览' : '生成上传预览' }}</button>
+        <Teleport :to="actionTarget||'body'" :disabled="!actionTarget||!!preview" defer><div class="creation-primary-actions"><button class="btn" :class="{'primary':!actionTarget||!preview}" type="submit" :form="previewFormId" :disabled="busy||creating||uncertain||!!created||!authorized||!available||!link.trim()||!sourceDirectory.trim()||!archiveDirectory.trim()"><AppIcon name="search" />{{ busy ? '正在核对目录与目标…' : preview ? '重新生成上传预览' : '生成上传预览' }}</button></div></Teleport>
       </fieldset>
     </form>
     <div v-if="error" class="notice danger" role="alert">{{ error }}</div>
@@ -84,13 +92,16 @@ onBeforeUnmount(() => { disposed = true; generation++;if(transitionLocked.value)
       <div class="upload-target"><div><small>{{ preview.channelTitle }}</small><strong>{{ preview.postTitle }}</strong><span>评论区：{{ preview.discussionTitle }}</span></div><span class="status-pill green">本批媒体权限已核对</span></div>
       <div class="upload-notes" role="status"><p v-for="warning in preview.warnings" :key="warning">{{ warning }}</p></div>
       <div class="upload-summary"><strong>{{ preview.fileCount }} 个媒体 · {{ preview.groups.length }} 组 · {{ formatMediaBytes(preview.totalBytes) }}</strong><span>忽略临时文件 {{ preview.otherFiles }} · 暂缓 {{ preview.deferredFiles }} · 同内容重复 {{ preview.duplicateFiles }}</span><button class="btn" :disabled="busy || creating || uncertain || !!created" @click="prepare(true)"><AppIcon name="refresh" />重新核对这份预览</button></div>
+      <p class="upload-next">{{preview.albumSize === 1 ? '逐条发送（每组 1 个）' : `每组最多 ${preview.albumSize} 个媒体`}}；不同类型分别分组，动图逐条发送。</p>
       <p v-if="verified" class="notice success" role="status">目标权限和原目录快照已重新核对；分组未改变，仍未发送文件。</p>
       <section v-for="group in preview.groups" :key="group.number" class="upload-group"><header><strong>第 {{ group.number }} 组 · {{ uploadTypes[group.mediaType] }}</strong><span>{{ group.mode === 'SINGLE' ? '单条发送' : `相册 · ${group.files.length} 个` }}</span></header><ol><li v-for="file in group.files" :key="file.relativePath"><div><strong>{{ file.fileName }}</strong><small>{{ file.relativePath }}</small><small>说明：{{ file.caption || '留空' }}</small></div><span>{{ formatMediaBytes(file.size) }}</span></li></ol></section>
       <details class="upload-text"><summary>目标主帖全文与目录</summary><p>{{ preview.postText }}</p><p>待上传：{{ preview.sourceDirectory }}<br />归档：{{ preview.archiveDirectory }}</p><a :href="preview.postLink" target="_blank" rel="noreferrer">查看 Telegram 主帖 ↗</a></details>
-      <p v-if="!selection" class="upload-next">同类型内按自然顺序排列，每组最多10个，尾组1个及动图单条处理。保存后分组固定，任务中心确认开始才会发送；收到正式回执后归档。</p>
+      <p v-if="!selection" class="upload-next">同类型内按自然顺序排列，尾组1个单条处理。保存后分组固定，任务中心确认开始才会发送；收到正式回执后归档。</p>
+      <Teleport :to="actionTarget||'body'" :disabled="!actionTarget" defer><div class="creation-primary-actions">
       <button v-if="!created&&!uncertain" class="btn primary" :disabled="busy||creating||!preview.fileCount" @click="createTask()">{{creating?'正在保存任务…':'保存上传任务（等待开始）'}}</button>
       <div v-if="uncertain" class="upload-options"><button class="btn" :disabled="creating" @click="lookupTask">核对是否已创建</button><button class="btn" :disabled="creating" @click="createTask(true)">重试同一创建操作</button></div>
       <div v-if="created" class="notice success" role="status"><span>上传任务已保存，尚未开始发送。</span><button class="btn" @click="emit('tasks')">查看上传任务</button></div>
+      </div></Teleport>
     </template>
   </section>
 </template>

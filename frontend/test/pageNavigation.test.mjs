@@ -26,14 +26,14 @@ function mount(t) {
   let serial = 0
   const api = async (path, options = {}) => {
     calls.push({ path, options: copy(options) }); const response = expected.shift()
-    try { assert.ok(response, 'Unexpected request: ' + path); assert.equal(path, response.path); assert.equal(options.method ?? 'GET', 'GET') }
+    try { assert.ok(response, 'Unexpected request: ' + path); assert.equal(path, response.path); assert.equal(options.method ?? 'GET', response.method ?? 'GET') }
     catch (cause) { failures.push(cause); throw cause }
     if (response.value instanceof Error) throw response.value
     return await response.value
   }
   const runtimeVue = { ...vue, onMounted() {}, onBeforeUnmount: hook => hooks.push(hook), withCtx: fn => fn,
     withDirectives: (node, directives) => { node.testDirectives = directives; return node } }
-  const modules = { vue: runtimeVue, './taskCategories': categories, './api': { api, ApiError, hasAppToken: true, clearAppToken() {} } }
+  const modules = { vue: runtimeVue, './taskCategories': categories, './api': { api, ApiError, hasAppToken: true, clearAppToken() {} }, './thumbnailMemory': { invalidateThumbnails() {} } }
   const requireModule = name => {
     if (name.endsWith('.vue')) {
       const title = name.split('/').at(-1).replace('.vue', '')
@@ -52,7 +52,7 @@ function mount(t) {
   state.telegram.value = { authState: 'READY', connectionState: 'READY', userId: '1', nativeLoaded: true, nativeVersion: 'synthetic' }
   t.after(() => { hooks.forEach(hook => hook()); scope.stop(); assert.equal(expected.length, 0); assert.deepEqual(failures, []) })
   return { state, calls, timers,
-    expect: (path, value) => expected.push({ path, value }),
+    expect: (path, value, method = 'GET') => expected.push({ path, value, method }),
     expectSettings: (config, runtime) => { expected.push({ path: '/settings', value: config }, { path: '/diagnostics', value: runtime }) },
     render: () => rendered.exports.render({}, [], {}, vue.proxyRefs(state), {}, {}) }
 }
@@ -64,6 +64,74 @@ function nodes(node) {
   return [node, ...nodes(children)]
 }
 const component = (tree, name) => nodes(tree).find(node => node.type?.__name === name)
+
+test('a connected first visit opens the library while an explicitly selected settings page is retained',async t=>{
+  const f=mount(t)
+  f.state.applyTelegram({...f.state.telegram.value,authState:'READY'})
+  assert.equal(f.state.page.value,'library');assert.equal(f.state.libraryVisited.value,true)
+  f.expectSettings(settings(),diagnostics('returned'))
+  f.state.navigate('settings');await flush()
+  f.state.applyTelegram({...f.state.telegram.value,authState:'READY'})
+  assert.equal(f.state.page.value,'settings')
+})
+
+test('library and rules retain their mounted views while hidden work is inactive',async t=>{
+  const f=mount(t);f.state.navigate('library')
+  const first=component(f.render(),'LibraryWorkspace');assert.ok(first);assert.equal(first.props.available,true)
+  f.state.navigate('rules')
+  const hidden=component(f.render(),'LibraryWorkspace');assert.ok(hidden);assert.equal(hidden.props.available,false)
+  assert.equal(component(f.render(),'RuleWorkspace').props.active,true)
+  f.state.navigate('tasks')
+  assert.equal(component(f.render(),'RuleWorkspace').props.active,false)
+  assert.equal(component(f.render(),'LibraryWorkspace').props.available,false)
+})
+
+test('rules-to-tasks navigation hides a real DOM wrapper while preserving the fragment-root rule component',async t=>{
+  const f=mount(t);f.state.navigate('rules');await flush()
+  const rule=component(f.render(),'RuleWorkspace')
+  const wrapper=tree=>nodes(tree).find(node=>node.type==='section'&&node.props?.class==='rules-page')
+  const shown=wrapper(f.render());assert.ok(shown)
+  assert.ok(shown.testDirectives?.some(([directive,value])=>directive===vue.vShow&&value===true))
+  assert.equal(rule.testDirectives?.some(([directive])=>directive===vue.vShow)??false,false,'v-show must not target the fragment-root component')
+  f.state.openTasks('all');await flush()
+  const hidden=wrapper(f.render()),retained=component(f.render(),'RuleWorkspace')
+  assert.ok(hidden);assert.ok(hidden.testDirectives?.some(([directive,value])=>directive===vue.vShow&&value===false),'the actual native container is hidden')
+  assert.equal(retained.type,rule.type);assert.equal(retained.key,rule.key);assert.equal(retained.props.active,false)
+  f.state.navigate('rules');await flush()
+  assert.ok(wrapper(f.render()).testDirectives?.some(([directive,value])=>directive===vue.vShow&&value===true))
+  assert.equal(component(f.render(),'RuleWorkspace').type,rule.type);assert.equal(component(f.render(),'RuleWorkspace').props.active,true)
+})
+
+test('initialization errors retain the disconnect control and allow settings and connection recovery', async t => {
+  const f = mount(t)
+  f.state.telegram.value = { authState: 'ERROR', connectionState: 'DISCONNECTED', userId: null,
+    nativeLoaded: true, nativeVersion: 'synthetic', error: 'Initialization failed' }
+  const text = node => typeof node === 'string' ? node : Array.isArray(node) ? node.map(text).join('')
+    : node && typeof node === 'object' ? text(node.children) : ''
+  const actions = nodes(f.render()).find(node => node.props?.class === 'session-actions')
+  const buttons = nodes(actions).filter(node => node.type === 'button')
+  assert.equal(f.state.activeSession.value, true)
+  assert.ok(buttons.some(node => text(node).includes('断开 · 保留会话') && !node.props.disabled))
+  assert.equal(buttons.some(node => text(node).includes('保存并连接 Telegram')), false)
+
+  const closed = { authState: 'CLOSED', connectionState: 'DISCONNECTED', userId: null,
+    nativeLoaded: true, nativeVersion: 'synthetic', error: null }
+  f.expect('/telegram/disconnect', closed, 'POST'); f.expect('/telegram', closed)
+  await f.state.disconnect()
+  assert.equal(f.state.activeSession.value, false)
+  assert.equal(f.state.telegram.value.authState, 'CLOSED')
+
+  const saved = settings({ proxy: { type: 'DIRECT', host: '', port: 0, username: '', passwordStored: false } })
+  const waiting = { ...closed, authState: 'WAIT_PHONE' }
+  f.expect('/settings', saved, 'PUT'); f.expect('/telegram/connect', waiting, 'POST'); f.expect('/telegram', waiting)
+  await f.state.connect()
+  assert.equal(f.state.telegram.value.authState, 'WAIT_PHONE')
+  assert.equal(f.state.error.value, '')
+  assert.deepEqual(f.calls.map(call => [call.path, call.options.method ?? 'GET']), [
+    ['/telegram/disconnect', 'POST'], ['/telegram', 'GET'], ['/settings', 'PUT'],
+    ['/telegram/connect', 'POST'], ['/telegram', 'GET'],
+  ])
+})
 
 test('leaving and returning to settings reads only settings and diagnostics once without toggling global loading or busy', async t => {
   const f = mount(t), fresh = settings({ apiId: 1002 }), runtime = diagnostics('fresh')
@@ -148,7 +216,7 @@ test('task sidebar return keeps the same unkeyed mounted component and category 
 })
 
 test('settings keep their mounted preference component and drafts across navigation while hidden download settings are inactive',async t=>{
-  const f=mount(t),initial=component(f.render(),'DownloadSettings')
+  const f=mount(t);f.state.selectSettingsTab('storage');const initial=component(f.render(),'DownloadSettings')
   assert.ok(initial);assert.equal(initial.props.active,true);assert.equal(initial.props.available,true);assert.equal(initial.key,null)
   f.state.form.apiHash='unsaved-private-draft';f.state.authValue.value='typed-code';f.state.navigate('tasks');await flush()
   const hidden=component(f.render(),'DownloadSettings');assert.equal(hidden.type,initial.type);assert.equal(hidden.key,initial.key);assert.equal(hidden.props.active,false)
@@ -164,16 +232,22 @@ test('settings diagnostics and onboarding are collapsed by default while credent
   f.state.error.value='visible service error';const tree=f.render(),details=nodes(tree).filter(node=>node.type==='details')
   const text=node=>typeof node==='string'?node:Array.isArray(node)?node.map(text).join(''):node&&typeof node==='object'?text(node.children):''
   const summaryText=node=>nodes(node).filter(child=>child.type==='summary').map(text).join('')
-  const diagnostic=details.find(node=>summaryText(node).includes('本机诊断')),help=details.find(node=>summaryText(node).includes('首次连接帮助'))
-  const staticHelp=nodes(tree).map(node=>node.children).find(content=>typeof content==='string'&&content.includes('<summary>首次连接帮助</summary>'))
+  const diagnostic=details.find(node=>summaryText(node).includes('本机诊断')),help=details.find(node=>text(node).includes('首次连接帮助'))
   assert.ok(diagnostic);assert.notEqual(diagnostic.props?.open,true)
-  // Vue may hoist the entirely static onboarding disclosure into one static HTML VNode.
-  if(help)assert.notEqual(help.props?.open,true)
-  else assert.match(staticHelp??'',/<details(?![^>]*\bopen\b)[^>]*><summary>首次连接帮助<\/summary>/)
+  assert.ok(help);assert.notEqual(help.props?.open,true)
   for(const id of ['api-id','api-hash','proxy-type','auth-value']){
     assert.ok(nodes(tree).some(node=>node.props?.id===id),id)
     assert.equal(details.some(detail=>nodes(detail).some(node=>node.props?.id===id)),false,id+' must stay outside collapsed help')
   }
   assert.ok(nodes(tree).some(node=>node.props?.role==='alert'&&text(node).includes('visible service error')))
   assert.ok(component(tree,'ThumbnailCacheSettings'));assert.ok(component(tree,'DownloadSettings'))
+})
+
+test('settings tabs expose diagnostic details and keep preference panels mounted without active hidden reads',t=>{
+  const f=mount(t);assert.equal(component(f.render(),'LocalPreferencesSettings').props.active,false)
+  f.state.selectSettingsTab('storage');assert.equal(component(f.render(),'LocalPreferencesSettings').props.active,true)
+  f.state.selectSettingsTab('diagnostics');const tree=f.render()
+  assert.equal(component(tree,'LocalPreferencesSettings').props.active,false)
+  const details=nodes(tree).find(node=>node.type==='details'&&String(node.props?.class).includes('runtime-section'))
+  assert.equal(details.props.open,true)
 })

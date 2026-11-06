@@ -12,6 +12,23 @@ export interface DownloadTask {
   completed: number; skipped: number; totalBytes: number; error: string | null; createdAt: number; updatedAt: number; items: DownloadItem[]
   duplicatePolicy: 'HISTORY_SKIP_V1' | 'KEEP_DUPLICATES_V2'; duplicates:number; duplicateDirectory:string
   automation?: DownloadAutomation | null
+  retry?: DownloadRetry | null
+}
+export interface DownloadRetry { attempt: number; nextAttemptAt: number }
+export function validDownloadRetry(value: unknown, task: Pick<DownloadTask, 'state' | 'pauseRequested'>): value is DownloadRetry {
+  if (!value || typeof value !== 'object' || Array.isArray(value) || task.state !== 'QUEUED' || task.pauseRequested !== false) return false
+  const retry = value as DownloadRetry
+  return Number.isSafeInteger(retry.attempt) && retry.attempt > 0 && Number.isSafeInteger(retry.nextAttemptAt)
+    && retry.nextAttemptAt > 0 && retry.nextAttemptAt <= 8_640_000_000_000_000
+}
+export function downloadTaskStatus(task: DownloadTask): string {
+  return task.retry ? '等待自动重试' : task.pauseRequested && ['QUEUED','RUNNING'].includes(task.state) ? '正在暂停'
+    : task.state === 'COMPLETED' && task.skipped ? '已处理完成' : taskLabels[task.state]!
+}
+export function downloadRetryHint(task: DownloadTask): string {
+  if (!validDownloadRetry(task.retry, task)) return ''
+  const time = new Intl.DateTimeFormat('zh-CN', { timeZone: 'Asia/Shanghai', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false }).format(task.retry.nextAttemptAt)
+  return `已安排第 ${task.retry.attempt} 次自动重试，预计北京时间 ${time} 重试。无需手动继续；点击“暂停下载”会取消自动重试。`
 }
 export interface DownloadAutomation {
   ruleId: string; ruleVersion: number; ruleName: string; manual: boolean; held: boolean; enabled: boolean; currentVersion: number
@@ -58,7 +75,8 @@ export function validDownloadItem(value: unknown): value is DownloadItem {
 export function validTask(task: DownloadTask | null | undefined): task is DownloadTask {
   return !!task && typeof task.id === 'string' && !!task.id && task.scope === 'OBSERVED_SELECTION'
     && ['QUEUED', 'RUNNING', 'PAUSED', 'FAILED', 'COMPLETED'].includes(task.state)
-    && Number.isSafeInteger(task.total) && task.total > 0 && task.total <= 100
+    && typeof task.pauseRequested === 'boolean' && (task.retry == null || validDownloadRetry(task.retry, task))
+    && Number.isSafeInteger(task.total) && task.total > 0
     && Number.isSafeInteger(task.completed) && task.completed >= 0 && task.completed <= task.total
     && Number.isSafeInteger(task.skipped) && task.skipped >= 0 && task.completed + task.skipped <= task.total
     && ['HISTORY_SKIP_V1','KEEP_DUPLICATES_V2'].includes(task.duplicatePolicy)

@@ -43,6 +43,17 @@ const fullTask = (member = summary(), overrides = {}) => ({
     downloadedBytes: member.downloadedBytes, writtenBytes: member.writtenBytes, outputPath: ROOT + '\\频道\\主帖\\synthetic.txt', error: null }], ...overrides,
 })
 
+test('batch status accepts more than 29 bounded tasks and preserves unlimited frozen totals and date conditions',()=>{
+  const members=Array.from({length:60},(_,i)=>summary({id:id(i+100),total:100,totalBytes:3700}))
+  const value=batch(members);value.snapshot={...value.snapshot,postCount:60,startDate:'2024-01-01',endDate:'2024-12-31'}
+  assert.equal(batchModule.validBatchStatus(value),true);assert.equal(value.snapshot.total,6000)
+  assert.equal(batchModule.validBatchStatus({...value,snapshot:{...value.snapshot,startDate:'2024-02-01'}},value),false)
+  assert.equal(batchModule.validBatchStatus({...value,snapshot:{...value.snapshot,startDate:null}},value),false)
+  assert.equal(batchModule.validBatchStatus({...value,snapshot:{...value.snapshot,endDate:'2023-12-31'}}),false)
+  assert.equal(batchModule.validBatchStatus({...value,snapshot:{...value.snapshot,endDate:'2024-02-30'}}),false)
+  const old=batch();assert.equal(batchModule.validBatchStatus({...old,snapshot:{...old.snapshot,startDate:null,endDate:null}},old),true)
+})
+
 test('actual child states define the batch and mixed running/failed members keep their failure count and controls', () => {
   const mixed = batch([summary({ state: 'RUNNING' }), summary({ id: id(101), state: 'FAILED', error: 'Synthetic failure' })])
   assert.equal(batchModule.validBatchStatus(mixed), true)
@@ -119,7 +130,7 @@ const compiled = ts.transpileModule(compileScript(parsed.descriptor, { id: 'down
 class ApiError extends Error { constructor(message, status) { super(message); this.status = status } }
 function mount(t, initial = batch(), propsOverride = {}) {
   const accessible = propsOverride.active !== false && (propsOverride.authorized ?? true) && (propsOverride.available ?? true) && (Object.hasOwn(propsOverride, 'accountId') ? !!propsOverride.accountId : true)
-  const steps = accessible ? [{ path: LIST, value: initial instanceof Promise || initial instanceof Error ? initial : { items: [initial], workerWarning: null } }] : []
+  const steps = accessible ? [{ path: propsOverride.focusId?'/transfers/download/batches/'+propsOverride.focusId:LIST, value: propsOverride.focusId||initial instanceof Promise||initial instanceof Error?initial:{ items: [initial], workerWarning: null } }] : []
   const calls = [], failures = [], hooks = [], timers = [], events = []
   const props = vue.reactive({ authorized: true, available: true, accountId: '1', ...propsOverride })
   const api = async (path, options = {}) => {
@@ -161,6 +172,9 @@ test('batch records pass activity and default closed without discarding cached c
   f.expect(LIST,{items:[fresh,saved],workerWarning:null});f.expect('/transfers/download/tasks/'+TASK,fullTask());f.props.active=true;await flush()
   records=renderBatchRecords(f);assert.equal(records.length,2);assert.equal(records[0].key,fresh.id);assert.ok(records.every(record=>record.props.active===true&&record.props['default-expanded']===false));assert.equal(f.state.detailTaskId.value,TASK)
 })
+test('a focused batch detail loads only its selected parent and retains immutable member evidence',async t=>{
+  const saved=batch(),f=mount(t,saved,{focusId:BATCH});await flush();assert.deepEqual(f.state.batches.value.map(batch=>batch.id),[BATCH]);assert.equal(f.state.hasMore.value,false);assert.deepEqual(f.calls,[{path:STATUS,method:'GET'}]);assert.equal(renderBatchRecords(f)[0].props['default-expanded'],true)
+})
 
 test('compact history starts with only a bounded GET, never resumes completed or paused tasks on view', async t => {
   const completed = batch([done()]), f = mount(t, completed)
@@ -169,7 +183,7 @@ test('compact history starts with only a bounded GET, never resumes completed or
   assert.equal(f.state.batches.value[0].state, 'COMPLETED')
   assert.match(f.state.description(completed), /已保存 1\/1/)
   assert.equal(f.timers.length, 0, 'Completed history has no automatic refresh')
-  assert.match(parsed.descriptor.template.content, /:default-expanded="false"/)
+  assert.match(parsed.descriptor.template.content, /:default-expanded="!!focusId"/)
   await f.state.action(completed, 'pause'); await f.state.action(completed, 'resume')
   assert.equal(f.calls.length, 1, 'Repeated completed controls are no-ops')
 })

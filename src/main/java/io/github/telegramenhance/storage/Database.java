@@ -20,7 +20,7 @@ import org.springframework.stereotype.Component;
 /** One process owns one connection. Callbacks must contain only short local SQL work. */
 @Component
 public final class Database implements AutoCloseable {
-    public static final int SCHEMA_VERSION = 17;
+    public static final int SCHEMA_VERSION = 19;
     private static final int BUSY_TIMEOUT_MS = 5_000;
     private final Path databasePath;
     private final Connection connection;
@@ -103,6 +103,10 @@ public final class Database implements AutoCloseable {
                 LEFT JOIN download_rule_tasks t ON t.rule_id=r.id LIMIT 0
                 """)){}
             validateContentSkipColumn(connection);
+            try (Statement statement = connection.createStatement();
+                 ResultSet ignored = statement.executeQuery("SELECT task_id,account_id,deleted_at,cleanup_pending FROM download_task_deletions LIMIT 0")) { }
+            try (Statement statement = connection.createStatement();
+                 ResultSet ignored = statement.executeQuery("SELECT task_id,account_id,attempt,next_attempt_at FROM download_task_retries LIMIT 0")) { }
         } catch (SQLException | IOException | RuntimeException failure) {
             if (opened != null) {
                 try { opened.close(); }
@@ -509,6 +513,24 @@ public final class Database implements AutoCloseable {
                 }
                 if (oldVersion < 16) allowDuplicatePlansWithoutManifests(sql);
                 if (oldVersion < 17) addContentSkipColumn(sql);
+                if (oldVersion < 18) {
+                    statement.execute("""
+                        CREATE TABLE IF NOT EXISTS download_task_deletions (
+                            task_id TEXT PRIMARY KEY NOT NULL REFERENCES download_tasks(task_id),
+                            account_id TEXT NOT NULL,deleted_at INTEGER NOT NULL,
+                            cleanup_pending INTEGER NOT NULL DEFAULT 1 CHECK(cleanup_pending IN(0,1)))
+                        """);
+                    statement.execute("CREATE INDEX IF NOT EXISTS download_task_deletions_cleanup ON download_task_deletions(account_id,cleanup_pending,deleted_at,task_id)");
+                }
+                if(oldVersion<19){
+                    statement.execute("""
+                        CREATE TABLE IF NOT EXISTS download_task_retries (
+                            task_id TEXT PRIMARY KEY NOT NULL REFERENCES download_tasks(task_id),account_id TEXT NOT NULL,
+                            attempt INTEGER NOT NULL CHECK(attempt BETWEEN 1 AND 2147483647),
+                            next_attempt_at INTEGER NOT NULL CHECK(next_attempt_at BETWEEN 0 AND 8640000000000000))
+                        """);
+                    statement.execute("CREATE INDEX IF NOT EXISTS download_task_retries_due ON download_task_retries(account_id,next_attempt_at,task_id)");
+                }
                 statement.execute("PRAGMA user_version=" + SCHEMA_VERSION);
             }
             return null;

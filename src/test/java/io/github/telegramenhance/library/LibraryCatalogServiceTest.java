@@ -38,6 +38,14 @@ class LibraryCatalogServiceTest {
         when(repository.media("account-a", "post", List.of("PHOTO", "VIDEO"), false, 50, 0)).thenReturn(expected);
         assertSame(expected, new LibraryCatalogService(repository, telegram).media("post", List.of(" photo ", "VIDEO", "PHOTO"), false, 50, 0));
     }
+    @Test void explicitSortKeepsAccountAndSearchBoundToTheSameCatalogRead() {
+        var repository = mock(ResourceRepository.class); var telegram = mock(TelegramService.class);
+        when(telegram.accountId()).thenReturn("account-a");
+        var expected = new CatalogPage(List.of(), 20, 40, 0, 3, 2, false, "INDEXED_ONLY");
+        var query = PostSearch.parse(List.of("-1001"), "旅行", "风景");
+        when(repository.catalog("account-a", query, 20, 40, "title-asc")).thenReturn(expected);
+        assertSame(expected, new LibraryCatalogService(repository, telegram).catalog(List.of("-1001"), "旅行", "风景", 20, 40, "title-asc"));
+    }
     @Test void invalidFiltersCannotTriggerRepositoryQueries() {
         var repository = mock(ResourceRepository.class); var telegram = mock(TelegramService.class);
         var service = new LibraryCatalogService(repository, telegram);

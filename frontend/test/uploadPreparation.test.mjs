@@ -13,9 +13,9 @@ import * as rules from '../src/rules.ts'
 const ID = '00000000-0000-0000-0000-000000000001'
 const LINK = 'https://t.me/synthetic/1'
 const flush = async () => { await vue.nextTick(); await new Promise(setImmediate) }
-function result(count = 23) {
-  const groups = []; for (let i = 0; i < count; i += 10) { const files = Array.from({ length: Math.min(10,count-i) }, (_,j) => ({ mediaType: 'VIDEO', relativePath: `clip${i+j+1}.mp4`, fileName: `clip${i+j+1}.mp4`, size: 10, caption: `clip${i+j+1}.mp4` })); groups.push({ number: groups.length + 1, mediaType: 'VIDEO', mode: files.length === 1 ? 'SINGLE' : 'ALBUM', files }) }
-  return { id: ID, accountId: '1', state: 'PREVIEW_ONLY', sourceDirectory: 'D:\source', archiveDirectory: 'D:\archive', recursive: true, captionMode: 'FILENAME', channelTitle: 'Synthetic', postTitle: 'Synthetic', postText: 'Synthetic', postLink: LINK, discussionTitle: 'Synthetic', permission: 'MEDIA_ALLOWED_AT_CHECK', slowModeSeconds: 0, fileCount: count, totalBytes: count * 10, groups, otherFiles: 0, deferredFiles: 0, linkedEntries: 0, duplicateFiles: 0, warnings: [], targetCheckedAt: 1, createdAt: 1, expiresAt: 600001 }
+function result(count = 23, albumSize = 10) {
+  const groups = []; for (let i = 0; i < count; i += albumSize) { const files = Array.from({ length: Math.min(albumSize,count-i) }, (_,j) => ({ mediaType: 'VIDEO', relativePath: `clip${i+j+1}.mp4`, fileName: `clip${i+j+1}.mp4`, size: 10, caption: `clip${i+j+1}.mp4` })); groups.push({ number: groups.length + 1, mediaType: 'VIDEO', mode: files.length === 1 ? 'SINGLE' : 'ALBUM', files }) }
+  return { id: ID, accountId: '1', state: 'PREVIEW_ONLY', sourceDirectory: 'D:\source', archiveDirectory: 'D:\archive', recursive: true, captionMode: 'FILENAME', albumSize, channelTitle: 'Synthetic', postTitle: 'Synthetic', postText: 'Synthetic', postLink: LINK, discussionTitle: 'Synthetic', permission: 'MEDIA_ALLOWED_AT_CHECK', slowModeSeconds: 0, fileCount: count, totalBytes: count * 10, groups, otherFiles: 0, deferredFiles: 0, linkedEntries: 0, duplicateFiles: 0, warnings: [], targetCheckedAt: 1, createdAt: 1, expiresAt: 600001 }
 }
 function mount(t) {
   const parsed = parse(readFileSync(new URL('../src/components/UploadPreparation.vue', import.meta.url), 'utf8'), { filename: 'UploadPreparation.vue' })
@@ -43,6 +43,26 @@ test('successful recheck preserves grouping and remains a non-sending preview', 
 })
 test('source directory or caption changes invalidate both old preview and late responses', async t => {
   const f=await fields(t); let resolve; f.expect(new Promise(yes=>{resolve=yes})); const running=f.state.prepare(); f.state.captionMode.value='EMPTY'; await flush(); resolve(result()); await running; assert.equal(f.state.preview.value,null); assert.equal(f.state.busy.value,false)
+})
+
+test('chosen album size is sent to preparation and reflected in frozen groups including single sends',async t=>{
+  const f=await fields(t);assert.equal(f.state.albumSize.value,10)
+  for(const size of [3,1]){
+    f.state.albumSize.value=size;await flush();f.expect(result(7,size));await f.state.prepare()
+    assert.equal(f.calls.at(-1).options.body.albumSize,size);assert.equal(f.state.preview.value.albumSize,size)
+    assert.deepEqual(f.state.preview.value.groups.map(group=>group.files.length),size===3?[3,3,1]:[1,1,1,1,1,1,1])
+  }
+  assert.equal(f.calls.some(call=>call.path.endsWith('/tasks')),false)
+})
+test('album size changes invalidate old previews and late responses, and mismatched receipts are rejected',async t=>{
+  const f=await fields(t);f.expect(result(7));await f.state.prepare()
+  f.state.albumSize.value=3;await flush();assert.equal(f.state.preview.value,null)
+  let release;f.expect(new Promise(resolve=>release=resolve));const pending=f.state.prepare()
+  f.state.albumSize.value=1;await flush();release(result(7,3));await pending
+  assert.equal(f.state.preview.value,null);assert.equal(f.state.busy.value,false)
+  f.expect(result(1,10));await f.state.prepare();assert.equal(f.state.preview.value,null);assert.match(f.state.error.value,/回执无法确认/)
+  for(const invalid of [0,11,1.5,NaN]){f.state.albumSize.value=invalid;await flush();await f.state.prepare()}
+  assert.equal(f.calls.length,3)
 })
 test('account changes and closing the view discard late preparation results', async t => {
   const f=await fields(t); let resolve; f.expect(new Promise(yes=>{resolve=yes})); const running=f.state.prepare(); f.props.accountId='2'; await flush(); resolve(result()); await running; assert.equal(f.state.preview.value,null); assert.equal(f.state.sourceDirectory.value,''); assert.equal(f.state.link.value,'')

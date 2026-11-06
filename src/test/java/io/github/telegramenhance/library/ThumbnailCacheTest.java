@@ -8,6 +8,8 @@ import java.awt.image.BufferedImage;
 import java.io.ByteArrayOutputStream;
 import java.nio.file.*;
 import java.nio.file.attribute.FileTime;
+import java.nio.channels.FileChannel;
+import java.nio.ByteBuffer;
 import java.util.Base64;
 import javax.imageio.ImageIO;
 import org.junit.jupiter.api.Test;
@@ -16,6 +18,47 @@ import org.junit.jupiter.api.io.TempDir;
 class ThumbnailCacheTest {
     @TempDir Path temporary;
     private static final String A = "a".repeat(64), B = "b".repeat(64), C = "c".repeat(64);
+
+    @Test void supportedQuotasPersistIndependentlyOfDirectoryAndInvalidQuotasDoNotWrite() throws Exception {
+        var paths = new AppPaths(temporary.resolve("data"));
+        try (var database = new Database(paths)) {
+            var root = temporary.resolve("quota-cache"); var cache = new ThumbnailCache(database, paths, root, 4, 256L * 1024 * 1024);
+            for (long invalid : new long[]{0, -1, 255L * 1024 * 1024, 256L * 1024 * 1024 + 1})
+                assertThrows(IllegalArgumentException.class, () -> cache.save(new ThumbnailCache.Update(root.toString(), invalid)));
+            assertFalse(Files.exists(root));
+            int savedRows = database.read(c -> { try (var r = c.createStatement().executeQuery("SELECT COUNT(*) FROM app_settings")) { r.next(); return r.getInt(1); } });
+            assertEquals(0, savedRows);
+            for (long limit : new long[]{256L * 1024 * 1024, 512L * 1024 * 1024, 1024L * 1024 * 1024}) {
+                assertEquals(limit, cache.save(new ThumbnailCache.Update(root.toString(), limit)).maximumBytes());
+                assertEquals(limit, new ThumbnailCache(database, paths, root, 4, 256L * 1024 * 1024).view().maximumBytes());
+            }
+            cache.save(new ThumbnailCache.Update(temporary.resolve("other-cache").toString()));
+            assertEquals(1024L * 1024 * 1024, cache.view().maximumBytes());
+        }
+    }
+
+    @Test void shrinkingTheQuotaEvictsOldOwnedFilesAndBlocksEarlierGenerationWrites() throws Exception {
+        var paths = new AppPaths(temporary.resolve("data"));
+        try (var database = new Database(paths)) {
+            var root = temporary.resolve("quota-cache"); var cache = new ThumbnailCache(database, paths, root, 4, 512L * 1024 * 1024);
+            cache.put(A, cache.generation(), image());
+            Path folder = root.resolve("twb-thumbnails-v1"), old = folder.resolve("thumb-" + B + ".jpg"), recent = folder.resolve("thumb-" + C + ".jpg");
+            // Sparse obsolete cache entries exercise a real byte quota without allocating hundreds of MiB of test data.
+            for (Path file : new Path[]{old, recent}) try (var channel = FileChannel.open(file, StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE, StandardOpenOption.SPARSE)) {
+                channel.position(128L * 1024 * 1024); channel.write(ByteBuffer.wrap(new byte[]{0}));
+            }
+            Files.setLastModifiedTime(folder.resolve("thumb-" + A + ".jpg"), FileTime.fromMillis(10));
+            Files.setLastModifiedTime(old, FileTime.fromMillis(20)); Files.setLastModifiedTime(recent, FileTime.fromMillis(30));
+            Files.writeString(folder.resolve("keep.txt"), "unrelated");
+            assertTrue(cache.view().bytes() > 256L * 1024 * 1024); long previousGeneration = cache.generation();
+            var saved = cache.save(new ThumbnailCache.Update(root.toString(), 256L * 1024 * 1024));
+            assertTrue(saved.bytes() <= saved.maximumBytes()); assertEquals(1, saved.files());
+            assertFalse(Files.exists(old)); assertTrue(Files.exists(recent)); assertEquals("unrelated", Files.readString(folder.resolve("keep.txt")));
+            cache.put(A, previousGeneration, image()); assertEquals(1, cache.view().files());
+            var restarted = new ThumbnailCache(database, paths, root, 4, 512L * 1024 * 1024);
+            assertEquals(256L * 1024 * 1024, restarted.view().maximumBytes()); assertEquals(saved.bytes(), restarted.view().bytes());
+        }
+    }
     static Preview image() throws Exception {
         var output = new ByteArrayOutputStream();
         ImageIO.write(new BufferedImage(32, 24, BufferedImage.TYPE_INT_RGB), "JPEG", output);

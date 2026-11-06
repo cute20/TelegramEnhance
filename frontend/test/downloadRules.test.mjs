@@ -50,6 +50,12 @@ test('unresolved is not a failure or completion: optional errors and actual save
   assert.equal(rules.validDownloadRule(view({ summary: { job: job({ completed: 3 }) } }), '1'), false)
   assert.equal(rules.validDownloadRule(view({ state: 'COMPLETED' }), '1'), false, 'A persistent rule has no whole-channel complete state')
 })
+
+test('download rule progress accepts cumulative post, media and page totals beyond former business ceilings',()=>{
+  const value=enabled({summary:{scanned:10_001,matched:10_001,unresolved:0,commentPages:200_001,media:100_001,completed:0,job:job({total:100_001})}})
+  assert.equal(rules.validDownloadRule(value,'1'),true)
+  assert.equal(rules.validDownloadRule({...value,summary:{...value.summary,media:Number.MAX_SAFE_INTEGER+1}},'1'),false)
+})
 test('window accepts cross-midnight and requires actual Shanghai times rather than browser-zone guesses', () => {
   const value = input(); value.window = { mode: 'WINDOW', start: '22:00', end: '08:00', timezone: 'Asia/Shanghai' }
   assert.equal(rules.validDownloadRuleInput(value), true)
@@ -129,6 +135,13 @@ function mount(t, initial = view(), overrides = {}, cachedChannels = true) {
     expect: (path, value, method = 'GET', body) => steps.push({ path, value, method, body }) }
 }
 const fill = state => { state.edit(null); Object.assign(state.form, input()) }
+
+test('the complete download-rule list accepts more than twenty rules without hiding or rejecting later channels',async t=>{
+  const values=Array.from({length:25},(_,i)=>view({rule:{id:'00000000-0000-0000-0000-'+String(i+10).padStart(12,'0')}}))
+  const f=mount(t,values);await flush()
+  assert.equal(f.state.items.value.length,25);assert.equal(f.state.listError.value,'');assert.equal(f.calls.length,1)
+  assert.equal(f.state.items.value.at(-1).rule.id,values.at(-1).rule.id)
+})
 
 test('source mode changes clear stale sources and filters while preserving chosen media and manual name', async t => {
   const f = mount(t); await flush(); fill(f.state)
@@ -568,4 +581,18 @@ test('embedded creation never accepts an unexpectedly enabled receipt as a confi
   assert.equal(f.events.some(event => event[0] === 'saved'), false)
   f.state.closeForm(); assert.equal(f.state.formOpen.value, true)
   assert.equal(f.calls.length, 1)
+})
+
+test('hidden download rules defer a queued list refresh until returning without clearing loaded state',async t=>{
+  const waiting=deferred(),f=mount(t,waiting.promise);f.props.active=false;f.props.refreshVersion=1;await flush()
+  waiting.resolve(listing([view()]));await flush();assert.equal(f.calls.length,1);assert.equal(f.state.items.value.length,1)
+  f.expect(BASE,listing([view()]));f.props.active=true;await flush();assert.equal(f.calls.length,2)
+})
+
+test('an uncertain download rule creation survives page visibility and only its original lookup resolves it',async t=>{
+  const f=mount(t);await flush();fill(f.state);f.expect(BASE,new Error('timeout'),'POST');await f.state.save()
+  const operation=f.calls[1].options.body.operationId;f.props.active=false;await flush();assert.equal(f.state.uncertain.value.operationId,operation)
+  f.props.active=true;await flush();assert.equal(f.calls.length,2);assert.equal(f.state.formOpen.value,true)
+  f.expect(BASE+'/by-operation/'+operation,view());await f.state.lookup()
+  assert.equal(f.state.uncertain.value,null);assert.equal(f.calls.filter(call=>call.options.method==='POST').length,1)
 })

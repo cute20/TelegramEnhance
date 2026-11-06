@@ -28,4 +28,6 @@ public final class BotDownloadController {
         return result;
     }
     @GetMapping("/tasks/by-operation/{id}") public BotDownloadService.Lookup lookup(@PathVariable String id){return bots.lookup(id);}
+    @PostMapping("/preparations") public CompletableFuture<BotDownloadService.Preparation> prepare(@RequestBody BotDownloadService.Create input){return bots.prepare(input);}
+    @GetMapping("/preparations/{id}") public ResponseEntity<BotDownloadService.Preparation> preparation(@PathVariable String id){return ResponseEntity.ofNullable(bots.preparation(id));}
 }

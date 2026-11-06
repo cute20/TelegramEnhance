@@ -2,13 +2,13 @@
 import { onBeforeUnmount, ref, watch } from 'vue'
 import { api, ApiError } from '../api'
 import { formatMediaBytes, originalMessageLink } from '../library'
-import { taskLabels, validTask, type DownloadTask, type DownloadAutomation } from '../downloadTasks'
+import { taskLabels, validTask, downloadTaskStatus, downloadRetryHint, type DownloadTask, type DownloadAutomation } from '../downloadTasks'
 import AppIcon from './AppIcon.vue'
 import CompactRecord from './CompactRecord.vue'
 import InfiniteLoad from './InfiniteLoad.vue'
 import { mergeTaskHistory } from '../taskHistory'
 import RuleDownloadTasks from './RuleDownloadTasks.vue'
-const props = withDefaults(defineProps<{ authorized: boolean; available: boolean; accountId: string | null; active?: boolean; refreshVersion?: number }>(), { active: true })
+const props = withDefaults(defineProps<{ authorized: boolean; available: boolean; accountId: string | null; active?: boolean; refreshVersion?: number; focusId?:string }>(), { active: true })
 const emit = defineEmits<{ accessError: [cause: ApiError] }>()
 const tasks = ref<DownloadTask[]>([]), error = ref(''), workerWarning = ref(''), busy = ref(''), loading = ref(false)
 const offset = ref(0)
@@ -48,6 +48,7 @@ async function load(append = false) {
   const alive = () => current(request, account) && ready() && epoch === listEpoch
   pending = true; loading.value = true; loadingMore.value = append
   try {
+    if(props.focusId){const result=await api<DownloadTask>('/transfers/download/tasks/'+encodeURIComponent(props.focusId));if(!alive())return;if(!validTask(result)||result.id!==props.focusId)throw new Error('下载任务回执无法确认');tasks.value=[result];hasMore.value=false;offset.value=1;error.value='';return}
     const updates = new Map<string, DownloadTask>(); let lastSize = 0, warning = ''
     const end = append ? start + 20 : Math.max(20, previousOffset, previous.length)
     for (let position = start; position < end; position += 20) {
@@ -95,7 +96,7 @@ function automationState(value: DownloadAutomation) {
   return value.manual ? '已转手动' : value.held ? '手动暂停' : !value.enabled ? '规则已暂停'
     : value.ruleVersion !== value.currentVersion ? '使用旧规则配置' : '规则已启用'
 }
-watch([() => props.authorized, () => props.available, () => props.accountId], () => {
+watch([() => props.authorized, () => props.available, () => props.accountId,()=>props.focusId], () => {
   generation++; stop(); tasks.value = []; error.value = ''; historyError.value = ''; busy.value = ''; loading.value = false; loadingMore.value = false; workerWarning.value = ''; offset.value = 0; hasMore.value = true
   refreshQueued = ready(); if (!pending) void load()
 }, { immediate: true })
@@ -105,13 +106,14 @@ onBeforeUnmount(() => { disposed = true; generation++; stop() })
 <template>
   <section class="download-tasks" aria-label="单帖下载">
     <header class="tasks-toolbar"><div><h2>单帖下载</h2></div><button class="btn" :disabled="loading" @click="refreshAll()"><AppIcon name="refresh" />刷新任务</button></header>
-    <RuleDownloadTasks :authorized="authorized" :available="available" :account-id="accountId" :active="active" :refresh-version="(refreshVersion??0)+localRefresh" @count="ruleCount=$event" @access-error="emit('accessError',$event)" />
+    <RuleDownloadTasks v-if="!focusId" :authorized="authorized" :available="available" :account-id="accountId" :active="active" :refresh-version="(refreshVersion??0)+localRefresh" @count="ruleCount=$event" @access-error="emit('accessError',$event)" />
     <div v-if="!authorized" class="notice warning">请先连接 Telegram，再查看当前账号的下载任务。</div>
     <div v-if="workerWarning" class="notice warning" role="alert">{{ workerWarning }}</div><div v-if="error" class="notice danger" role="alert">{{ error }}</div>
     <p v-if="loading && !tasks.length && !ruleCount" class="tasks-empty" role="status">正在读取任务…</p><p v-else-if="!tasks.length && !ruleCount" class="tasks-empty">暂无下载任务。点击右上“新建传输”，预览、勾选媒体并填写保存目录。</p>
-    <CompactRecord v-for="task in tasks" :key="task.id" class="download-task" :title="task.title" :description="`${task.channelTitle} · 已保存 ${task.completed}/${task.total}${task.duplicates?' · 重复媒体 '+task.duplicates:''}${task.skipped?' · 历史跳过 '+task.skipped:''} · ${formatMediaBytes(task.totalBytes)}`" :status="task.pauseRequested&&task.state==='RUNNING'?'正在暂停':task.state==='COMPLETED'&&task.skipped?'已处理完成':taskLabels[task.state]!" :tone="task.state==='COMPLETED'?'success':task.state==='FAILED'?'warning':['RUNNING','QUEUED'].includes(task.state)?'active':'neutral'" :timestamp="task.updatedAt" :default-expanded="false" :active="active" :alert="task.error">
+    <CompactRecord v-for="task in tasks" :key="task.id" class="download-task" :title="task.title" :description="`${task.channelTitle} · 已保存 ${task.completed}/${task.total}${task.duplicates?' · 重复媒体 '+task.duplicates:''}${task.skipped?' · 历史跳过 '+task.skipped:''} · ${formatMediaBytes(task.totalBytes)}`" :status="downloadTaskStatus(task)" :tone="task.state==='COMPLETED'?'success':task.state==='FAILED'?'warning':['RUNNING','QUEUED'].includes(task.state)?'active':'neutral'" :timestamp="task.updatedAt" :default-expanded="!!focusId" :active="active" :alert="task.retry ? downloadRetryHint(task) + (task.error ? ' ' + task.error : '') : task.error">
       <div class="download-task-body">
         <p v-if="task.error" class="notice warning" role="status">{{ task.error }}</p>
+        <p v-if="task.retry" class="notice download-retry-note" role="status">{{ downloadRetryHint(task) }}</p>
         <dl class="task-facts">
           <dt>保存位置</dt><dd><code>{{ task.targetDirectory }}</code></dd>
           <template v-if="task.duplicatePolicy==='KEEP_DUPLICATES_V2' && task.duplicates">
@@ -126,6 +128,7 @@ onBeforeUnmount(() => { disposed = true; generation++; stop() })
           <button v-if="['QUEUED','RUNNING'].includes(task.state)" class="btn" :disabled="!!busy || task.pauseRequested" @click="action(task,'pause')">暂停下载</button>
           <button v-if="['PAUSED','FAILED'].includes(task.state)" class="btn primary" :disabled="!!busy" @click="action(task,'resume')">继续未完成项</button>
           <small v-if="task.automation && !task.automation.manual">继续下载受规则状态和时段控制。</small>
+          <small v-if="task.state==='PAUSED'">任务已暂停，不会自动重试；需要时点击“继续未完成项”。</small>
         </div>
         <details class="task-files">
           <summary>文件明细（{{ task.total }}）</summary>

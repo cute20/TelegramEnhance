@@ -121,11 +121,11 @@ test('single-post connection interruption never releases the synchronous mutatio
 test('shared channel source uses one channel discovery owner and sends unchanged tags and keywords to the scan API',async t=>{
   const f=mount(t,'DownloadChannelPreview',{selection:selection({entry:'CHANNEL',source:'-1001'})});await flush();assert.equal(f.calls.length,0)
   assert.equal(f.nodes().some(node=>node.type?.__name==='SourceChannelSelect'),false)
-  f.expect('/transfers/download/channels/preview',scan(),'POST',{source:'-1001',tags:'旅行',keywords:'山'});await f.state.begin()
+  f.expect('/transfers/download/channels/preview',scan(),'POST',{source:'-1001',tags:'旅行',keywords:'山',startDate:null,endDate:null});await f.state.begin()
   assert.equal(f.state.scan.value.exhausted,true)
   f.props.selection=selection({entry:'MANUAL',source:'@other',tags:'新标签',keywords:'新词'});await flush()
   assert.equal(f.state.scan.value,null);assert.equal(f.state.tags.value,'新标签');assert.equal(f.state.keywords.value,'新词')
-  f.expect('/transfers/download/channels/preview',scan({tags:['新标签'],keywords:['新词']}),'POST',{source:'@other',tags:'新标签',keywords:'新词'});await f.state.begin()
+  f.expect('/transfers/download/channels/preview',scan({tags:['新标签'],keywords:['新词']}),'POST',{source:'@other',tags:'新标签',keywords:'新词',startDate:null,endDate:null});await f.state.begin()
   assert.equal(f.calls.length,2);assert.ok(f.calls.every(call=>call.path==='/transfers/download/channels/preview'))
 })
 

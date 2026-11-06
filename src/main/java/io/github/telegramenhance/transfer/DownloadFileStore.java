@@ -26,6 +26,7 @@ import java.util.UUID;
 public final class DownloadFileStore {
     private static final int CHUNK = 1024 * 1024;
     private final DownloadPaths paths; private final DownloadRepository repository;
+    private final Object publication = new Object();
     public DownloadFileStore(DownloadPaths paths, DownloadRepository repository) { this.paths = paths; this.repository = repository; }
     public interface Content { byte[] read(long offset, int count); }
     public static final class Stopped extends RuntimeException { }
@@ -40,7 +41,10 @@ public final class DownloadFileStore {
         Path current = root;
         for (Path part : relative) {
             Path child = current.resolve(part);
-            if (!Files.exists(child, LinkOption.NOFOLLOW_LINKS)) Files.createDirectory(child);
+            if (!Files.exists(child, LinkOption.NOFOLLOW_LINKS)) {
+                try { Files.createDirectory(child); }
+                catch (FileAlreadyExistsException concurrentCreation) { /* Validate the winning directory below. */ }
+            }
             if (!Files.isDirectory(child) || Files.isSymbolicLink(child) || !child.toRealPath().startsWith(root)) throw new IOException("Target directory changed");
             current = child.toRealPath();
             if(!paths.root(current.toString()).equals(current))throw new IOException("Protected output directory");
@@ -48,6 +52,9 @@ public final class DownloadFileStore {
         return current;
     }
     public boolean recoverPublished(Task task, Item item, Runnable check) throws IOException {
+        synchronized (publication) { return recoverPublishedLocked(task, item, check); }
+    }
+    private boolean recoverPublishedLocked(Task task, Item item, Runnable check) throws IOException {
         Path dir = directory(task), target = item.plan()==null?target(dir,item.relativeFile()):output(task,item.plan().relativePath());
         if (Files.exists(target, LinkOption.NOFOLLOW_LINKS) && "FINALIZING".equals(item.state()) && item.sha256() != null && matches(target, item.file().size(), item.sha256(), check)) {
             writeManifest(task,item,item.plan(),check);
@@ -56,6 +63,17 @@ public final class DownloadFileStore {
         return false;
     }
     public void write(Task task, Item original, Content content, Runnable check) throws IOException {
+        write(task, original, content, check, false, () -> {});
+    }
+    /** Checkpoints only complete network blocks that have been forced to the owned partial file. */
+    public void writeStreaming(Task task, Item original, Content content, Runnable check) throws IOException {
+        writeStreaming(task, original, content, check, () -> {});
+    }
+    /** Confirms the final transfer receipt only after every byte has a verified durable checkpoint. */
+    public void writeStreaming(Task task, Item original, Content content, Runnable check, Runnable beforePublish) throws IOException {
+        write(task, original, content, check, true, beforePublish);
+    }
+    private void write(Task task, Item original, Content content, Runnable check, boolean streaming, Runnable beforePublish) throws IOException {
         Path dir = directory(task); Item item = original;
         Path part = part(dir, item), owner = owner(dir, item);
         if (!Files.exists(owner, LinkOption.NOFOLLOW_LINKS)) Files.writeString(owner, item.token(), StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE, LinkOption.NOFOLLOW_LINKS);
@@ -74,7 +92,8 @@ public final class DownloadFileStore {
         if (written > 0 && !prefix.equals(item.sha256())) throw new IOException("Partial file changed");
         long remaining = item.file().size() - written;
         if (Files.getFileStore(dir).getUsableSpace() < remaining + 16L * 1024 * 1024) throw new IOException("Insufficient output space");
-        repository.progress(task.accountId(), task.id(), item.id(), "WRITING", item.file().size(), written, prefix, item.relativeFile());
+        String phase = streaming ? "DOWNLOADING" : "WRITING";
+        repository.progress(task.accountId(), task.id(), item.id(), phase, streaming ? written : item.file().size(), written, prefix, item.relativeFile());
         try (var output = FileChannel.open(part, StandardOpenOption.WRITE, LinkOption.NOFOLLOW_LINKS)) {
             verifyOwner(owner, item);
             output.truncate(written); output.position(written);
@@ -83,14 +102,32 @@ public final class DownloadFileStore {
                 int count = (int) Math.min(CHUNK, item.file().size() - written);
                 byte[] data = content.read(written, count);
                 if (data == null || data.length != count) throw new IOException("Unexpected source length");
+                // A network read can outlive a pause or a change to the owned output paths.
+                check.run(); if (!directory(task).equals(dir)) throw new IOException("Target changed"); verifyOwner(owner, item);
                 ByteBuffer buffer = ByteBuffer.wrap(data); while (buffer.hasRemaining()) output.write(buffer);
                 digest.update(data); output.force(false); written += count;
-                repository.progress(task.accountId(), task.id(), item.id(), "WRITING", item.file().size(), written, digestCopy(digest), item.relativeFile());
+                String checkpointHash = digestCopy(digest);
+                if (streaming) repository.streamCheckpoint(task.accountId(), task.id(), item.id(), written, checkpointHash, item.relativeFile());
+                else repository.progress(task.accountId(), task.id(), item.id(), phase, item.file().size(), written, checkpointHash, item.relativeFile());
             }
             output.force(true);
         }
         String hash = digestCopy(digest); check.run();
         if (Files.size(part) != item.file().size() || !matches(part, item.file().size(), hash, check)) throw new IOException("Output verification failed");
+        if (streaming) {
+            check.run(); beforePublish.run(); check.run();
+            // A final network receipt may wait long enough for the output to change after verification.
+            if (!directory(task).equals(dir)) throw new IOException("Target changed"); verifyOwner(owner, item);
+            if (Files.size(part) != item.file().size() || !matches(part, item.file().size(), hash, check)) throw new IOException("Output verification failed");
+            repository.progress(task.accountId(), task.id(), item.id(), "WRITING", item.file().size(), written, hash, item.relativeFile());
+        }
+        synchronized (publication) {
+            // Hashing/byte copies remain concurrent. Plan selection, publication, and its
+            // success log settle together before another file checks duplicate history.
+            check.run(); publish(task, item, dir, part, owner, hash, check);
+        }
+    }
+    private void publish(Task task, Item item, Path dir, Path part, Path owner, String hash, Runnable check) throws IOException {
         if(repository.skipContent(task,item,hash)){
             // Commit the skip decision before removing our verified temporary file, so an interruption
             // cannot leave a WRITING checkpoint whose entire prefix has already been deleted.
@@ -122,6 +159,19 @@ public final class DownloadFileStore {
         if(!Files.exists(owner(existing,item),LinkOption.NOFOLLOW_LINKS))return;
         Path dir=directory(task);
         cleanupAfterCompleted(dir,verifiedForCleanup(item,item.sha256()));
+    }
+    /** Remove only authenticated unfinished temporary files. Published user files and history are retained. */
+    public boolean cleanupDeleted(Task task)throws IOException{
+        Path existing=Path.of(task.targetRoot()).resolve(task.relativeDirectory());
+        if(!Files.exists(existing,LinkOption.NOFOLLOW_LINKS))return true;
+        Path dir=directory(task);boolean complete=true;
+        for(var item:task.items()){
+            if(item.state().equals("COMPLETED")||item.state().equals("SKIPPED_HISTORY"))continue;
+            Path marker=owner(dir,item);if(!Files.exists(marker,LinkOption.NOFOLLOW_LINKS))continue;
+            cleanupOwned(dir,item);
+            if(Files.exists(marker,LinkOption.NOFOLLOW_LINKS))complete=false;
+        }
+        return complete;
     }
     private static Item verifiedForCleanup(Item item,String hash){
         return new Item(item.id(),item.ordinal(),item.file(),item.relativeFile(),item.token(),item.state(),item.file().size(),item.file().size(),hash,item.error(),item.history(),item.plan());

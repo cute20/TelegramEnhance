@@ -6,6 +6,7 @@ import it.tdlight.jni.TdApi;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
+import tools.jackson.databind.json.JsonMapper;
 import org.junit.jupiter.api.Test;
 
 class BotReaderTest {
@@ -50,6 +51,39 @@ class BotReaderTest {
         var f = new Fixture(); var outgoing = message(99); outgoing.isOutgoing = true; f.history = new TdApi.Message[]{outgoing};
         var filtered = f.reader.history(f.target, null, 1); assertTrue(filtered.messages().isEmpty()); assertFalse(filtered.historyEnd()); assertEquals("99", filtered.nextCursor());
         f.history = new TdApi.Message[0]; var empty = f.reader.history(f.target, "99", 1); assertTrue(empty.historyEnd()); assertNull(empty.nextCursor());
+    }
+    @Test void historyCapturesTheOriginalFileIdentityBeforeLaterPagesCanRemoveTheMessage(){
+        var f=new Fixture();f.message.content=document(7,"stable-file",37);
+        var file=((TdApi.MessageDocument)f.message.content).document.document;file.remote.id="private-remote-reference";
+        var observed=f.reader.history(f.target,null,1).messages().getFirst();var media=observed.media().getFirst();var captured=observed.observedFiles().get(media.key());
+        assertNotNull(captured);assertEquals(media,captured.media());assertEquals("stable-file",captured.uniqueId());assertEquals(37,captured.size());
+        assertEquals(7,captured.botReference().fileId());assertEquals("private-remote-reference",captured.botReference().remoteId());
+        assertThrows(UnsupportedOperationException.class,()->observed.observedFiles().clear());
+        file.remote.id="changed-native-reference";file.remote.uniqueId="changed-native-identity";file.id=99;
+        assertEquals(7,captured.botReference().fileId());assertEquals("stable-file",captured.uniqueId());assertEquals("private-remote-reference",captured.botReference().remoteId());
+        String serialized=JsonMapper.builder().build().writeValueAsString(observed);
+        assertFalse(serialized.contains("private-remote-reference"));assertFalse(serialized.contains("observedFiles"));assertFalse(observed.toString().contains("private-remote-reference"));
+        assertTrue(f.calls.stream().noneMatch(query->query instanceof TdApi.GetFile||query instanceof TdApi.DownloadFile||query instanceof TdApi.ForwardMessages));
+    }
+    @Test void unsafeOrUnverifiableMediaNeverCaptureAReusableNativeFileHandle(){
+        for(String mode:List.of("self-destruct","overlay","secret","unknown-size","unknown-identity","wrong-sender","outgoing","channel")){
+            var f=new Fixture();f.message.content=document(7,"stable-file",37);
+            var file=((TdApi.MessageDocument)f.message.content).document.document;
+            if(mode.equals("self-destruct"))f.message.selfDestructIn=1;
+            if(mode.equals("overlay"))f.message.ephemeralContent=new TdApi.EphemeralMessageContent();
+            if(mode.equals("unknown-size"))file.size=0;
+            if(mode.equals("unknown-identity"))file.remote.uniqueId="";
+            if(mode.equals("wrong-sender"))f.message.senderId=new TdApi.MessageSenderUser(999);
+            if(mode.equals("outgoing"))f.message.isOutgoing=true;
+            if(mode.equals("channel"))f.message.isChannelPost=true;
+            if(mode.equals("secret")){var content=new TdApi.MessageVideo();content.video=new TdApi.Video();content.video.video=file;content.isSecret=true;f.message.content=content;}
+            var view=f.reader.history(f.target,null,1);
+            assertTrue(view.messages().stream().allMatch(message->message.observedFiles().isEmpty()),mode);
+        }
+    }
+    @Test void legacyBotMessageConstructorsDoNotInventCapturedFileAuthority(){
+        var message=new Message(new io.github.telegramenhance.library.ResourceModels.MessageRef("71","100",null),"text",List.of(),List.of());
+        assertTrue(message.observedFiles().isEmpty());
     }
     @Test void historyUsesStrictOlderCursorsAndDoesNotRepeatAnInclusiveAnchor() {
         var f = new Fixture(); f.history = new TdApi.Message[]{message(100), message(99), message(99), message(98)};

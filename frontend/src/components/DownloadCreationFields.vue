@@ -1,15 +1,16 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, ref, watch } from 'vue'
 import { api, ApiError } from '../api'
-import { validSourceChannels, type DownloadChannels } from '../downloadChannel'
+import { validSourceChannels, downloadDatesError, type DownloadChannels } from '../downloadChannel'
 import { mediaTypes } from '../downloadPreview'
 import type { DownloadCreationSelection } from '../transferCreation'
 import SourceChannelSelect from './SourceChannelSelect.vue'
-const props = defineProps<{ modelValue: DownloadCreationSelection; authorized: boolean; available: boolean; accountId: string | null; disabled: boolean }>()
+const props = defineProps<{ modelValue: DownloadCreationSelection; authorized: boolean; available: boolean; accountId: string | null; disabled: boolean; dateFiltering?: boolean }>()
 const emit = defineEmits<{ 'update:modelValue': [value: DownloadCreationSelection]; accessError: [cause: ApiError] }>()
 const channels = ref<DownloadChannels | null>(null), loading = ref(false), error = ref('')
 const ready = computed(() => props.authorized && props.available && !!props.accountId)
 const all = computed(() => mediaTypes.every(item => props.modelValue.types.includes(item.type)))
+const datesError = computed(() => props.dateFiltering!==false && props.modelValue.entry!=='POST' ? downloadDatesError(props.modelValue.startDate,props.modelValue.endDate) : '')
 let generation = 0, disposed = false, attempted = false
 function update(patch: Partial<DownloadCreationSelection>) {
   if (props.disabled || !ready.value) return
@@ -61,6 +62,8 @@ onBeforeUnmount(() => { disposed = true; generation++ })
       <label v-else>频道来源<input class="input" :value="modelValue.source" placeholder="频道链接、@用户名、频道ID或私有频道主帖链接" maxlength="2048" autocomplete="off" @input="source(($event.target as HTMLInputElement).value)" /></label>
       <p v-if="error" class="field-error" role="status">{{ error }}</p>
       <div v-if="modelValue.entry !== 'POST'" class="field-columns"><label>主帖标签 · 全部满足<input class="input" :value="modelValue.tags" placeholder="留空不限标签" maxlength="2048" @input="update({tags:($event.target as HTMLInputElement).value})" /></label><label>主帖关键词 · 全部包含<input class="input" :value="modelValue.keywords" placeholder="留空不限关键词" maxlength="2048" @input="update({keywords:($event.target as HTMLInputElement).value})" /></label></div>
+      <details v-if="dateFiltering!==false && modelValue.entry!=='POST'" class="download-date-filters"><summary>高级筛选 · 发布时间</summary><div class="field-columns"><label>开始日期<input type="date" class="input" :value="modelValue.startDate??''" :max="modelValue.endDate||undefined" @input="update({startDate:($event.target as HTMLInputElement).value})" /></label><label>结束日期<input type="date" class="input" :value="modelValue.endDate??''" :min="modelValue.startDate||undefined" @input="update({endDate:($event.target as HTMLInputElement).value})" /></label></div><small>日期范围用于频道历史扫描，按主帖发布时间和北京时间筛选，包含起止当天；留空则不限。</small><p v-if="datesError" class="field-error" role="alert">{{datesError}}</p></details>
+      <small v-else-if="modelValue.startDate||modelValue.endDate">日期范围用于频道历史扫描，当前指定主帖或自动规则不应用该条件；切回频道扫描时保留原日期。</small>
       <fieldset class="media-options"><legend>评论媒体类型</legend><div class="source-options"><button type="button" :aria-pressed="all" :class="{selected:all}" @click="update({types:all?[]:mediaTypes.map(item=>item.type)})">全部</button><button v-for="item in mediaTypes" :key="item.type" type="button" :aria-pressed="modelValue.types.includes(item.type)" :class="{selected:modelValue.types.includes(item.type)}" @click="type(item.type)">{{ item.label }}</button></div><label class="inline-option"><input type="checkbox" :checked="modelValue.includeMain" @change="update({includeMain:($event.target as HTMLInputElement).checked})" />包含主帖自身全部媒体</label></fieldset>
       <label>保存目录<input class="input" :value="modelValue.targetDirectory" placeholder="例如 D:\TelegramDownloads" autocomplete="off" @input="update({targetDirectory:($event.target as HTMLInputElement).value})" /></label>
     </fieldset>

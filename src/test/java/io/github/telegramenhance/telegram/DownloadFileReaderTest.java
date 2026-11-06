@@ -9,6 +9,32 @@ import java.util.concurrent.CompletableFuture;
 import org.junit.jupiter.api.Test;
 
 class DownloadFileReaderTest {
+    @Test void ownedStallCancellationPreservesPartialBytesAndReapplyingDownloadRequestsTheWholeFile(){
+        var f=new Fixture();f.file.local.isDownloadingActive=true;f.file.local.downloadedSize=5;
+        f.reader.cancel("1",1,7,"unique",11);assertFalse(f.file.local.isDownloadingActive);assertEquals(5,f.file.local.downloadedSize);
+        f.reader.start("1",1,7,"unique",11);var request=f.calls.stream().filter(TdApi.DownloadFile.class::isInstance).map(TdApi.DownloadFile.class::cast).findFirst().orElseThrow();
+        assertEquals(7,request.fileId);assertEquals(0,request.offset);assertEquals(0,request.limit);assertTrue(request.synchronous);
+        assertTrue(f.calls.stream().anyMatch(q->q instanceof TdApi.CancelDownloadFile cancel&&!cancel.onlyIfPending));assertTrue(f.calls.stream().noneMatch(TdApi.DeleteFile.class::isInstance));
+    }
+    @Test void aReusedFileIdWrongSizeOrSessionCannotAuthorizeStallCancellation(){
+        for(String change:List.of("identity","size","session")){
+            var f=new Fixture();if(change.equals("identity"))f.file.remote.uniqueId="someone-else";if(change.equals("size"))f.file.size=12;if(change.equals("session"))f.session=2;
+            assertThrows(IllegalArgumentException.class,()->f.reader.cancel("1",1,7,"unique",11),change);
+            assertTrue(f.calls.stream().noneMatch(q->q instanceof TdApi.CancelDownloadFile||q instanceof TdApi.DeleteFile),change);
+        }
+    }
+    @Test void manyOrdinaryFilesReceiveIndependentBudgetsInsteadOfSharingOneMinute(){
+        var f=new Fixture();var clock=new java.util.concurrent.atomic.AtomicLong();
+        f.message.isChannelPost=false;f.message.topicId=new TdApi.MessageTopicThread(99);
+        var selected=java.util.stream.IntStream.range(1000,1158).mapToObj(id->new Media("1:-1001:"+id+":0",new MessageRef("-1001",String.valueOf(id),"https://t.me/synthetic/"+id),"COMMENT","DOCUMENT","test.bin",11,"")).toList();
+        var post=new Post("1:-1009:200","1","-1009","channel","200","title","","0",List.of(new MessageRef("-1009","200",null)),List.of(),"-1001","99",List.of(new MessageRef("-1001","99",null)),true,"PARTIAL",List.of());
+        var reader=new DownloadFileReader(new DownloadFileReader.Gateway(){public <R extends TdApi.Object>CompletableFuture<R>read(long generation,TdApi.Function<R> request){
+            clock.addAndGet(java.util.concurrent.TimeUnit.SECONDS.toNanos(2));if(request instanceof TdApi.GetMessage source)f.message.id=source.messageId;return f.read(generation,request);
+        }},()->"1",()->1,clock::get);
+        var frozen=reader.freeze(post,selected,1);assertEquals(158,frozen.size());assertEquals(selected.stream().map(Media::key).toList(),frozen.stream().map(file->file.media().key()).toList());
+        assertTrue(clock.get()>java.util.concurrent.TimeUnit.MINUTES.toNanos(1));assertEquals(158,f.calls.stream().filter(q->q instanceof TdApi.GetMessageProperties).count());
+        assertTrue(f.calls.stream().noneMatch(q->q instanceof TdApi.DownloadFile||q instanceof TdApi.ReadFilePart));
+    }
     @Test void aMissingPreviewLinkIsResolvedWithoutDownloadingTheOriginal(){
         var f=new Fixture();var frozen=f.reader.freeze(f.post,List.of(f.media),1).getFirst();
         assertEquals("https://t.me/synthetic/100",frozen.media().message().link());assertEquals(f.media.message().messageId(),frozen.media().message().messageId());
@@ -107,6 +133,7 @@ class DownloadFileReaderTest {
             else if (request instanceof TdApi.GetMessageProperties) result = properties;
             else if (request instanceof TdApi.GetMessageLink) {var link=new TdApi.MessageLink();link.link=nativeLink;result=link;}
             else if (request instanceof TdApi.GetFile || request instanceof TdApi.DownloadFile) result = file;
+            else if (request instanceof TdApi.GetFileDownloadedPrefixSize) result = new TdApi.FileDownloadedPrefixSize(0);
             else if (request instanceof TdApi.ReadFilePart) result = new TdApi.Data(new byte[partLength]);
             else if (request instanceof TdApi.CancelDownloadFile) { file.local.isDownloadingActive = false; result = new TdApi.Ok(); }
             else if (request instanceof TdApi.DeleteFile) { file.local.isDownloadingCompleted = false; file.local.downloadedSize = 0; result = new TdApi.Ok(); }

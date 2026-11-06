@@ -24,18 +24,19 @@ public final class RuleUploadBroker {
     }
     public CompletableFuture<Void> consider(Rule rule,Scan scan,Runnable running){
         long generation=telegram.sessionGeneration();current(rule,generation,running);if(resumeActive(rule,running))return CompletableFuture.completedFuture(null);
-        var approved=policy.authorization(rule);var claimed=uploads.claimed(rule.accountId(),approved.post(),scan.files());int claimedCount=(int)scan.files().stream().filter(f->claimed.contains(UploadRepository.contentKey(f))).count();
-        var available=scan.files().stream().filter(f->!claimed.contains(UploadRepository.contentKey(f))).sorted(Comparator.comparing(FileVersion::relativePath,UploadDirectoryScanner::natural)).toList();
-        if(available.isEmpty()){note(rule,"IDLE",claimedCount>0?"同目标已有上传任务的内容未重复创建或移动；可到任务中心核对":"没有新的稳定媒体",null,claimedCount);return CompletableFuture.completedFuture(null);}
-        var first=available.getFirst();long maximumBytes=8L*1024*1024*1024;int maximum=first.mediaType().equals("ANIMATION")?1:10;long bytes=0;var selectedPaths=new HashSet<String>();
+        var approved=policy.authorization(rule);var claimed=uploads.claimed(rule.accountId(),approved.post(),scan.files());var cancelled=rules.cancelledContent(rule);int claimedCount=(int)scan.files().stream().filter(f->claimed.contains(UploadRepository.contentKey(f))).count();
+        var available=scan.files().stream().filter(f->!claimed.contains(UploadRepository.contentKey(f))&&!cancelled.contains(UploadRepository.contentKey(f))).sorted(Comparator.comparing(FileVersion::relativePath,UploadDirectoryScanner::natural)).toList();
+        if(available.isEmpty()){note(rule,"IDLE",!cancelled.isEmpty()?"本次启用后取消的内容未重复创建；需要再次上传时，请暂停规则后重新预览并启用":claimedCount>0?"同目标已有上传任务的内容未重复创建或移动；可到任务中心核对":"没有新的稳定媒体",null,claimedCount);return CompletableFuture.completedFuture(null);}
+        var first=available.getFirst();long maximumBytes=8L*1024*1024*1024;int maximum=first.mediaType().equals("ANIMATION")?1:rule.input().albumSize();long bytes=0;var selectedPaths=new HashSet<String>();
         for(var file:available){if(!file.mediaType().equals(first.mediaType()))continue;if(selectedPaths.size()>=maximum)break;if(file.size()>maximumBytes){note(rule,"BLOCKED","候选媒体超过单组暂存上限，请拆分文件后处理",null,claimedCount);return CompletableFuture.completedFuture(null);}if(bytes>maximumBytes-file.size())break;bytes+=file.size();selectedPaths.add(file.relativePath());}
         var selected=available.stream().filter(f->selectedPaths.contains(f.relativePath())).toList();
         CompletableFuture<Void> preparation;
         try{preparation=reads.readWork(()->{
             current(rule,generation,running);var target=targets.read(rule.input().link(),rule.accountId(),generation,Set.of(first.mediaType()));current(rule,generation,running);
             if(!RuleUploadPolicy.sameTarget(approved,target))throw new IllegalArgumentException("目标讨论映射与启用时不一致，请重新预览并启用规则");
-            var frozenScan=new Scan(scan.sourceDirectory(),scan.archiveDirectory(),scan.recursive(),selected,selected,0,0,0,0);var prepared=new Prepared(rule.input().uploadInput(),target,frozenScan,UploadPreviewService.groups(selected,rule.input().captionMode()));
-            String fingerprint=DownloadPaths.hash(rule.id()+":"+rule.version()+":"+json.writeValueAsString(rule.input())+":"+UploadRepository.targetKey(target.post())+":"+json.writeValueAsString(selected));String operation=UUID.nameUUIDFromBytes(("auto-upload:"+fingerprint).getBytes(StandardCharsets.UTF_8)).toString();
+            var frozenScan=new Scan(scan.sourceDirectory(),scan.archiveDirectory(),scan.recursive(),selected,selected,0,0,0,0);var prepared=new Prepared(rule.input().uploadInput(),target,frozenScan,UploadPreviewService.groups(selected,rule.input().captionMode(),rule.input().albumSize()));
+            String selection=DownloadPaths.hash(rule.id()+":"+rule.version()+":"+json.writeValueAsString(rule.input())+":"+UploadRepository.targetKey(target.post())+":"+json.writeValueAsString(selected));
+            String fingerprint="auto-upload-v2:"+rule.revision()+":"+selection;String operation=UUID.nameUUIDFromBytes(("auto-upload:"+fingerprint).getBytes(StandardCharsets.UTF_8)).toString();
             current(rule,generation,running);var task=uploads.create(rule.accountId(),operation,fingerprint,prepared,rule);current(rule,generation,running);uploads.start(rule.accountId(),task.id());note(rule,"QUEUED","已创建一组自动上传任务，按保存的时段执行",task.id(),claimedCount);return (Void)null;
         });}catch(RuntimeException rejected){preparation=CompletableFuture.failedFuture(rejected);}
         return preparation.exceptionally(failure->{try{current(rule,generation,running);note(rule,"BLOCKED","自动任务准备未完成，请检查目录、已有任务及目标权限；可用分组预览核对，未自动重试发送",null,claimedCount);}catch(RuntimeException stale){/* Old context cannot publish a new status or task. */}return null;});

@@ -78,7 +78,7 @@ class UploadPreviewTimeoutControllerTest {
 
     private static UploadPreviewModels.View view() {
         return new UploadPreviewModels.View("snapshot", "1", "PREVIEW_ONLY", INPUT.sourceDirectory(), INPUT.archiveDirectory(), true,
-                "FILENAME", "Synthetic channel", "Synthetic post", "Synthetic body", INPUT.link(), "Synthetic discussion", "MEDIA_ALLOWED_AT_CHECK", 0,
+                "FILENAME", 10, "Synthetic channel", "Synthetic post", "Synthetic body", INPUT.link(), "Synthetic discussion", "MEDIA_ALLOWED_AT_CHECK", 0,
                 0, 0, List.of(), 0, 0, 0, 0, List.of(), 1, 1, 600_001);
     }
 }

@@ -14,14 +14,23 @@ public final class DownloadBatchModels {
     public record PostSummary(String key,String title,String state,long commentMessages,int mainMedia,int commentMedia,long bytes){}
     public record View(String id,String accountId,long revision,String channelTitle,List<String> tags,List<String> keywords,
             List<String> types,boolean includeMain,String targetDirectory,List<PostSummary> posts,int total,long totalBytes,
-            boolean exhausted,boolean canContinue,boolean busy,String error,List<String> warnings,long createdAt,long expiresAt){
+            boolean exhausted,boolean canContinue,boolean busy,String error,List<String> warnings,long createdAt,long expiresAt,String startDate,String endDate){
         public View{tags=List.copyOf(tags);keywords=List.copyOf(keywords);types=List.copyOf(types);posts=List.copyOf(posts);warnings=List.copyOf(warnings);}
+        public View(String id,String accountId,long revision,String channelTitle,List<String> tags,List<String> keywords,
+                List<String> types,boolean includeMain,String targetDirectory,List<PostSummary> posts,int total,long totalBytes,
+                boolean exhausted,boolean canContinue,boolean busy,String error,List<String> warnings,long createdAt,long expiresAt){
+            this(id,accountId,revision,channelTitle,tags,keywords,types,includeMain,targetDirectory,posts,total,totalBytes,exhausted,canContinue,busy,error,warnings,createdAt,expiresAt,null,null);
+        }
         @Override public String toString(){return "DownloadBatchPreview[posts="+posts.size()+", media="+total+"]";}
     }
     public record Job(Post post,List<FrozenFile> files){public Job{files=List.copyOf(files);}}
     public record Snapshot(String previewId,long revision,String channelTitle,List<String> tags,List<String> keywords,
-            List<String> types,boolean includeMain,String targetDirectory,int postCount,int total,long totalBytes){
+            List<String> types,boolean includeMain,String targetDirectory,int postCount,int total,long totalBytes,String startDate,String endDate){
         public Snapshot{tags=List.copyOf(tags);keywords=List.copyOf(keywords);types=List.copyOf(types);}
+        public Snapshot(String previewId,long revision,String channelTitle,List<String> tags,List<String> keywords,
+                List<String> types,boolean includeMain,String targetDirectory,int postCount,int total,long totalBytes){
+            this(previewId,revision,channelTitle,tags,keywords,types,includeMain,targetDirectory,postCount,total,totalBytes,null,null);
+        }
     }
     public record Receipt(String id,Snapshot snapshot,List<String> taskIds,long createdAt){public Receipt{taskIds=List.copyOf(taskIds);}}
     public record Lookup(Receipt batch){}

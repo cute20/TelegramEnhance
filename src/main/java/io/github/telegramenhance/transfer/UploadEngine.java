@@ -18,7 +18,24 @@ public final class UploadEngine implements AutoCloseable,org.springframework.con
     @org.springframework.beans.factory.annotation.Autowired
     public UploadEngine(UploadRepository repository,UploadFiles files,UploadTransport transport,TelegramService telegram,UploadTargetReader targets,ResourceService reads,UploadRetryService retries){this.repository=repository;this.files=files;this.transport=transport;this.telegram=telegram;this.targets=targets;this.reads=reads;this.retries=retries;worker.scheduleWithFixedDelay(this::tick,500,1000,TimeUnit.MILLISECONDS);}
     public String warning(){return warning;}
-    private void tick(){if(closed)return;transport.expireRecoveries();String account;long session;try{account=telegram.accountId();session=telegram.sessionGeneration();}catch(RuntimeException unavailable){return;}try{Task task=repository.next(account);if(task!=null)run(task,session);}catch(RuntimeException failed){warning="上传后台未能确认状态，请先核对任务；不会自动重发";}}
+    private String cleanupCursor;
+    private boolean startupCleanupDone;
+    /** Cancel first commits a terminal state; the sending lane then releases only verified cache copies. */
+    public void cleanupCancelled(Task task){
+        try{worker.execute(()->cleanCancelled(task));}catch(RejectedExecutionException stopped){/* Startup collection will retry after shutdown. */}
+    }
+    private void cleanCancelled(Task task){
+        if(closed)return;
+        try{files.cleanupCancelled(task,()->{if(closed||Thread.currentThread().isInterrupted())throw new Stopped();});}
+        catch(RuntimeException unavailable){/* Keep uncertain files; a later startup can retry. */}
+    }
+    private void collectCancelledOnStartup(){
+        if(startupCleanupDone||closed)return;
+        var page=repository.cancelledAfter(cleanupCursor,8);
+        for(var task:page){if(closed)return;cleanCancelled(task);cleanupCursor=task.id();}
+        startupCleanupDone=page.size()<8;
+    }
+    private void tick(){if(closed)return;try{collectCancelledOnStartup();}catch(RuntimeException unavailable){/* Do not block other tasks on damaged cleanup metadata. */}transport.expireRecoveries();String account;long session;try{account=telegram.accountId();session=telegram.sessionGeneration();}catch(RuntimeException unavailable){return;}try{Task task=repository.next(account);if(task!=null)run(task,session);}catch(RuntimeException failed){warning="上传后台未能确认状态，请先核对任务；不会自动重发";}}
     private void run(Task original,long session){
         Task task=original;Group active=null;boolean intended=false;
         Runnable check=()->{if(closed||Thread.currentThread().isInterrupted()||!original.accountId().equals(telegram.accountId())||session!=telegram.sessionGeneration())throw new Stopped();};
@@ -36,7 +53,7 @@ public final class UploadEngine implements AutoCloseable,org.springframework.con
                 task=repository.task(task.accountId(),task.id());active=task.groups().stream().filter(g->g.id()==initial.id()).findFirst().orElseThrow();
                 var fixedTask=task;var media=active.items().stream().map(i->i.file().mediaType()).collect(java.util.stream.Collectors.toSet());
                 var fresh=reads.readWork(()->targets.read(fixedTask.prepared().input().link(),fixedTask.accountId(),session,media)).get(100,TimeUnit.SECONDS);
-                if(!task.prepared().target().post().equals(fresh.post()))throw new IllegalArgumentException("目标主帖或讨论映射已变化，请核对任务");
+                if(!task.prepared().target().post().sameContent(fresh.post()))throw new IllegalArgumentException("目标主帖或讨论映射已变化，请核对任务");
                 try(var lease=files.lease(active.items().stream().map(Item::staged).toList(),check)){
                     check.run();repository.intent(task,active,transport.owner(session));intended=true;transport.send(task,active,session);
                     long deadline=System.nanoTime()+TimeUnit.SECONDS.toNanos(receiptWaitSeconds(active.items().stream().mapToLong(i->i.file().size()).sum()));

@@ -9,7 +9,7 @@ import CompactRecord from './CompactRecord.vue'
 import InfiniteLoad from './InfiniteLoad.vue'
 import { mergeTaskHistory } from '../taskHistory'
 
-const props = withDefaults(defineProps<{ authorized: boolean; available: boolean; accountId: string | null; active?: boolean; refreshVersion?: number }>(), { active: true })
+const props = withDefaults(defineProps<{ authorized: boolean; available: boolean; accountId: string | null; active?: boolean; refreshVersion?: number; focusId?:string }>(), { active: true })
 const emit = defineEmits<{ accessError: [cause: ApiError] }>()
 const batches = ref<DownloadBatchStatus[]>([])
 const offset = ref(0), loading = ref(false), pending = ref(false), busy = ref(''), error = ref(''), workerWarning = ref('')
@@ -72,6 +72,7 @@ async function load(append = false) {
   const alive = () => current(context, account) && isActive() && epoch === listEpoch
   stopTimer(); pending.value = true; loading.value = !batches.value.length; loadingMore.value = append
   try {
+    if(props.focusId){const result=await api<DownloadBatchStatus>('/transfers/download/batches/'+encodeURIComponent(props.focusId));if(!alive())return;if(!validBatchStatus(result)||result.id!==props.focusId)throw new Error('批次回执无法确认');batches.value=[result];hasMore.value=false;offset.value=1;error.value='';return}
     const updates = new Map<string, DownloadBatchStatus>(); let lastSize = 0, warning = ''
     const end = append ? start + limit : Math.max(limit, previousOffset, previous.length)
     for (let position = start; position < end; position += limit) {
@@ -183,7 +184,7 @@ function batchAlert(batch: DownloadBatchStatus) {
   return uncertainIds.value.includes(batch.id) ? '操作结果尚未确认，先核对状态。' : batch.failedTasks ? `${batch.failedTasks} 个子任务需要处理，其他子任务状态分别保留。` : batch.state === 'PAUSING' ? '等待工作任务停稳，已确认保存数和字节仍可能更新。' : null
 }
 
-watch([() => props.authorized, () => props.available, () => props.accountId], () => {
+watch([() => props.authorized, () => props.available, () => props.accountId,()=>props.focusId], () => {
   generation++; stopTimer(); batches.value = []; offset.value = 0; hasMore.value = true; loadingMore.value = false; historyError.value = ''; error.value = ''; workerWarning.value = ''; busy.value = ''; loading.value = false; uncertainIds.value = []; clearDetail()
   if (pending.value) refreshQueued = true
   else if (canAccess.value) void load()
@@ -201,7 +202,7 @@ onBeforeUnmount(() => { disposed = true; generation++; stopTimer(); clearDetail(
     <div v-if="!authorized || !accountId" class="notice warning">完成 Telegram 授权后查看当前账号的批量下载。</div><div v-else-if="!available" class="notice warning">本机服务当前不可用，批次读取已暂停。</div>
     <div v-if="workerWarning" class="notice warning" role="status">{{ workerWarning }}</div><div v-if="error" class="notice danger" role="alert">{{ error }}</div>
     <p v-if="loading && !batches.length" class="batch-empty" role="status">正在读取批量下载记录…</p><p v-else-if="canAccess && !batches.length && !error" class="batch-empty">暂无批量下载记录。可在频道扫描结果中选择主帖，准备并确认下载清单。</p>
-    <CompactRecord v-for="batch in batches" :key="batch.id" :title="batch.snapshot.channelTitle || '频道批量下载'" :description="description(batch)" :status="batchStateLabels[batch.state]" :tone="batch.state === 'COMPLETED' ? 'success' : batch.failedTasks || batch.state === 'FAILED' ? 'warning' : ['RUNNING', 'QUEUED', 'PAUSING'].includes(batch.state) ? 'active' : 'neutral'" :timestamp="batch.updatedAt" :default-expanded="false" :active="active" :alert="batchAlert(batch)">
+    <CompactRecord v-for="batch in batches" :key="batch.id" :title="batch.snapshot.channelTitle || '频道批量下载'" :description="description(batch)" :status="batchStateLabels[batch.state]" :tone="batch.state === 'COMPLETED' ? 'success' : batch.failedTasks || batch.state === 'FAILED' ? 'warning' : ['RUNNING', 'QUEUED', 'PAUSING'].includes(batch.state) ? 'active' : 'neutral'" :timestamp="batch.updatedAt" :default-expanded="!!focusId" :active="active" :alert="batchAlert(batch)">
       <template #actions><span class="batch-byte-summary">客户端已取得 {{ formatMediaBytes(batch.downloadedBytes) }} · 目标已写入 {{ formatMediaBytes(batch.writtenBytes) }} / {{ formatMediaBytes(batch.snapshot.totalBytes) }}</span><button v-if="batch.canPause" class="btn" type="button" :disabled="pending || uncertainIds.includes(batch.id)" @click="action(batch, 'pause')">暂停整批</button><span v-else-if="batch.state === 'PAUSING'" class="batch-pausing">正在暂停整批…</span><button v-if="batch.canResume" class="btn" type="button" :disabled="pending || uncertainIds.includes(batch.id)" @click="action(batch, 'resume')">继续暂停 / 失败项</button><button v-if="uncertainIds.includes(batch.id)" class="btn" type="button" :disabled="pending" @click="checkBatch(batch)">核对批次状态</button></template>
       <p class="batch-directory">保存根目录：<code>{{ batch.snapshot.targetDirectory }}</code></p><p class="batch-note">仅包含创建时冻结的 {{ batch.snapshot.postCount }} 条主帖、{{ batch.snapshot.total }} 个媒体。重复媒体已保存数包含在“已保存”中；历史跳过不表示本次保存了新文件。</p>
       <ul class="batch-members"><li v-for="task in batch.tasks" :key="task.id"><div class="batch-member-summary"><div><strong>{{ task.title || '未命名主帖' }}</strong><p>{{ task.pauseRequested && task.state === 'RUNNING' ? '正在暂停' : taskLabels[task.state] }} · 已保存 {{ task.completed }}/{{ task.total }}<span v-if="task.duplicates"> · 其中重复 {{ task.duplicates }}</span><span v-if="task.skipped"> · 历史跳过 {{ task.skipped }}</span></p><small>客户端已取得 {{ formatMediaBytes(task.downloadedBytes) }} · 目标已写入 {{ formatMediaBytes(task.writtenBytes) }} / {{ formatMediaBytes(task.totalBytes) }}</small><p v-if="task.error" class="batch-member-error">{{ task.error }}</p></div><button class="btn" type="button" :disabled="pending" @click="showTask(batch, task.id)">{{ detailBatchId === batch.id && detailTaskId === task.id ? '收起文件明细' : '查看文件明细' }}</button></div>

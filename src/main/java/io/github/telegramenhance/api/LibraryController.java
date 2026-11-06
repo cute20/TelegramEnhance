@@ -13,8 +13,10 @@ public final class LibraryController {
     @GetMapping("/catalog") public CatalogPage catalog(
             @RequestParam(required=false) List<String> channelIds,
             @RequestParam(defaultValue="") String tags, @RequestParam(defaultValue="") String keywords,
-            @RequestParam(defaultValue="20") int limit, @RequestParam(defaultValue="0") int offset) {
-        return library.catalog(channelIds, tags, keywords, limit, offset);
+            @RequestParam(defaultValue="20") int limit, @RequestParam(defaultValue="0") int offset,
+            @RequestParam(required=false) String sort) {
+        return sort == null ? library.catalog(channelIds, tags, keywords, limit, offset)
+                : library.catalog(channelIds, tags, keywords, limit, offset, sort);
     }
     @GetMapping("/posts/{key}/media") public MediaPage media(@PathVariable String key,
             @RequestParam(required=false) List<String> types, @RequestParam(defaultValue="true") boolean includeMain,

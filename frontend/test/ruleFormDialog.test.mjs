@@ -42,3 +42,11 @@ test('rapidly cancelled opening cannot focus or display a stale form',async t=>{
 test('dialog falls back to its close button when the form has no editable controls',async t=>{
   const f=mount(t);f.element.querySelector=()=>null;f.props.open=true;await flush();assert.equal(f.counts.closeFocus,1);assert.equal(f.counts.inputFocus,0)
 })
+
+test('parameter and preview steps restore their own scroll context without moving on ordinary updates',async t=>{
+  const f=mount(t);f.props.scrollKey='parameters';await flush();f.state.body.value=vue.markRaw({scrollTop:240})
+  f.props.scrollKey='review';await flush();assert.equal(f.state.body.value.scrollTop,0)
+  f.state.body.value.scrollTop=510;f.props.busy=true;await flush();assert.equal(f.state.body.value.scrollTop,510)
+  f.props.scrollKey='parameters';await flush();assert.equal(f.state.body.value.scrollTop,240)
+  f.props.scrollKey='review';await flush();assert.equal(f.state.body.value.scrollTop,510)
+})

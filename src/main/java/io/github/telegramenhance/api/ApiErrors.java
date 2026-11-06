@@ -1,5 +1,6 @@
 package io.github.telegramenhance.api;
 
+import io.github.telegramenhance.transfer.CreationRejectedException;
 import java.util.Map;
 import java.util.concurrent.CompletionException;
 import org.springframework.http.ResponseEntity;
@@ -11,7 +12,11 @@ import org.springframework.web.method.annotation.MethodArgumentTypeMismatchExcep
 @RestControllerAdvice
 public class ApiErrors {
     @ExceptionHandler(IllegalArgumentException.class)
-    public ResponseEntity<Map<String, String>> invalid(IllegalArgumentException error) { return ResponseEntity.badRequest().body(Map.of("message", error.getMessage())); }
+    public ResponseEntity<Map<String, String>> invalid(IllegalArgumentException error) {
+        return ResponseEntity.badRequest().body(error instanceof CreationRejectedException
+                ? Map.of("message", error.getMessage(), "code", CreationRejectedException.CODE)
+                : Map.of("message", error.getMessage()));
+    }
     @ExceptionHandler(HttpMessageNotReadableException.class)
     public ResponseEntity<Map<String, String>> unreadable() { return ResponseEntity.badRequest().body(Map.of("message", "请求格式无效，请检查设置后重试")); }
     @ExceptionHandler(MethodArgumentTypeMismatchException.class)

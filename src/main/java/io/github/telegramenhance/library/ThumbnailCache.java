@@ -26,6 +26,7 @@ import org.springframework.stereotype.Service;
 @Service
 public final class ThumbnailCache {
     private static final String SETTING = "thumbnail.cache.directory";
+    private static final String LIMIT_SETTING = "thumbnail.cache.maximum_bytes";
     private static final String NAMESPACE = "twb-thumbnails-v1";
     private static final String OWNER = ".twb-thumbnail-cache";
     private static final String MAGIC = "TelegramResourceWorkbench thumbnail cache v1\n";
@@ -36,7 +37,7 @@ public final class ThumbnailCache {
     private final AppPaths paths;
     private final Path defaultDirectory;
     private final int maximumFiles;
-    private final long maximumBytes;
+    private long maximumBytes;
     private Path directory;
     private Object folderIdentity;
     private final Map<String, Entry> index = new HashMap<>();
@@ -47,7 +48,9 @@ public final class ThumbnailCache {
     private long hits, writes;
 
     public record View(String directory, String defaultDirectory, int files, long bytes, long maximumBytes, String warning) { }
-    public record Update(String directory) { }
+    public record Update(String directory, Long maximumBytes) {
+        public Update(String directory) { this(directory, null); }
+    }
     public record Cleared(View cache, int removed) { }
     private record Entry(long size, long touched, Object identity) { }
 
@@ -64,6 +67,16 @@ public final class ThumbnailCache {
             }
         });
         directory = saved == null ? this.defaultDirectory : Path.of(saved).toAbsolutePath().normalize();
+        String savedLimit = database.read(c -> {
+            try (var q = c.prepareStatement("SELECT setting_value FROM app_settings WHERE setting_key=?")) {
+                q.setString(1, LIMIT_SETTING); try (var rows = q.executeQuery()) { return rows.next() ? rows.getString(1) : null; }
+            }
+        });
+        if (savedLimit != null) {
+            try { long limit = Long.parseLong(savedLimit); if (supportedLimit(limit)) this.maximumBytes = limit;
+                else throw new IllegalStateException("已保存的缓存配额无效"); }
+            catch (NumberFormatException invalid) { throw new IllegalStateException("已保存的缓存配额无效"); }
+        }
     }
 
     public synchronized long generation() { return generation; }
@@ -80,6 +93,8 @@ public final class ThumbnailCache {
     public synchronized View save(Update update) {
         if (update == null) throw new IllegalArgumentException("请选择缩略图缓存目录");
         Path selected = validate(update.directory());
+        long nextLimit = update.maximumBytes() == null ? maximumBytes : update.maximumBytes();
+        if (update.maximumBytes() != null && !supportedLimit(nextLimit)) throw new IllegalArgumentException("缓存上限可选 256、512 或 1024 MiB");
         try { ensureFolder(selected, true); }
         catch (IOException failure) { throw new IllegalArgumentException("无法使用此缩略图缓存目录，请检查路径和写入权限"); }
         database.write(connection -> {
@@ -89,11 +104,23 @@ public final class ThumbnailCache {
                 """)) {
                 statement.setString(1, SETTING); statement.setString(2, selected.toString());
                 statement.setLong(3, Instant.now().toEpochMilli()); statement.executeUpdate();
+                if (update.maximumBytes() != null) { statement.setString(1, LIMIT_SETTING); statement.setString(2, Long.toString(nextLimit)); statement.executeUpdate(); }
             }
             return null;
         });
-        directory = selected; generation++; indexed = false; index.clear(); folderIdentity = null;
-        return view();
+        directory = selected; maximumBytes = nextLimit; generation++; indexed = false; index.clear(); folderIdentity = null;
+        view();
+        try { trimToLimit(); } catch (IOException failure) { warning = "新缓存配额已保存，部分较旧的缓存暂未能清理。"; }
+        return snapshot();
+    }
+
+    private static boolean supportedLimit(long bytes) { return bytes == 256L*1024*1024 || bytes == 512L*1024*1024 || bytes == 1024L*1024*1024; }
+    private void trimToLimit() throws IOException {
+        while (bytes() > maximumBytes || index.size() > maximumFiles) {
+            var oldest = index.entrySet().stream().min(Comparator.comparingLong(entry -> entry.getValue().touched())).orElse(null);
+            if (oldest == null) break;
+            deleteOwned(oldest.getKey(), oldest.getValue()); index.remove(oldest.getKey());
+        }
     }
 
     public synchronized Cleared clear() {

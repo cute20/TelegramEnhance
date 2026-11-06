@@ -382,3 +382,63 @@ test('once-download mutation remains queryable after same-account availability i
   f.expect('/transfers/download/tasks/by-operation/'+operation,{task:task()});await f.state.lookupDownload();assert.equal(f.state.createdTask.value.id,ID);assert.equal(f.state.createUncertain.value,false);assert.deepEqual(f.events.at(-1),['locked',false])
   assert.equal(f.calls.filter(call=>call.options.method==='POST'&&call.path==='/transfers/download/tasks').length,1)
 })
+
+test('a focused download detail reads its selected task without querying or merging list history',async t=>{
+  const f=mount(t,'DownloadTasks',[{path:'/transfers/download/tasks/'+ID,value:task()}],{focusId:ID});await flush()
+  assert.deepEqual(f.state.tasks.value.map(task=>task.id),[ID]);assert.equal(f.state.hasMore.value,false);assert.equal(f.calls.length,1)
+})
+test('a focused upload detail keeps receipt recovery on the selected task without listing other uploads',async t=>{
+  const f=mount(t,'UploadTasks',[{path:'/transfers/upload/tasks/'+ID,value:readyUpload()}],{focusId:ID});await flush()
+  assert.deepEqual(f.state.tasks.value.map(task=>task.id),[ID]);assert.equal(f.state.hasMore.value,false);assert.equal(f.calls.length,1)
+})
+test('a focused rule download detail reads only its parent and preserves source file pagination',async t=>{
+  const group=ruleGroup(),f=mount(t,'RuleDownloadTasks',[{path:'/transfers/download/rule-tasks/'+ID,value:group}],{focusId:ID});await flush()
+  assert.deepEqual(f.state.groups.value.map(group=>group.id),[ID]);assert.equal(f.calls.length,1)
+})
+
+const retryTime=Date.UTC(2026,10,4,1,2,3)
+const retryTask=(overrides={})=>task({state:'QUEUED',retry:{attempt:1,nextAttemptAt:retryTime},error:'连接中断，已安排自动重试',...overrides})
+function retryNodes(node){if(!node||typeof node!=='object')return[];if(Array.isArray(node))return node.flatMap(retryNodes);const children=Array.isArray(node.children)?node.children:node.children&&typeof node.children==='object'?Object.values(node.children).filter(value=>typeof value==='function').flatMap(slot=>slot()):[];return[node,...children.flatMap(retryNodes)]}
+const retryText=node=>typeof node==='string'?node:Array.isArray(node)?node.map(retryText).join(''):node&&typeof node==='object'?retryText(node.children):''
+
+test('download retry metadata is optional and validates integer attempt, timestamp, queue state and the manual pause flag',()=>{
+  assert.equal(taskModule.validTask(task()),true);assert.equal(taskModule.validTask(task({retry:null})),true);assert.equal(taskModule.validTask(retryTask()),true)
+  for(const retry of [{attempt:0,nextAttemptAt:retryTime},{attempt:-1,nextAttemptAt:retryTime},{attempt:1.5,nextAttemptAt:retryTime},{attempt:'1',nextAttemptAt:retryTime},{attempt:NaN,nextAttemptAt:retryTime},{attempt:Infinity,nextAttemptAt:retryTime},{attempt:1,nextAttemptAt:0},{attempt:1,nextAttemptAt:-1},{attempt:1,nextAttemptAt:retryTime+0.5},{attempt:1,nextAttemptAt:String(retryTime)},{attempt:1,nextAttemptAt:Number.MAX_SAFE_INTEGER},{attempt:1,nextAttemptAt:NaN},{},[]])assert.equal(taskModule.validTask(retryTask({retry})),false)
+  for(const state of ['RUNNING','PAUSED','FAILED'])assert.equal(taskModule.validTask(retryTask({state})),false,state)
+  assert.equal(taskModule.validTask(retryTask({pauseRequested:true})),false)
+  for(const pauseRequested of ['false',0,null])assert.equal(taskModule.validTask(task({pauseRequested})),false)
+  assert.equal(taskModule.validTask(task({state:'QUEUED',pauseRequested:true,retry:null})),true,'a global manual pause can still be waiting for admission')
+  assert.equal(taskModule.downloadTaskStatus(task({state:'QUEUED',pauseRequested:true,retry:null})),'正在暂停')
+})
+
+test('retrying downloads show the scheduled Beijing time and keep an enabled pause action without requiring manual resume',async t=>{
+  const saved=retryTask(),path='/transfers/download/tasks?standalone=true&limit=20&offset=0',f=mount(t,'DownloadTasks',[{path,value:{items:[saved],workerWarning:null}}]);await flush()
+  const record=renderTaskRecords(f)[0],children=retryNodes(record)
+  assert.equal(record.props.status,'等待自动重试');assert.match(record.props.alert,/第 1 次自动重试.*北京时间.*09:02:03.*无需手动继续.*暂停下载.*取消自动重试/)
+  assert.match(record.props.alert,/连接中断/)
+  const pause=children.find(node=>node.type==='button'&&retryText(node)==='暂停下载');assert.ok(pause);assert.equal(pause.props.disabled,false)
+  assert.equal(children.some(node=>node.type==='button'&&retryText(node)==='继续未完成项'),false)
+  assert.ok(children.some(node=>node.props?.class==='notice download-retry-note'&&/无需手动继续/.test(retryText(node))))
+  assert.equal(f.calls.length,1);assert.equal(f.calls.every(call=>!call.options.method),true)
+})
+
+test('retry progress remains GET-only as the backend schedules another attempt and eventually starts downloading',async t=>{
+  const saved=retryTask(),path='/transfers/download/tasks?standalone=true&limit=20&offset=0',f=mount(t,'DownloadTasks',[{path,value:{items:[saved],workerWarning:null}}]);await flush()
+  f.expect('/transfers/download/tasks/'+ID,retryTask({retry:{attempt:2,nextAttemptAt:retryTime+10000}}));await f.state.readProgress()
+  assert.match(renderTaskRecords(f)[0].props.alert,/第 2 次自动重试/)
+  f.expect('/transfers/download/tasks/'+ID,task({state:'RUNNING',retry:null,error:null}));await f.state.readProgress()
+  const record=renderTaskRecords(f)[0];assert.equal(record.props.status,'正在处理');assert.equal(record.props.alert,null)
+  assert.equal(f.calls.every(call=>!call.options.method),true);assert.equal(f.calls.some(call=>call.path.endsWith('/resume')),false)
+})
+
+test('manually pausing an automatic retry sends only the explicit pause and late progress cannot restore its retry schedule',async t=>{
+  const saved=retryTask(),path='/transfers/download/tasks?standalone=true&limit=20&offset=0',f=mount(t,'DownloadTasks',[{path,value:{items:[saved],workerWarning:null}}]);await flush()
+  const response=deferred();f.expect('/transfers/download/tasks/'+ID,response.promise);const reading=f.state.readProgress()
+  const paused=task({state:'PAUSED',pauseRequested:true,retry:null,error:'已手动暂停'})
+  f.expect('/transfers/download/tasks/'+ID+'/pause',paused,'POST');await f.state.action(saved,'pause')
+  response.resolve(saved);await reading;await flush()
+  assert.equal(f.state.tasks.value[0].state,'PAUSED');assert.equal(f.state.tasks.value[0].retry,null);assert.equal(f.timers.filter(timer=>!timer.cancelled).length,0)
+  const record=renderTaskRecords(f)[0],children=retryNodes(record);assert.equal(record.props.status,'已暂停')
+  assert.ok(children.some(node=>node.type==='small'&&/不会自动重试/.test(retryText(node))))
+  assert.equal(f.calls.filter(call=>call.options.method==='POST').length,1);assert.equal(f.calls.some(call=>call.path.endsWith('/resume')),false)
+})

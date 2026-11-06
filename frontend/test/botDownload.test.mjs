@@ -18,6 +18,10 @@ const button=()=>({id:'button-next',text:'下一组 (2/6)',kind:'NEXT',messageId
 const wait=(overrides={})=>({waitSeconds:5,timeoutSeconds:120,elapsedMs:0,quietMs:0,remainingMs:120000,progressObserved:false,timedOut:false,...overrides})
 function preview(overrides={}){const m=media();return{id:ID,revision:1,bot:{chatId:CHAT,botUserId:'123456',title:'Synthetic bot'},messages:[{id:'1001',text:'',media:[copy(m)],buttons:[]},{id:'1002',text:'已获取第1组文件（共6组）',media:[],buttons:[button()]}],media:[m],controlMessageId:'1002',recommendedButtonId:'button-next',paginationStatus:'MORE',currentPage:1,totalPages:6,state:'READY',warning:null,nextHistoryCursor:null,historyEnd:true,...overrides}}
 function task(){return{id:'22222222-2222-4222-8222-222222222222',title:'Synthetic bot',channelTitle:'Synthetic bot',state:'QUEUED',pauseRequested:false,targetDirectory:'D:\\chosen',scope:'OBSERVED_SELECTION',total:1,completed:0,skipped:0,totalBytes:16,error:null,createdAt:1,updatedAt:1,duplicatePolicy:'KEEP_DUPLICATES_V2',duplicates:0,duplicateDirectory:'D:\\chosen\\重复媒体',items:[{id:'item',fileName:'sample.txt',type:'DOCUMENT',state:'QUEUED',size:16,downloadedBytes:0,writtenBytes:0,outputPath:'D:\\chosen\\sample.txt',error:null,history:null,sourceLink:null,duplicate:null,manifestPath:null}]}}
+const preparationReceipt=(operationId,state='PREPARING',task=null,error=null)=>({operationId,state,task,error})
+const readyPreparation=value=>options=>preparationReceipt(options.body.operationId,'READY',value)
+const pendingPreparation=options=>preparationReceipt(options.body.operationId)
+function taskForMedia(media){const value=task();return{...value,total:media.length,totalBytes:media.reduce((sum,item)=>sum+item.size,0),items:media.map((item,index)=>({...value.items[0],id:'item-'+index,fileName:item.fileName,size:item.size,outputPath:'D:\\chosen\\file-'+index}))}}
 class ApiError extends Error{constructor(message,status){super(message);this.status=status}}
 const compiled=new Map()
 function mount(t,name='BotDownload',overrides={},runtime={}){
@@ -31,13 +35,14 @@ function mount(t,name='BotDownload',overrides={},runtime={}){
   let now=100_000,timerSerial=0,activeRequests=0,maxRequests=0
   class ClockDate extends Date{static now(){return now}}
   const setTimer=(callback,delay)=>{const token=++timerSerial;timers.set(token,{callback,due:now+delay});return token},clearTimer=token=>timers.delete(token)
-  const api=async(path,options={})=>{calls.push({path,options});const expected=steps.shift();try{assert.ok(expected,'unexpected '+path);assert.equal(path,expected.path);assert.equal(options.method??'GET',expected.method??'GET')}catch(error){failures.push(error);throw error}activeRequests++;maxRequests=Math.max(maxRequests,activeRequests);try{const value=await expected.value;if(value instanceof Error)throw value;return value}finally{activeRequests--}}
+  const api=async(path,options={})=>{calls.push({path,options});const expected=steps.shift();try{assert.ok(expected,'unexpected '+path);assert.equal(path,expected.path);assert.equal(options.method??'GET',expected.method??'GET')}catch(error){failures.push(error);throw error}activeRequests++;maxRequests=Math.max(maxRequests,activeRequests);try{const value=await (typeof expected.value==='function'?expected.value(options):expected.value);if(value instanceof Error)throw value;return value}finally{activeRequests--}}
   const botModule=Object.hasOwn(runtime,'operationCrypto')?{...bots,botOperationId:()=>bots.botOperationId(runtime.operationCrypto)}:bots
   const modules={vue:{...vue,onBeforeUnmount:hook=>hooks.push(hook),withCtx:fn=>fn,withDirectives:node=>node},'../api':{api,ApiError},'../botDownload':botModule,'../downloadTasks':tasks,'../library':library,'../transferCreation':creation}
   const require=name=>{if(name.endsWith('.vue')){const key=name.split('/').at(-1).replace('.vue','');if(!stubs.has(key))stubs.set(key,{__name:key});return{__esModule:true,default:stubs.get(key)}}assert.ok(Object.hasOwn(modules,name),name);return modules[name]}
   const code=compiled.get(name),module={exports:{}},render={exports:{}}
   new Function('require','module','exports','setTimeout','clearTimeout','Date',code.code)(require,module,module.exports,setTimer,clearTimer,ClockDate);new Function('require','module','exports',code.render)(require,render,render.exports)
   const scope=vue.effectScope(),state=scope.run(()=>module.exports.default.setup(props,{expose(){},emit:(...event)=>events.push(event)}))
+  if(name==='BotDownload'&&runtime.autoPagination!==true)state.autoPagination.value=false
   let destroyed=false;const destroy=()=>{if(!destroyed){destroyed=true;hooks.forEach(hook=>hook());scope.stop()}}
   t.after(()=>{destroy();assert.deepEqual(failures,[]);assert.equal(steps.length,0);assert.equal(timers.size,0)})
   const advance=async milliseconds=>{const target=now+milliseconds;let guard=0;while(true){const next=[...timers].sort((a,b)=>a[1].due-b[1].due).find(([,timer])=>timer.due<=target);if(!next)break;assert.ok(++guard<=200,'timer loop is not bounded');now=next[1].due;timers.delete(next[0]);next[1].callback();await flush()}now=target;await flush()}
@@ -56,6 +61,13 @@ test('bot preview validates bounded messages, button positions, media membership
   for(const mutate of [v=>v.messages=Array(51).fill(v.messages[0]),v=>v.media=Array(501).fill(v.media[0]),v=>v.messages[1].buttons.push({...button(),id:'duplicate-position'}),v=>v.messages[0].media[0].size=17,v=>v.nextHistoryCursor='1001',v=>v.historyEnd=false,v=>v.currentPage=7,v=>v.bot.botUserId='9223372036854775808']){const value=preview();mutate(value);assert.equal(bots.validBotPreview(value),false)}
   const value=preview({paginationStatus:'END',currentPage:6,recommendedButtonId:null,historyEnd:true,nextHistoryCursor:null});assert.equal(bots.validBotPreview(value),true)
 })
+
+test('bot pagination totals have no million-page business cap while unsafe or inconsistent numbers remain invalid',()=>{
+  assert.equal(bots.validBotPreview(preview({currentPage:1_000_001,totalPages:2_000_000})),true)
+  assert.equal(bots.validBotPreview(preview({currentPage:Number.MAX_SAFE_INTEGER,totalPages:Number.MAX_SAFE_INTEGER,paginationStatus:'END',recommendedButtonId:null})),true)
+  assert.equal(bots.validBotPreview(preview({currentPage:null,totalPages:null})),true,'unrepresentable server page labels can remain unknown')
+  for(const patch of [{currentPage:0},{totalPages:-1},{currentPage:1.5},{currentPage:Number.MAX_SAFE_INTEGER+1,totalPages:null},{currentPage:4,totalPages:3}])assert.equal(bots.validBotPreview(preview(patch)),false)
+})
 test('bot source reads only on the explicit open action and does not select or download any media automatically',async t=>{
   const f=mount(t);await flush();assert.equal(f.calls.length,0)
   f.state.source.value='@synthetic_bot';f.expect(BASE+'/preview',preview(),'POST');await f.state.open()
@@ -72,7 +84,7 @@ test('explicitly rereading the same bot clears the old resource before the reque
   assert.doesNotMatch(text(f.render()),/sample\.txt|已获取第1组文件/)
 })
 test('an unknown task creation still blocks resource rereads without discarding the frozen operation or its selected media',async t=>{
-  const f=await opened(t);f.state.select('file-a');f.state.targetDirectory.value='D:\\chosen';f.expect(BASE+'/tasks',new Error('lost creation response'),'POST');await f.state.create()
+  const f=await opened(t);f.state.select('file-a');f.state.targetDirectory.value='D:\\chosen';f.expect(BASE+'/preparations',new Error('lost creation response'),'POST');await f.state.create()
   const request=copy(f.state.createRequest.value),prior=copy(f.state.preview.value)
   await f.state.open();assert.equal(f.calls.length,2);assert.deepEqual(f.state.createRequest.value,request);assert.deepEqual(f.state.preview.value,prior);assert.deepEqual(f.state.selected.value,['file-a'])
 })
@@ -96,24 +108,30 @@ test('unsupported callbacks cannot be invoked and manual choices require a secon
   f.state.chooseButton(button());assert.equal(f.state.manualButton.value.id,'button-next');assert.equal(f.calls.length,1)
   f.expect(BASE+'/preview/'+ID+'/press',preview({revision:2,currentPage:2}),'POST');await f.state.press(f.state.manualButton.value);assert.equal(f.calls.length,2)
 })
-test('media selection caps at 100, keeps choices on refresh, and leaves new media unselected',async t=>{
-  const value=preview();value.media=Array.from({length:101},(_,i)=>({...media(),key:'m'+i,message:{chatId:CHAT,messageId:String(2000+i),link:null}}));value.messages[0].media=[]
-  const f=await opened(t,value);f.state.selectAll();assert.equal(f.state.selected.value.length,100);f.state.select('m100');assert.equal(f.state.selected.value.length,100)
-  f.state.select('m0');f.state.select('m100');assert.equal(f.state.selected.value.includes('m100'),true)
-  f.expect(BASE+'/preview/'+ID,{...value,revision:2});await f.state.read('refresh');assert.equal(f.state.selected.value.length,100)
+test('media preview and selection have no count cap, preserve choices on refresh, and accept a large task receipt',async t=>{
+  const value=preview();value.media=Array.from({length:601},(_,i)=>({...media(),key:'m'+i,message:{chatId:CHAT,messageId:String(2000+i),link:null}}));value.messages[0].media=[]
+  assert.equal(bots.validBotPreview(value),true)
+  const f=await opened(t,value);f.state.selectAll();assert.equal(f.state.selected.value.length,601);assert.equal(f.state.allSelected.value,true)
+  f.state.select('m600');assert.equal(f.state.selected.value.length,600);f.state.select('m600');assert.equal(f.state.selected.value.length,601)
+  const refreshed=copy(value);refreshed.revision=2;refreshed.media.push({...media(),key:'new-file',message:{chatId:CHAT,messageId:'3000',link:null}})
+  f.expect(BASE+'/preview/'+ID,refreshed);await f.state.read('refresh');assert.equal(f.state.selected.value.length,601);assert.equal(f.state.selected.value.includes('new-file'),false)
+  const accepted=task();accepted.total=601;accepted.totalBytes=601*16;accepted.items=value.media.map((media,index)=>({...accepted.items[0],id:'item-'+index,fileName:media.fileName,outputPath:'D:\\chosen\\file-'+index}))
+  assert.equal(tasks.validTask(accepted),true)
+  f.state.targetDirectory.value='D:\\chosen';assert.equal(f.state.canCreate.value,true);f.expect(BASE+'/preparations',readyPreparation(accepted),'POST');await f.state.create()
+  assert.equal(f.calls.at(-1).options.body.mediaKeys.length,601);assert.equal(f.state.createdTask.value.total,601);assert.equal(f.state.createRequest.value,null)
 })
 test('download creation freezes the selected revision/directory and a lost result only queries its original operation',async t=>{
-  const f=await opened(t);f.state.select('file-a');f.state.targetDirectory.value='D:\\chosen';f.expect(BASE+'/tasks',new Error('lost task response'),'POST');await f.state.create()
+  const f=await opened(t);f.state.select('file-a');f.state.targetDirectory.value='D:\\chosen';f.expect(BASE+'/preparations',new Error('lost task response'),'POST');await f.state.create()
   const request=copy(f.state.createRequest.value);assert.ok(request);assert.equal(request.revision,1);assert.deepEqual(request.mediaKeys,['file-a']);assert.ok(f.events.some(event=>event[0]==='locked'&&event[1]===true))
   await f.state.create();f.state.select('file-a');assert.equal(f.calls.length,2);assert.deepEqual(f.state.selected.value,['file-a'])
-  f.expect(BASE+'/tasks/by-operation/'+request.operationId,{task:null});await f.state.lookup();assert.deepEqual(f.state.createRequest.value,request)
-  f.expect(BASE+'/tasks/by-operation/'+request.operationId,{task:task()});await f.state.lookup();assert.equal(f.state.createdTask.value.id,task().id);assert.equal(f.state.createRequest.value,null)
-  assert.equal(f.calls.filter(call=>call.path===BASE+'/tasks').length,1);assert.deepEqual(f.events.at(-1),['locked',false])
+  f.expect(BASE+'/preparations/'+request.operationId,new ApiError('尚未查到这次创建，请稍后再次核对',404));await f.state.lookup();assert.deepEqual(f.state.createRequest.value,request)
+  f.expect(BASE+'/preparations/'+request.operationId,preparationReceipt(request.operationId,'READY',task()));await f.state.lookup();assert.equal(f.state.createdTask.value.id,task().id);assert.equal(f.state.createRequest.value,null)
+  assert.equal(f.calls.filter(call=>call.path===BASE+'/preparations').length,1);assert.deepEqual(f.events.at(-1),['locked',false])
   f.state.continueBrowsing();assert.equal(f.state.createdTask.value,null);assert.deepEqual(f.state.selected.value,[]);assert.equal(f.state.targetDirectory.value,'D:\\chosen');assert.equal(f.calls.length,4)
 })
 test('a definite rejected task request is editable, while malformed success retains the frozen lookup identity',async t=>{
-  const f=await opened(t);f.state.select('file-a');f.state.targetDirectory.value='D:\\chosen';f.expect(BASE+'/tasks',new ApiError('invalid directory',400),'POST');await f.state.create();assert.equal(f.state.createRequest.value,null)
-  f.expect(BASE+'/tasks',{...task(),targetDirectory:'D:\\other'},'POST');await f.state.create();assert.ok(f.state.createRequest.value);assert.equal(f.state.createdTask.value,null)
+  const f=await opened(t);f.state.select('file-a');f.state.targetDirectory.value='D:\\chosen';f.expect(BASE+'/preparations',new ApiError('invalid directory',400),'POST');await f.state.create();assert.equal(f.state.createRequest.value,null)
+  f.expect(BASE+'/preparations',readyPreparation({...task(),targetDirectory:'D:\\other'}),'POST');await f.state.create();assert.ok(f.state.createRequest.value);assert.equal(f.state.createdTask.value,null)
 })
 test('account changes and unmount discard late reads and clear old robot identities',async t=>{
   const f=mount(t),response=deferred();f.state.source.value='@synthetic_bot';f.expect(BASE+'/preview',response.promise,'POST');const pending=f.state.open()
@@ -121,7 +139,7 @@ test('account changes and unmount discard late reads and clear old robot identit
   const second=deferred();f.expect(BASE+'/preview',second.promise,'POST');const next=f.state.open();f.destroy();second.resolve(preview());await next;assert.equal(f.state.preview.value,null)
 })
 test('brief local unavailability preserves source, media choice and unresolved task operation',async t=>{
-  const f=await opened(t);f.state.select('file-a');f.state.targetDirectory.value='D:\\chosen';f.expect(BASE+'/tasks',new Error('offline'),'POST');await f.state.create();const before=copy(f.state.createRequest.value)
+  const f=await opened(t);f.state.select('file-a');f.state.targetDirectory.value='D:\\chosen';f.expect(BASE+'/preparations',new Error('offline'),'POST');await f.state.create();const before=copy(f.state.createRequest.value)
   f.props.available=false;await flush();assert.equal(f.state.source.value,'@synthetic_bot');assert.deepEqual(f.state.selected.value,['file-a']);assert.deepEqual(f.state.createRequest.value,before)
   await f.state.lookup();assert.equal(f.calls.length,2);f.props.available=true;await flush();assert.equal(f.calls.length,2,'recovery does not automatically submit or poll')
 })
@@ -294,7 +312,7 @@ test('observed media can be downloaded regardless of pagination waiting, review,
     f.state.select('file-a');assert.equal(f.state.canCreate.value,false);assert.match(f.state.creationHint.value,/保存目录/)
     f.state.targetDirectory.value='D:\\chosen';f.state.waitSeconds.value=1
     assert.equal(f.state.canCreate.value,true,state);assert.equal(f.state.canPress.value,false,state)
-    f.expect(BASE+'/tasks',task(),'POST');await f.state.create()
+    f.expect(BASE+'/preparations',readyPreparation(task()),'POST');await f.state.create()
     assert.equal(f.calls.length,2,'creating from an accepted snapshot needs no extra metadata request')
     assert.equal(f.calls[1].options.body.revision,1);assert.deepEqual(f.calls[1].options.body.mediaKeys,['file-a'])
     f.state.continueBrowsing();assert.equal(f.state.canPress.value,false,'downloading never unlocks the unresolved pagination operation')
@@ -313,7 +331,7 @@ test('creating a download waits for an in-flight observation, freezes choices an
   f.state.select('file-a');f.state.selectAll();await f.state.press(button());await f.state.open()
   assert.deepEqual(f.state.selected.value,['file-a']);assert.equal(f.calls.length,3)
   const added={...media(),key:'file-b',message:{chatId:CHAT,messageId:'1003',link:null}},value=preview({revision:3,state:'WAITING',wait:wait({elapsedMs:5000,remainingMs:115000})})
-  value.media.push(added);f.expect(BASE+'/tasks',task(),'POST');response.resolve(value);await pending
+  value.media.push(added);f.expect(BASE+'/preparations',readyPreparation(task()),'POST');response.resolve(value);await pending
   assert.equal(f.state.preview.value.media.length,2);assert.deepEqual(f.state.selected.value,['file-a'])
   assert.equal(f.calls[3].options.body.revision,3);assert.deepEqual(f.calls[3].options.body.mediaKeys,['file-a'])
   assert.equal(f.calls[3].options.body.targetDirectory,'D:\\chosen');assert.equal(f.maxRequests,1);assert.equal(f.timers.size,0)
@@ -325,7 +343,7 @@ test('a pending manual refresh and download remain serial and submit only its fi
   const f=await opened(t);f.state.select('file-a');f.state.targetDirectory.value='D:\\chosen'
   const response=deferred();f.expect(BASE+'/preview/'+ID,response.promise);const refresh=f.state.read()
   assert.equal(f.state.busy.value,'refresh');assert.equal(f.state.canCreate.value,true)
-  const pending=f.state.create();f.expect(BASE+'/tasks',task(),'POST');response.resolve(preview({revision:2,state:'NEEDS_REVIEW'}))
+  const pending=f.state.create();f.expect(BASE+'/preparations',readyPreparation(task()),'POST');response.resolve(preview({revision:2,state:'NEEDS_REVIEW'}))
   await Promise.all([refresh,pending]);assert.equal(f.calls[2].options.body.revision,2);assert.equal(f.maxRequests,1)
   assert.equal(f.state.createdTask.value.id,task().id);assert.equal(f.state.busy.value,'');assert.equal(f.state.preparingCreate.value,false)
 })
@@ -361,7 +379,7 @@ test('a failed in-flight metadata read prevents creating from the old revision u
       assert.deepEqual(f.state.selected.value,['file-a']);assert.equal(f.state.creationRecheckRequired.value,true)
       assert.match(f.state.creationHint.value,/刷新消息/)
       f.expect(BASE+'/preview/'+ID,preview({revision:2}));await f.state.read();assert.equal(f.state.canCreate.value,true)
-      f.expect(BASE+'/tasks',task(),'POST');await f.state.create();assert.equal(f.calls[3].options.body.revision,2)
+      f.expect(BASE+'/preparations',readyPreparation(task()),'POST');await f.state.create();assert.equal(f.calls[3].options.body.revision,2)
     }
   }
 })
@@ -402,12 +420,12 @@ test('download preparation and a rejected in-flight GET remain visible in the ac
   assert.match(text(downloadFooter(f)),/正在核对已选媒体/)
   response.resolve(new ApiError('本次资源已失效，请重新读取当前页',400));await Promise.all([refresh,pending])
   assert.equal(f.state.preview.value,null);assert.match(text(downloadFooter(f)),/本次资源已失效，请重新读取当前页/)
-  assert.equal(f.calls.filter(call=>call.path===BASE+'/tasks').length,0)
+  assert.equal(f.calls.filter(call=>call.path===BASE+'/preparations').length,0)
 })
 
 test('a definite download rejection is shown beside the download button and remains editable',async t=>{
   const f=await opened(t);f.state.select('file-a');f.state.targetDirectory.value='D:\\chosen'
-  const response=deferred();f.expect(BASE+'/tasks',response.promise,'POST');const pending=f.state.create()
+  const response=deferred();f.expect(BASE+'/preparations',response.promise,'POST');const pending=f.state.create()
   assert.match(text(downloadFooter(f)),/正在创建下载任务/)
   response.resolve(new ApiError('目标目录不可写',400));await pending
   assert.match(text(downloadFooter(f)),/目标目录不可写.*下载选中媒体/s)
@@ -416,17 +434,17 @@ test('a definite download rejection is shown beside the download button and rema
 
 test('an unknown download creation shows its original failure and lookup-only action in the footer',async t=>{
   const f=await opened(t);f.state.select('file-a');f.state.targetDirectory.value='D:\\chosen'
-  f.expect(BASE+'/tasks',new ApiError('服务暂不可用',500),'POST');await f.state.create()
+  f.expect(BASE+'/preparations',new ApiError('服务暂不可用',500),'POST');await f.state.create()
   const request=copy(f.state.createRequest.value)
   assert.match(text(downloadFooter(f)),/服务暂不可用.*核对创建结果.*不会重复提交/s)
   assert.doesNotMatch(text(downloadFooter(f)),/下载选中媒体/);await f.state.create();assert.equal(f.calls.length,2)
-  f.expect(BASE+'/tasks/by-operation/'+request.operationId,{task:null});await f.state.lookup()
+  f.expect(BASE+'/preparations/'+request.operationId,new ApiError('尚未查到这次创建，请稍后再次核对',404));await f.state.lookup()
   assert.match(text(downloadFooter(f)),/尚未查到这次创建.*核对创建结果/s);assert.deepEqual(f.state.createRequest.value,request)
 })
 
 test('a created download displays its file count and queue state beside task navigation without changing pages',async t=>{
   const f=await opened(t);f.state.select('file-a');f.state.targetDirectory.value='D:\\chosen'
-  f.expect(BASE+'/tasks',task(),'POST');await f.state.create()
+  f.expect(BASE+'/preparations',readyPreparation(task()),'POST');await f.state.create()
   assert.match(text(downloadFooter(f)),/下载任务已创建，共 1 个文件 · 等待下载.*查看下载任务.*继续浏览机器人/s)
   assert.equal(f.events.some(event=>event[0]==='tasks'),false);assert.equal(f.state.preview.value.id,ID)
   const action=nodes(downloadFooter(f)).find(node=>node.type==='button'&&text(node)==='查看下载任务');assert.ok(action)
@@ -452,14 +470,14 @@ test('the rendered download click creates exactly one task with native UUID or s
     const f=await opened(t,preview(),{operationCrypto});f.state.select('file-a');f.state.targetDirectory.value='D:\\chosen'
     const click=nodes(downloadFooter(f)).find(node=>node.type==='button'&&text(node)==='下载选中媒体')
     assert.equal(click.props.disabled,false);assert.equal(click.props.type,'button');assert.equal(typeof click.props.onClick,'function')
-    const response=deferred();f.expect(BASE+'/tasks',response.promise,'POST');const pending=click.props.onClick({type:'click'})
+    const response=deferred();f.expect(BASE+'/preparations',response.promise,'POST');const pending=click.props.onClick({type:'click'})
     await click.props.onClick({type:'click'});assert.equal(f.calls.length,2);assert.equal(randomCalls,1)
     const request=copy(f.state.createRequest.value);assert.match(request.operationId,/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/)
     response.resolve(new ApiError('response lost after creation',500));await pending
     assert.match(text(downloadFooter(f)),/核对创建结果/);await click.props.onClick({type:'click'})
     assert.equal(f.calls.length,2);assert.equal(randomCalls,1);assert.deepEqual(f.state.createRequest.value,request)
-    f.expect(BASE+'/tasks/by-operation/'+request.operationId,{task:task()});await f.state.lookup()
-    assert.equal(f.state.createdTask.value.id,task().id);assert.equal(f.calls.filter(call=>call.path===BASE+'/tasks').length,1)
+    f.expect(BASE+'/preparations/'+request.operationId,preparationReceipt(request.operationId,'READY',task()));await f.state.lookup()
+    assert.equal(f.state.createdTask.value.id,task().id);assert.equal(f.calls.filter(call=>call.path===BASE+'/preparations').length,1)
   }
 })
 
@@ -489,7 +507,7 @@ test('a permission rejection preserves its footer reason and lets the user remov
   view.media.push(remaining)
   const f=await opened(t,view);f.state.selectAll();f.state.targetDirectory.value='D:\\chosen'
   const rejectedReason='源消息不可保存或身份已变化'
-  f.expect(BASE+'/tasks',new ApiError(rejectedReason,400),'POST')
+  f.expect(BASE+'/preparations',new ApiError(rejectedReason,400),'POST')
   let click=nodes(downloadFooter(f)).find(node=>node.type==='button'&&text(node)==='下载选中媒体')
   await click.props.onClick({type:'click'});const rejected=copy(f.calls[1].options.body)
   assert.deepEqual(rejected.mediaKeys,['file-a','file-b']);assert.match(text(downloadFooter(f)),/源消息不可保存或身份已变化/)
@@ -498,11 +516,11 @@ test('a permission rejection preserves its footer reason and lets the user remov
   await f.advance(300000);assert.equal(f.calls.length,2,'a definite rejection never retries itself')
   f.state.select('file-a');assert.deepEqual(f.state.selected.value,['file-b'])
   const accepted=task();accepted.items[0].fileName=remaining.fileName
-  f.expect(BASE+'/tasks',accepted,'POST');click=nodes(downloadFooter(f)).find(node=>node.type==='button'&&text(node)==='下载选中媒体')
+  f.expect(BASE+'/preparations',readyPreparation(accepted),'POST');click=nodes(downloadFooter(f)).find(node=>node.type==='button'&&text(node)==='下载选中媒体')
   assert.equal(click.props.disabled,false);await click.props.onClick({type:'click'})
   const request=f.calls[2].options.body;assert.deepEqual(request.mediaKeys,['file-b']);assert.notEqual(request.operationId,rejected.operationId)
   assert.equal(request.sourceId,rejected.sourceId);assert.equal(request.revision,rejected.revision);assert.equal(request.targetDirectory,rejected.targetDirectory)
-  assert.equal(f.state.createdTask.value.id,accepted.id);assert.equal(f.calls.filter(call=>call.path===BASE+'/tasks').length,2)
+  assert.equal(f.state.createdTask.value.id,accepted.id);assert.equal(f.calls.filter(call=>call.path===BASE+'/preparations').length,2)
   await f.advance(300000);assert.equal(f.calls.length,3);assert.equal(f.events.some(event=>event[0]==='tasks'),false)
 })
 
@@ -518,9 +536,9 @@ test('the current-page reader accepts an initial middle or final page and downlo
     if(last)assert.match(text(f.render()),/机器人已显示最后一页／组/)
     f.state.select('file-a');f.state.targetDirectory.value='D:\\chosen';assert.equal(f.state.canCreate.value,true)
     const download=nodes(downloadFooter(f)).find(node=>node.type==='button'&&text(node)==='下载选中媒体')
-    f.expect(BASE+'/tasks',task(),'POST');await download.props.onClick({type:'click'})
+    f.expect(BASE+'/preparations',readyPreparation(task()),'POST');await download.props.onClick({type:'click'})
     assert.deepEqual(f.calls[1].options.body.mediaKeys,['file-a']);assert.equal(f.state.createdTask.value.id,task().id)
-    await f.advance(300000);assert.deepEqual(f.calls.map(call=>call.path),[BASE+'/preview',BASE+'/tasks'])
+    await f.advance(300000);assert.deepEqual(f.calls.map(call=>call.path),[BASE+'/preview',BASE+'/preparations'])
     assert.equal(f.timers.size,0,'reading a current page never starts a pagination observation window by itself')
   }
 })
@@ -534,7 +552,255 @@ test('explicitly rereading after a manual Telegram page change starts from that 
   const open=nodes(f.render()).find(node=>node.type==='button'&&text(node)==='读取当前页／组');await open.props.onClick({type:'click'})
   assert.deepEqual(f.state.selected.value,[]);assert.deepEqual(f.state.preview.value.media.map(media=>media.key),['file-b'])
   assert.equal(f.state.preview.value.currentPage,6);assert.equal(f.state.targetDirectory.value,'D:\\chosen')
-  f.state.select('file-b');f.expect(BASE+'/tasks',task(),'POST');await f.state.create()
+  f.state.select('file-b');f.expect(BASE+'/preparations',readyPreparation(task()),'POST');await f.state.create()
   assert.deepEqual(f.calls[2].options.body.mediaKeys,['file-b'])
-  assert.deepEqual(f.calls.map(call=>call.path),[BASE+'/preview',BASE+'/preview',BASE+'/tasks']);assert.equal(f.timers.size,0)
+  assert.deepEqual(f.calls.map(call=>call.path),[BASE+'/preview',BASE+'/preview',BASE+'/preparations']);assert.equal(f.timers.size,0)
+})
+
+function autoPage(page,revision,state='READY',overrides={}){
+  const value=preview({currentPage:page,totalPages:3,revision,state,...overrides})
+  const items=Array.from({length:page},(_,index)=>({...media(),key:index===0?'file-a':'page-'+(index+1),message:{chatId:CHAT,messageId:index===0?'1001':String(3000+index),link:null}}))
+  const current=items.at(-1);value.media=items;value.messages[0]={id:current.message.messageId,text:'',media:[copy(current)],buttons:[]}
+  value.messages[1].text='已获取第'+page+'组文件（共3组）';value.messages[1].buttons[0].text='下一组 ('+(page+1)+'/3)';return value
+}
+
+test('automatic collection is enabled by default but performs no I/O before the explicit current-page read',async t=>{
+  const f=mount(t,'BotDownload',{},{autoPagination:true});assert.equal(f.state.autoPagination.value,true)
+  f.state.source.value='@synthetic_bot';await flush();await f.advance(300000);assert.equal(f.calls.length,0)
+  f.expect(BASE+'/preview',autoPage(1,1),'POST');await f.state.open();assert.equal(f.state.autoPaging.value,true);assert.equal(f.calls.length,1)
+  assert.match(text(f.render()),/自动翻页采集至末页/);f.state.stopAutoPagination();assert.equal(f.timers.size,0)
+})
+
+test('automatic collection reaches the last page through stable replies without preparing or polling any download task',async t=>{
+  const f=await opened(t,autoPage(1,1),{autoPagination:true})
+  f.expect(BASE+'/preview/'+ID+'/press',autoPage(1,2,'WAITING',{wait:wait()}),'POST');await f.advance(0)
+  await f.advance(4999);assert.equal(f.calls.length,2)
+  f.expect(BASE+'/preview/'+ID,autoPage(2,3));f.expect(BASE+'/preview/'+ID+'/press',autoPage(2,4,'WAITING',{wait:wait()}),'POST');await f.advance(1)
+  assert.equal(f.calls.filter(call=>call.path.endsWith('/press')).length,2)
+  f.expect(BASE+'/preview/'+ID,autoPage(3,5,'READY',{paginationStatus:'END',recommendedButtonId:null}));await f.advance(5000)
+  assert.equal(f.state.autoPaging.value,false);assert.equal(f.state.preview.value.media.length,3);assert.equal(f.state.visibleMedia.value.length,3)
+  assert.deepEqual(f.state.selected.value,[]);assert.equal(f.maxRequests,1);assert.equal(f.timers.size,0);assert.match(f.state.notice.value,/最后一页/)
+  assert.equal(f.calls.every(call=>call.path.startsWith(BASE+'/preview')),true,'collection must not wait for downloads or create preparations')
+})
+
+test('exact PAGE callbacks still collect when enormous page labels are represented by null numeric fields',async t=>{
+  const pageView=(page,revision,state='READY',extra={})=>{
+    const value=autoPage(page,revision,state,{currentPage:null,totalPages:null,...extra})
+    value.messages[1].buttons[0]={...value.messages[1].buttons[0],kind:'PAGE',page:null,text:'999999999999999999999999999999'+page}
+    return value
+  }
+  assert.equal(bots.validBotPreview(pageView(1,1)),true)
+  const f=await opened(t,pageView(1,1),{autoPagination:true})
+  f.expect(BASE+'/preview/'+ID+'/press',pageView(1,2,'WAITING',{wait:wait()}),'POST');await f.advance(0)
+  f.expect(BASE+'/preview/'+ID,pageView(2,3));f.expect(BASE+'/preview/'+ID+'/press',pageView(2,4,'WAITING',{wait:wait()}),'POST');await f.advance(5000)
+  f.expect(BASE+'/preview/'+ID,pageView(3,5,'READY',{paginationStatus:'END',recommendedButtonId:null}));await f.advance(5000)
+  assert.equal(f.state.preview.value.paginationStatus,'END');assert.equal(f.state.autoPaging.value,false)
+  assert.equal(f.state.visibleMedia.value.length,3);assert.equal(f.calls.filter(call=>call.path.endsWith('/press')).length,2)
+  assert.equal(f.timers.size,0);assert.ok(f.calls.every(call=>call.path.startsWith(BASE+'/preview')))
+})
+
+test('automatic collection crosses two hundred pages and twenty minutes when each page has a fresh stable reply',async t=>{
+  const pages=206,pageView=(page,revision,state='READY',extra={})=>{
+    const value=autoPage(page,revision,state,{totalPages:pages,...extra})
+    value.messages[1].text=`第${page}页/共${pages}页`;value.messages[1].buttons[0].text=`下一页 (${page+1}/${pages})`
+    return value
+  }
+  const f=await opened(t,pageView(1,1),{autoPagination:true})
+  f.expect(BASE+'/preview/'+ID+'/press',pageView(1,2,'WAITING',{wait:wait({waitSeconds:10})}),'POST');await f.advance(0)
+  for(let page=2;page<=pages;page++){
+    const last=page===pages
+    f.expect(BASE+'/preview/'+ID,pageView(page,page*2-1,'READY',last?{paginationStatus:'END',recommendedButtonId:null}:{}))
+    if(!last)f.expect(BASE+'/preview/'+ID+'/press',pageView(page,page*2,'WAITING',{wait:wait({waitSeconds:10})}),'POST')
+    await f.advance(10000)
+  }
+  assert.equal(f.state.preview.value.currentPage,pages);assert.equal(f.state.visibleMedia.value.length,pages)
+  assert.equal(f.calls.filter(call=>call.path.endsWith('/press')).length,pages-1)
+  assert.equal(f.state.autoPaging.value,false);assert.equal(f.maxRequests,1);assert.equal(f.timers.size,0)
+  assert.ok(f.calls.every(call=>call.path.startsWith(BASE+'/preview')),'large collection never creates or polls downloads')
+})
+
+test('all 158 collected files remain visible and can be selected for one asynchronous background download',async t=>{
+  const all=Array.from({length:158},(_,index)=>({...media(),key:'collected-'+index,message:{chatId:CHAT,messageId:String(4000+index),link:null}}))
+  const initial=autoPage(1,1);initial.media=all.slice(0,78);initial.messages[0].media=[]
+  const final=autoPage(2,3,'READY',{paginationStatus:'END',recommendedButtonId:null});final.media=all;final.messages[0].media=[]
+  const f=await opened(t,initial,{autoPagination:true})
+  f.expect(BASE+'/preview/'+ID+'/press',{...initial,revision:2,state:'WAITING',wait:wait()},'POST');await f.advance(0)
+  f.expect(BASE+'/preview/'+ID,final);await f.advance(5000)
+  assert.equal(f.state.visibleMedia.value.length,158);f.state.selectAll();assert.equal(f.state.selected.value.length,158);f.state.targetDirectory.value='D:\\chosen'
+  f.expect(BASE+'/preparations',pendingPreparation,'POST');await f.state.create();const request=copy(f.state.createRequest.value)
+  assert.equal(request.mediaKeys.length,158);assert.equal(f.state.preparation.value.state,'PREPARING')
+  f.expect(BASE+'/preparations/'+request.operationId,preparationReceipt(request.operationId,'READY',taskForMedia(all)));await f.advance(2000)
+  assert.equal(f.state.createdTask.value.total,158);assert.equal(f.calls.some(call=>call.path.startsWith('/transfers/download/tasks/')),false)
+})
+
+test('an acknowledged uncertain pagination result keeps collection active until stable READY and never repeats the callback',async t=>{
+  const f=await opened(t,autoPage(1,1),{autoPagination:true})
+  f.expect(BASE+'/preview/'+ID+'/press',autoPage(1,2,'NEEDS_REVIEW',{wait:wait()}),'POST');await f.advance(0)
+  assert.equal(f.state.autoPaging.value,true);assert.equal(f.state.pressUnknown.value,true)
+  for(const elapsedMs of [5000,7000]){f.expect(BASE+'/preview/'+ID,autoPage(1,2,'NEEDS_REVIEW',{wait:wait({elapsedMs,remainingMs:120000-elapsedMs})}));await f.advance(elapsedMs===5000?5000:2000);assert.equal(f.calls.filter(call=>call.path.endsWith('/press')).length,1)}
+  f.expect(BASE+'/preview/'+ID,autoPage(2,3));f.expect(BASE+'/preview/'+ID+'/press',autoPage(2,4,'WAITING',{wait:wait()}),'POST');await f.advance(2000)
+  assert.equal(f.state.pressUnknown.value,false);assert.equal(f.calls.filter(call=>call.path.endsWith('/press')).length,2)
+  f.expect(BASE+'/preview/'+ID,autoPage(3,5,'READY',{paginationStatus:'END',recommendedButtonId:null}));await f.advance(5000)
+  assert.equal(f.state.autoPaging.value,false);assert.equal(f.calls.every(call=>call.path.startsWith(BASE+'/preview')),true)
+})
+
+test('stopping collection during a callback still verifies that callback without pressing another page',async t=>{
+  const f=await opened(t,autoPage(1,1),{autoPagination:true}),response=deferred()
+  f.expect(BASE+'/preview/'+ID+'/press',response.promise,'POST');await f.advance(0);f.state.stopAutoPagination()
+  response.resolve(autoPage(1,2,'WAITING',{wait:wait()}));await flush();f.expect(BASE+'/preview/'+ID,autoPage(2,3));await f.advance(5000)
+  assert.equal(f.state.autoPaging.value,false);assert.equal(f.state.preview.value.currentPage,2);assert.equal(f.calls.filter(call=>call.path.endsWith('/press')).length,1);assert.equal(f.timers.size,0)
+})
+
+test('stop, disconnection, hiding, account changes and disposal prevent late replies from resuming collection',async t=>{
+  for(const change of ['stop','offline','inactive','account','dispose']){
+    const f=await opened(t,autoPage(1,1),{autoPagination:true});f.expect(BASE+'/preview/'+ID+'/press',autoPage(1,2,'WAITING',{wait:wait()}),'POST');await f.advance(0)
+    const response=deferred();f.expect(BASE+'/preview/'+ID,response.promise);await f.advance(5000)
+    if(change==='stop')f.state.stopAutoPagination();else if(change==='offline')f.props.available=false;else if(change==='inactive')f.props.active=false;else if(change==='account')f.props.accountId='2';else f.destroy()
+    await flush();response.resolve(autoPage(2,3));await flush();f.props.available=true;f.props.active=true;await flush();await f.advance(300000)
+    assert.equal(f.state.autoPaging.value,false,change);assert.equal(f.calls.filter(call=>call.path.endsWith('/press')).length,1,change);assert.equal(f.timers.size,0,change)
+  }
+})
+
+test('an unstructured callback failure stops collection and later verification never restarts it',async t=>{
+  for(const failure of [new Error('lost callback response'),new ApiError('callback unavailable',503)]){
+    const f=await opened(t,autoPage(1,1),{autoPagination:true});f.expect(BASE+'/preview/'+ID+'/press',failure,'POST');await f.advance(0)
+    assert.equal(f.state.autoPaging.value,false);assert.equal(f.state.pressUnknown.value,true)
+    f.expect(BASE+'/preview/'+ID,autoPage(2,3));await f.advance(5000);assert.equal(f.state.pressUnknown.value,false);await f.advance(300000)
+    assert.equal(f.calls.filter(call=>call.path.endsWith('/press')).length,1);assert.equal(f.timers.size,0)
+  }
+})
+
+test('no-progress review expires at the original deadline and preserves media without repeating pagination',async t=>{
+  const f=await opened(t,autoPage(1,1),{autoPagination:true});f.state.waitSeconds.value=2;f.state.timeoutSeconds.value=15
+  f.expect(BASE+'/preview/'+ID+'/press',autoPage(1,2,'NEEDS_REVIEW',{wait:wait({waitSeconds:2,timeoutSeconds:15,remainingMs:15000})}),'POST');await f.advance(0)
+  for(let seconds=2;seconds<=14;seconds+=2)f.expect(BASE+'/preview/'+ID,autoPage(1,2,'NEEDS_REVIEW',{wait:wait({waitSeconds:2,timeoutSeconds:15,elapsedMs:seconds*1000,remainingMs:(15-seconds)*1000})}))
+  await f.advance(14000);assert.equal(f.state.autoPaging.value,true);await f.advance(1000)
+  assert.equal(f.state.autoPaging.value,false);assert.equal(f.state.waitingExpired.value,true);assert.equal(f.state.preview.value.media.length,1);assert.equal(f.timers.size,0);assert.equal(f.calls.filter(call=>call.path.endsWith('/press')).length,1)
+})
+
+test('unknown next controls and repeated pagination positions stop automatic collection',async t=>{
+  for(const overrides of [{paginationStatus:'UNKNOWN',recommendedButtonId:null},{paginationStatus:'MORE',recommendedButtonId:null},{paginationStatus:'END',recommendedButtonId:null,currentPage:3}]){
+    const f=await opened(t,autoPage(1,1,'READY',overrides),{autoPagination:true});await f.advance(0);assert.equal(f.state.autoPaging.value,false);assert.equal(f.calls.length,1)
+  }
+  const f=await opened(t,autoPage(1,1),{autoPagination:true}),repeated=autoPage(1,2);repeated.messages[1].buttons[0].id='new-button';repeated.recommendedButtonId='new-button'
+  f.expect(BASE+'/preview/'+ID+'/press',repeated,'POST');await f.advance(0)
+  assert.equal(f.state.autoPaging.value,false);assert.match(f.state.notice.value,/分页位置没有变化/);assert.equal(f.calls.length,2);assert.equal(f.timers.size,0)
+})
+
+test('late initial reads after brief offline or hidden recovery do not restart automatic collection',async t=>{
+  for(const change of ['offline','inactive']){
+    const f=mount(t,'BotDownload',{},{autoPagination:true}),response=deferred();f.state.source.value='@synthetic_bot';f.expect(BASE+'/preview',response.promise,'POST');const pending=f.state.open()
+    if(change==='offline'){f.props.available=false;f.props.available=true}else{f.props.active=false;f.props.active=true}
+    await flush();response.resolve(autoPage(1,1));await pending;await f.advance(300000)
+    assert.equal(f.state.preview.value.revision,1);assert.equal(f.state.autoPaging.value,false);assert.equal(f.calls.length,1);assert.equal(f.timers.size,0)
+  }
+})
+
+test('task creation is unavailable during collection and a frozen queued task is not polled or recreated by the collector',async t=>{
+  const f=await opened(t,autoPage(1,1),{autoPagination:true});f.state.selectAll();f.state.targetDirectory.value='D:\\chosen';await f.state.create();assert.equal(f.calls.length,1);assert.equal(f.state.canCreate.value,false)
+  f.state.stopAutoPagination();f.expect(BASE+'/preparations',readyPreparation(task()),'POST');await f.state.create();assert.equal(f.state.createdTask.value.state,'QUEUED')
+  f.state.startAutoPagination();await f.advance(300000);assert.equal(f.calls.length,2)
+  f.state.continueBrowsing();f.state.startAutoPagination();f.expect(BASE+'/preview/'+ID+'/press',autoPage(1,2,'WAITING',{wait:wait()}),'POST');await f.advance(0)
+  assert.equal(f.calls.filter(call=>call.path.endsWith('/press')).length,1);assert.equal(f.calls.some(call=>call.path.startsWith('/transfers/download/tasks/')),false);f.state.stopWaiting()
+})
+
+test('bot preparation receipts require a matching operation and strict state, task and error combinations',()=>{
+  for(const value of [preparationReceipt(ID),preparationReceipt(ID,'READY',task()),preparationReceipt(ID,'FAILED',null,'原消息已变化')])assert.equal(bots.validBotPreparation(value),true)
+  for(const value of [null,{},preparationReceipt('invalid'),preparationReceipt(ID,'UNKNOWN'),preparationReceipt(ID,'PREPARING',task()),preparationReceipt(ID,'PREPARING',null,'error'),preparationReceipt(ID,'READY'),preparationReceipt(ID,'READY',task(),'error'),preparationReceipt(ID,'FAILED'),preparationReceipt(ID,'FAILED',task(),'error'),preparationReceipt(ID,'FAILED',null,' '),preparationReceipt(ID,'FAILED',null,'a'.repeat(8193))])assert.equal(bots.validBotPreparation(value),false)
+})
+
+test('158 selected media prepare asynchronously for longer than the old request deadline using one POST and serial same-operation GETs',async t=>{
+  const view=preview();view.media=Array.from({length:158},(_,index)=>({...media(),key:'large-'+index,message:{chatId:CHAT,messageId:String(4000+index),link:null}}));view.messages[0].media=[]
+  const f=await opened(t,view);f.state.selectAll();f.state.targetDirectory.value='D:\\chosen'
+  f.expect(BASE+'/preparations',pendingPreparation,'POST');await f.state.create()
+  const request=copy(f.state.createRequest.value),accepted=taskForMedia(view.media)
+  assert.equal(request.mediaKeys.length,158);assert.equal(f.state.pollingCreation.value,true);assert.equal(f.state.preparation.value.state,'PREPARING')
+  assert.match(text(downloadFooter(f)),/正在后台核对 158 个媒体/)
+  for(let index=0;index<80;index++)f.expect(BASE+'/preparations/'+request.operationId,preparationReceipt(request.operationId))
+  f.expect(BASE+'/preparations/'+request.operationId,preparationReceipt(request.operationId,'READY',accepted))
+  await f.advance(150000);assert.equal(f.state.createdTask.value,null);assert.equal(f.state.pollingCreation.value,true);assert.deepEqual(f.state.createRequest.value,request)
+  await f.advance(12000);assert.equal(f.state.createdTask.value.total,158);assert.equal(f.state.pollingCreation.value,false);assert.equal(f.state.createRequest.value,null);assert.equal(f.timers.size,0)
+  assert.equal(f.maxRequests,1);assert.equal(f.calls.filter(call=>call.options.method==='POST'&&call.path===BASE+'/preparations').length,1)
+  assert.equal(f.calls.some(call=>call.path.includes('/tasks')),false);await f.advance(300000);assert.equal(f.calls.length,83)
+})
+
+test('preparation GETs never overlap even when one read takes longer than the polling interval',async t=>{
+  const f=await opened(t);f.state.select('file-a');f.state.targetDirectory.value='D:\\chosen'
+  f.expect(BASE+'/preparations',pendingPreparation,'POST');await f.state.create();const request=copy(f.state.createRequest.value),response=deferred()
+  f.expect(BASE+'/preparations/'+request.operationId,response.promise);await f.advance(2000)
+  assert.equal(f.state.busy.value,'lookup');assert.equal(f.calls.length,3);await f.advance(20000);assert.equal(f.calls.length,3);assert.equal(f.timers.size,0)
+  response.resolve(preparationReceipt(request.operationId));await flush();assert.equal(f.timers.size,1)
+  f.expect(BASE+'/preparations/'+request.operationId,preparationReceipt(request.operationId,'READY',task()));await f.advance(2000)
+  assert.equal(f.state.createdTask.value.id,task().id);assert.equal(f.maxRequests,1);assert.equal(f.timers.size,0)
+})
+
+test('a failed preparation preserves selection and directory and a new explicit attempt uses a new operation',async t=>{
+  const f=await opened(t);f.state.select('file-a');f.state.targetDirectory.value='D:\\chosen'
+  f.expect(BASE+'/preparations',pendingPreparation,'POST');await f.state.create();const request=copy(f.state.createRequest.value)
+  f.expect(BASE+'/preparations/'+request.operationId,preparationReceipt(request.operationId,'FAILED',null,'Telegram 元数据读取失败'));await f.advance(2000)
+  assert.equal(f.state.createRequest.value,null);assert.equal(f.state.pollingCreation.value,false);assert.equal(f.state.canCreate.value,true);assert.equal(f.timers.size,0)
+  assert.deepEqual(f.state.selected.value,['file-a']);assert.equal(f.state.targetDirectory.value,'D:\\chosen');assert.match(text(downloadFooter(f)),/Telegram 元数据读取失败.*下载选中媒体/s)
+  await f.advance(300000);assert.equal(f.calls.length,3)
+  f.expect(BASE+'/preparations',readyPreparation(task()),'POST');await f.state.create();assert.notEqual(f.calls.at(-1).options.body.operationId,request.operationId);assert.equal(f.state.createdTask.value.id,task().id)
+})
+
+test('stopping preparation waiting retains its frozen operation and explicit lookup resumes only its GETs',async t=>{
+  const f=await opened(t);f.state.select('file-a');f.state.targetDirectory.value='D:\\chosen'
+  f.expect(BASE+'/preparations',pendingPreparation,'POST');await f.state.create();const request=copy(f.state.createRequest.value)
+  f.state.stopCreationWaiting();assert.equal(f.state.pollingCreation.value,false);assert.deepEqual(f.state.createRequest.value,request);assert.equal(f.state.canCreate.value,false)
+  await f.state.create();await f.advance(300000);assert.equal(f.calls.length,2);assert.match(text(downloadFooter(f)),/页面等待已停止.*核对创建结果/s)
+  f.expect(BASE+'/preparations/'+request.operationId,preparationReceipt(request.operationId));await f.state.lookup();assert.equal(f.state.pollingCreation.value,true)
+  f.expect(BASE+'/preparations/'+request.operationId,preparationReceipt(request.operationId,'READY',task()));await f.advance(2000)
+  assert.equal(f.state.createdTask.value.id,task().id);assert.equal(f.calls.filter(call=>call.path===BASE+'/preparations').length,1);assert.equal(f.timers.size,0)
+})
+
+test('malformed or mismatched preparation receipts never unfreeze the original request or create a duplicate task',async t=>{
+  for(const response of [options=>preparationReceipt('33333333-3333-4333-8333-333333333333'),options=>preparationReceipt(options.body.operationId,'READY',{...task(),targetDirectory:'D:\\other'}),options=>preparationReceipt(options.body.operationId,'READY',{...task(),total:2}),options=>({operationId:options.body.operationId,state:'PREPARING',task:task(),error:null})]){
+    const f=await opened(t);f.state.select('file-a');f.state.targetDirectory.value='D:\\chosen'
+    f.expect(BASE+'/preparations',response,'POST');await f.state.create();const request=copy(f.state.createRequest.value)
+    assert.ok(request);assert.equal(f.state.createdTask.value,null);assert.equal(f.state.pollingCreation.value,false);assert.equal(f.timers.size,0);assert.match(f.state.error.value,/准备回执/)
+    await f.state.create();await f.advance(300000);assert.equal(f.calls.length,2)
+    f.expect(BASE+'/preparations/'+request.operationId,preparationReceipt(request.operationId,'READY',task()));await f.state.lookup();assert.equal(f.state.createdTask.value.id,task().id)
+  }
+})
+
+test('an automatic preparation GET failure stops polling and preserves the original operation for manual lookup',async t=>{
+  for(const failure of [new ApiError('尚未查到原准备结果',404),new ApiError('Telegram 暂不可用',503),new Error('lost preparation receipt')]){
+    const f=await opened(t);f.state.select('file-a');f.state.targetDirectory.value='D:\\chosen'
+    f.expect(BASE+'/preparations',pendingPreparation,'POST');await f.state.create();const request=copy(f.state.createRequest.value)
+    f.expect(BASE+'/preparations/'+request.operationId,failure);await f.advance(2000)
+    assert.equal(f.state.pollingCreation.value,false);assert.deepEqual(f.state.createRequest.value,request);assert.equal(f.state.createdTask.value,null);assert.equal(f.timers.size,0)
+    assert.match(text(downloadFooter(f)),new RegExp(failure.message));await f.advance(300000);assert.equal(f.calls.length,3)
+    f.expect(BASE+'/preparations/'+request.operationId,preparationReceipt(request.operationId,'READY',task()));await f.state.lookup();assert.equal(f.state.createdTask.value.id,task().id)
+  }
+})
+
+test('stop, disconnection, hiding, account changes and disposal cancel in-flight preparation polling without accepting late results',async t=>{
+  for(const change of ['stop','offline','inactive','account','dispose']){
+    const f=await opened(t);f.state.select('file-a');f.state.targetDirectory.value='D:\\chosen'
+    f.expect(BASE+'/preparations',pendingPreparation,'POST');await f.state.create();const request=copy(f.state.createRequest.value),response=deferred()
+    f.expect(BASE+'/preparations/'+request.operationId,response.promise);await f.advance(2000)
+    if(change==='stop')f.state.stopCreationWaiting()
+    else if(change==='offline')f.props.available=false
+    else if(change==='inactive')f.props.active=false
+    else if(change==='account')f.props.accountId='2'
+    else f.destroy()
+    await flush();response.resolve(preparationReceipt(request.operationId,'READY',task()));await flush()
+    f.props.available=true;f.props.active=true;await flush();await f.advance(300000)
+    assert.equal(f.state.createdTask.value,null,change);assert.equal(f.state.pollingCreation.value,false,change);assert.equal(f.timers.size,0,change);assert.equal(f.calls.length,3,change)
+    if(change==='account')assert.equal(f.state.createRequest.value,null)
+    else if(change!=='dispose')assert.deepEqual(f.state.createRequest.value,request)
+  }
+})
+
+test('a late initial preparation receipt after offline or hidden recovery does not restart automatic polling',async t=>{
+  for(const change of ['offline','inactive']){
+    const f=await opened(t);f.state.select('file-a');f.state.targetDirectory.value='D:\\chosen'
+    const response=deferred();f.expect(BASE+'/preparations',response.promise,'POST');const pending=f.state.create(),request=copy(f.state.createRequest.value)
+    if(change==='offline'){f.props.available=false;f.props.available=true}
+    else{f.props.active=false;f.props.active=true}
+    await flush();response.resolve(preparationReceipt(request.operationId));await pending
+    assert.equal(f.state.pollingCreation.value,false,change);assert.deepEqual(f.state.createRequest.value,request);await f.advance(300000);assert.equal(f.calls.length,2,change);assert.equal(f.timers.size,0,change)
+    f.expect(BASE+'/preparations/'+request.operationId,preparationReceipt(request.operationId,'READY',task()));await f.state.lookup();assert.equal(f.state.createdTask.value.id,task().id)
+  }
 })

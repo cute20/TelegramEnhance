@@ -46,6 +46,20 @@ test('shared all button really selects and clears every type, preserving the ind
   assert.equal(f.calls.length,0)
 })
 
+test('advanced date controls preserve the draft across source switches and apply only to historical channel scans',async t=>{
+  const f=mount(t,'DownloadCreationFields');await flush()
+  let inputs=nodes(f.render()).filter(n=>n.type==='input'&&n.props.type==='date');assert.equal(inputs.length,2)
+  inputs[0].props.onInput({target:{value:'2024-02-29'}});inputs[1].props.onInput({target:{value:'2024-03-01'}});await flush()
+  assert.equal(f.props.modelValue.startDate,'2024-02-29');assert.equal(f.props.modelValue.endDate,'2024-03-01');assert.match(text(f.render()),/北京时间.*起止当天/)
+  f.state.entry('POST');await flush();assert.equal(nodes(f.render()).filter(n=>n.type==='input'&&n.props.type==='date').length,0)
+  assert.match(text(f.render()),/日期范围用于频道历史扫描/);assert.equal(f.props.modelValue.startDate,'2024-02-29')
+  f.state.entry('MANUAL');await flush();f.state.source('@newchannel');assert.equal(f.props.modelValue.endDate,'2024-03-01')
+  f.props.dateFiltering=false;await flush();assert.equal(nodes(f.render()).filter(n=>n.type==='input'&&n.props.type==='date').length,0)
+  assert.match(text(f.render()),/自动规则不应用该条件/)
+  f.props.dateFiltering=true;f.state.update({startDate:'2024-04-02',endDate:'2024-04-01'});await flush();assert.match(f.state.datesError.value,/不能晚于/)
+  assert.equal(f.calls.length,1,'date editing never scans or creates a task')
+})
+
 test('common draft is immutable while frozen and channel responses cannot cross account identity',async t=>{
   const f=mount(t,'DownloadCreationFields',{modelValue:{...creation.emptyDownloadSelection(),entry:'POST'}})
   f.props.disabled=true;await flush();f.state.source('-1002');f.state.entry('CHANNEL');assert.equal(f.props.modelValue.entry,'POST')
@@ -64,5 +78,16 @@ test('upload common fields derive one sibling archive path for both execution mo
   assert.equal(input.props.value,'D:\\media\\待上传-已上传');assert.equal(input.props.readonly,'')
   assert.equal(f.props.modelValue.captionMode,'EMPTY');assert.equal(f.props.modelValue.recursive,false)
   f.props.disabled=true;f.state.update({link:'https://t.me/new/1'});assert.equal(f.props.modelValue.link,'')
+  assert.equal(f.calls.length,0)
+})
+
+test('upload group size defaults to ten and provides one through ten including individual sends',async t=>{
+  const f=mount(t,'UploadCreationFields')
+  assert.equal(f.props.modelValue.albumSize,10)
+  const select=nodes(nodes(f.render()).find(node=>node.type==='label'&&text(node).startsWith('每组媒体数量'))).find(node=>node.type==='select')
+  assert.deepEqual(nodes(select).filter(node=>node.type==='option').map(node=>node.props.value),[1,2,3,4,5,6,7,8,9,10])
+  assert.match(text(select),/1 个（逐条发送）/)
+  select.props.onChange({target:{value:'3'}});await flush();assert.equal(f.props.modelValue.albumSize,3)
+  f.props.disabled=true;select.props.onChange({target:{value:'1'}});assert.equal(f.props.modelValue.albumSize,3)
   assert.equal(f.calls.length,0)
 })

@@ -57,21 +57,24 @@ class DownloadSourceServiceTest {
             assertThrows(ExecutionException.class, () -> await(f.service.thumbnailSource(preview.id(), 1, "observed")));
         }
     }
-    @Test void thumbnailGrantMemoryIsBoundedAndUnsupportedOrUnobservedMediaNeverReceivesAGrant() throws Exception {
+    @Test void moreThan1024ObservedMediaRemainSelectableAndRetainTheirOriginalPageGrants() throws Exception {
         try (var f = new Fixture()) {
             var first = await(f.service.preview(LINK)); var state = first; long edge = Long.parseLong(first.comments().nextCursor());
-            String oldest = null, newest = null;
+            String oldest = null, newest = null;var keys=new java.util.ArrayList<String>();
             for (int batch = 0; batch < 21; batch++) {
                 var media = new java.util.ArrayList<Media>(); var refs = new java.util.ArrayList<MessageRef>();
                 for (int i = 1; i <= 50; i++) { var ref = new MessageRef("-2001", Long.toString(edge - i), ""); refs.add(ref); media.add(new Media("m" + ref.messageId(), ref, "COMMENT", "PHOTO", "", 1, "")); }
-                if (oldest == null) oldest = media.getFirst().key(); newest = media.getLast().key();
+                if (oldest == null) oldest = media.getFirst().key(); newest = media.getLast().key();keys.addAll(media.stream().map(Media::key).toList());
                 var page = new Page(post(true).key(), media, refs, 50, Long.toString(edge - 50), false, "PARTIAL", List.of());
                 when(f.reader.comments(post(true), Long.toString(edge))).thenReturn(page);
                 state = await(f.service.next(state.id(), Long.toString(edge), state.pageNumber())); edge -= 50;
             }
             var id = first.id(); var oldKey = oldest;
-            assertThrows(ExecutionException.class, () -> await(f.service.thumbnailSource(id, 2, oldKey)));
+            assertEquals(oldKey,await(f.service.thumbnailSource(id, 2, oldKey)).media().key());
             assertEquals(newest, await(f.service.thumbnailSource(id, state.pageNumber(), newest)).media().key());
+            var selection=await(f.service.selection(id,keys,false));assertEquals(1050,selection.media().size());assertEquals(keys,selection.media().stream().map(Media::key).toList());
+            assertThrows(ExecutionException.class,()->await(f.service.selection(id,List.of("unobserved"),false)));
+            assertThrows(IllegalArgumentException.class,()->f.service.selection(id,List.of(oldKey,oldKey),false));
         }
     }
     @Test void previewAndPagingUseTheExistingReadQueueWithoutWritingBusinessIndexes() throws Exception {
@@ -138,7 +141,7 @@ class DownloadSourceServiceTest {
             var entered = new CountDownLatch(1); var release = new CountDownLatch(1);
             var blocking = f.work.readWork(() -> { entered.countDown(); try { assertTrue(release.await(3, TimeUnit.SECONDS)); } catch (InterruptedException e) { throw new RuntimeException(e); } return true; });
             assertTrue(entered.await(2, TimeUnit.SECONDS)); var queued = f.service.preview(LINK);
-            f.generation.incrementAndGet(); release.countDown(); await(blocking);
+            f.generation.incrementAndGet(); release.countDown(); assertThrows(ExecutionException.class, () -> await(blocking));
             assertThrows(ExecutionException.class, () -> await(queued)); verifyNoInteractions(f.reader);
         }
     }

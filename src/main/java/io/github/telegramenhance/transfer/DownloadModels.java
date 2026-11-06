@@ -7,7 +7,11 @@ import java.util.List;
 public final class DownloadModels {
     public static final String HISTORY_SKIP = "HISTORY_SKIP_V1", KEEP_DUPLICATES = "KEEP_DUPLICATES_V2";
     private DownloadModels() { }
-    public record FrozenFile(Media media, String uniqueId, long size, String fileName) {
+    public record BotFileReference(int fileId, String remoteId) {
+        @Override public String toString() { return "BotFileReference[redacted]"; }
+    }
+    public record FrozenFile(Media media, String uniqueId, long size, String fileName, BotFileReference botReference) {
+        public FrozenFile(Media media, String uniqueId, long size, String fileName) { this(media, uniqueId, size, fileName, null); }
         @Override public String toString() { return "FrozenFile[type=" + media.type() + ", size=" + size + "]"; }
     }
     public record Item(String id, int ordinal, FrozenFile file, String relativeFile, String token,
@@ -28,9 +32,14 @@ public final class DownloadModels {
                            String sourceLink, Duplicate duplicate, String manifestPath) { }
     public record TaskView(String id, String title, String channelTitle, String state, boolean pauseRequested,
                            String targetDirectory, String scope, int total, long completed, long skipped, long totalBytes,
-                           String error, long createdAt, long updatedAt, List<ItemView> items, String duplicatePolicy, long duplicates, String duplicateDirectory, Automation automation) {
+                           String error, long createdAt, long updatedAt, List<ItemView> items, String duplicatePolicy, long duplicates, String duplicateDirectory, Automation automation, Retry retry) {
+        public TaskView(String id,String title,String channelTitle,String state,boolean pauseRequested,String targetDirectory,String scope,int total,long completed,long skipped,long totalBytes,
+                String error,long createdAt,long updatedAt,List<ItemView> items,String duplicatePolicy,long duplicates,String duplicateDirectory,Automation automation){
+            this(id,title,channelTitle,state,pauseRequested,targetDirectory,scope,total,completed,skipped,totalBytes,error,createdAt,updatedAt,items,duplicatePolicy,duplicates,duplicateDirectory,automation,null);
+        }
         public TaskView { items = List.copyOf(items); }
     }
+    public record Retry(int attempt,long nextAttemptAt) { }
     public record Automation(String ruleId,long ruleVersion,String ruleName,boolean manual,boolean held,boolean enabled,long currentVersion,io.github.telegramenhance.rules.RuleModels.Window window) { }
     public record CacheOwner(String accountId, String uniqueId, int fileId) { }
 }

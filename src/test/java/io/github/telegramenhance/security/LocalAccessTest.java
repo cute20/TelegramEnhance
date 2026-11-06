@@ -3,6 +3,7 @@ package io.github.telegramenhance.security;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.mockito.Mockito.mock;
 
 import io.github.telegramenhance.config.AppPaths;
@@ -20,6 +21,15 @@ class LocalAccessTest {
     private static final String AUTHORITY = "127.0.0.1:" + PORT;
     private LocalAccess access;
     private String token;
+
+    @Test void launchUriStaysOnBoundLoopbackWithSecretOnlyInFragment() {
+        var uri = access.launchUri();
+        assertEquals("http", uri.getScheme()); assertEquals("127.0.0.1", uri.getHost()); assertEquals(PORT, uri.getPort());
+        assertEquals("/", uri.getPath()); assertNull(uri.getQuery()); assertNull(uri.getUserInfo());
+        assertEquals("token=" + token, uri.getFragment());
+        ReflectionTestUtils.setField(access, "port", 0);
+        assertThrows(IllegalStateException.class, access::launchUri);
+    }
 
     @BeforeEach
     void setUp() {

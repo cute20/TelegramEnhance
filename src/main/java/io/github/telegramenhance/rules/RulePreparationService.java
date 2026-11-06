@@ -1,6 +1,7 @@
 package io.github.telegramenhance.rules;
 
 import io.github.telegramenhance.telegram.TelegramService;
+import io.github.telegramenhance.transfer.ScanTaskStore;
 import jakarta.annotation.PreDestroy;
 import java.time.Clock;
 import java.util.LinkedHashMap;
@@ -22,6 +23,8 @@ public final class RulePreparationService implements AutoCloseable {
     private final Executor starter;
     private final LinkedHashMap<String, Job> jobs = new LinkedHashMap<>();
     private volatile boolean closed;
+    private ScanTaskStore scanTasks;
+    @org.springframework.beans.factory.annotation.Autowired public void trackScans(ScanTaskStore scanTasks){this.scanTasks=scanTasks;}
 
     public record Request(String operationId, long revision, String kind) { }
     public record View(String operationId, String ruleId, String accountId, long version, long revision,
@@ -69,7 +72,7 @@ public final class RulePreparationService implements AutoCloseable {
                     && pending.kind.equals(input.kind()) && pending.state.equals("RUNNING"))
                 throw new IllegalArgumentException("这条规则的同类准备正在进行，请等待原操作结果");
             if (jobs.size() >= 8) throw new IllegalArgumentException("准备记录已达到8份上限，请等待已完成记录过期后重试");
-            job = new Job(input, rule, generation, clock.millis(), nanos.getAsLong()); jobs.put(key, job);
+            job = new Job(input, rule, generation, clock.millis(), nanos.getAsLong());remember(job,true);jobs.put(key, job);
         }
         try { starter.execute(() -> run(job)); }
         catch (RuntimeException unavailable) { fail(job, new IllegalArgumentException("准备队列暂不可用，本次未启用或发送文件")); }
@@ -91,6 +94,14 @@ public final class RulePreparationService implements AutoCloseable {
             }
             expire(job); return job.view();
         }
+    }
+
+    /** Bounded read-only task-centre projection; never starts or replays a preparation. */
+    public java.util.List<View> snapshot() {
+        String account=telegram.accountId();long generation=telegram.sessionGeneration();
+        synchronized(this){requireOpen();prune();var result=jobs.values().stream()
+            .filter(job->job.account.equals(account)&&job.generation==generation)
+            .map(job->{expire(job);return job.view();}).toList();context(account,generation);return result;}
     }
 
     private void run(Job job) {
@@ -139,9 +150,11 @@ public final class RulePreparationService implements AutoCloseable {
         if (job.state.equals("RUNNING") && nanos.getAsLong() - job.startedNanos >= BUDGET) {
             job.error = EXPIRED; job.result = null; job.state = "FAILED";
             job.finishedAt = job.startedAt + TimeUnit.NANOSECONDS.toMillis(BUDGET); job.finishedNanos = job.startedNanos + BUDGET;
+            remember(job,false);
         }
     }
-    private void finished(Job job) { job.finishedAt = clock.millis(); job.finishedNanos = nanos.getAsLong(); }
+    private void finished(Job job) { job.finishedAt = clock.millis(); job.finishedNanos = nanos.getAsLong();remember(job,false); }
+    private void remember(Job job,boolean claim){if(scanTasks==null)return;scanTasks.remember(job.account,job.generation,new ScanTaskStore.Snapshot(job.operation,"rule-preparation","规则准备",job.kind.equals("preview")?"生成上传清单（单次操作，不可中断）":"检测目录（单次操作，不可中断）",job.state,job.startedAt,job.finishedAt==null?job.startedAt:job.finishedAt,0,0,0,"PREPARING",job.rule,null,job.error,job.revision,0,false,job.state.equals("RUNNING")),claim);}
     private void prune() {
         for (var job : jobs.values()) expire(job);
         long now = nanos.getAsLong(); jobs.values().removeIf(job -> !job.state.equals("RUNNING") && now - job.finishedNanos >= TTL);

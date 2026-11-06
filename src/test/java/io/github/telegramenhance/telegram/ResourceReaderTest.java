@@ -15,6 +15,26 @@ class ResourceReaderTest {
     private static final String ACCOUNT = "test-account";
     private static final String LINK = "https://t.me/example_channel/1";
 
+    @Test void realPublicationDateUsesTelegramSecondsAndMissingDatesStayUnknown() {
+        var scenario = new Scenario();
+        assertNull(scenario.reader.probe(LINK).publishedAt());
+        scenario.main.date = 1_700_000_123;
+        var post = scenario.reader.probe(LINK);
+        assertEquals(1_700_000_123_000L, post.publishedAt());
+        assertEquals(post.publishedAt(), scenario.reader.refresh(post).publishedAt());
+    }
+
+    @Test void albumPublicationDateComesFromCanonicalFirstMemberRatherThanReadAnchor() {
+        var scenario = new Scenario();
+        scenario.main.mediaAlbumId = 42; scenario.main.date = 1_700_000_123;
+        var older = message(scenario.main.chatId, 999, "first member"); older.mediaAlbumId = 42; older.date = 1_700_000_100;
+        scenario.mainPages.add(page(message(scenario.main.chatId, 1100, "newer post"), scenario.main));
+        scenario.mainPages.add(page(older, message(scenario.main.chatId, 998, "older post")));
+        var post = scenario.reader.probe(LINK);
+        assertEquals("999", post.mainMessageId());
+        assertEquals(1_700_000_100_000L, post.publishedAt());
+    }
+
     @Test
     void sameMessageIdsInDifferentChannelsKeepDistinctPostAndMediaIdentities() {
         var first = new Scenario(-1001, -2001);

@@ -9,8 +9,8 @@ function update(patch: Partial<UploadCreationSelection>) { if (!props.disabled) 
   <section class="creation-fields" aria-label="上传设置"><fieldset :disabled="disabled">
     <label>目标主帖链接<input class="input" :value="modelValue.link" placeholder="https://t.me/…" autocomplete="off" @input="update({link:($event.target as HTMLInputElement).value})" /></label>
     <div class="field-columns"><label>待上传目录<input class="input" :value="modelValue.sourceDirectory" placeholder="例如 D:\待上传" autocomplete="off" @input="update({sourceDirectory:($event.target as HTMLInputElement).value})" /></label><label>已上传归档目录<input class="input" :value="ruleArchiveDirectory(modelValue.sourceDirectory)" placeholder="自动生成：原目录名-已上传" readonly /></label></div>
-    <div class="upload-options"><label class="inline-option"><input type="checkbox" :checked="modelValue.recursive" @change="update({recursive:($event.target as HTMLInputElement).checked})" />包含子目录</label><label>媒体说明<select class="input" :value="modelValue.captionMode" @change="update({captionMode:($event.target as HTMLSelectElement).value as 'FILENAME'|'EMPTY'})"><option value="FILENAME">使用文件名</option><option value="EMPTY">留空</option></select></label></div>
-    <p>不同媒体类型分别分组，正式确认上传成功后归档。</p>
+    <div class="upload-options"><label class="inline-option"><input type="checkbox" :checked="modelValue.recursive" @change="update({recursive:($event.target as HTMLInputElement).checked})" />包含子目录</label><label>媒体说明<select class="input" :value="modelValue.captionMode" @change="update({captionMode:($event.target as HTMLSelectElement).value as 'FILENAME'|'EMPTY'})"><option value="FILENAME">使用文件名</option><option value="EMPTY">留空</option></select></label><label>每组媒体数量<select class="input" :value="modelValue.albumSize" @change="update({albumSize:Number(($event.target as HTMLSelectElement).value)})"><option v-for="size in 10" :key="size" :value="size">{{size === 1 ? '1 个（逐条发送）' : `${size} 个`}}</option></select></label></div>
+    <p>每组最多按所选数量发送，默认 10 个；不同媒体类型分别分组，动图逐条发送。正式确认上传成功后归档。</p>
   </fieldset></section>
 </template>
 <style scoped>

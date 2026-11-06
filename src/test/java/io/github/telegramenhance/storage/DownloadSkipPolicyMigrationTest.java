@@ -26,7 +26,7 @@ class DownloadSkipPolicyMigrationTest {
             assertTrue(Files.size(Path.of(paths.database() + "-wal")) > 0);
             var before = rows(original);
             try (var migrated = new Database(paths)) {
-                assertEquals(17, migrated.diagnostics().get("schemaVersion"));
+                assertEquals(Database.SCHEMA_VERSION, migrated.diagnostics().get("schemaVersion"));
                 assertEquals("ok", migrated.diagnostics().get("integrity"));
                 assertEquals(before, migrated.read(DownloadSkipPolicyMigrationTest::rows));
                 assertEquals("2", value(migrated, "SELECT COUNT(*) FROM download_tasks WHERE skip_content_duplicates=0"));
@@ -62,7 +62,7 @@ class DownloadSkipPolicyMigrationTest {
             var before = rows(original);
             String definition = scalar(original, "SELECT sql FROM sqlite_master WHERE name='download_tasks'");
             try (var migrated = new Database(paths)) {
-                assertEquals(17, migrated.diagnostics().get("schemaVersion"));
+                assertEquals(Database.SCHEMA_VERSION, migrated.diagnostics().get("schemaVersion"));
                 assertEquals(before, migrated.read(DownloadSkipPolicyMigrationTest::rows));
                 assertEquals(definition, value(migrated, "SELECT sql FROM sqlite_master WHERE name='download_tasks'"));
                 assertEquals("1", value(migrated, "SELECT skip_content_duplicates FROM download_tasks WHERE task_id='legacy-0'"));
@@ -106,11 +106,11 @@ class DownloadSkipPolicyMigrationTest {
             var paths = seed("claimed-current-" + unconstrained, true);
             try (var original = DriverManager.getConnection("jdbc:sqlite:" + paths.database()); var statement = original.createStatement()) {
                 if (unconstrained) statement.execute("ALTER TABLE download_tasks ADD COLUMN skip_content_duplicates INTEGER NOT NULL DEFAULT 0");
-                statement.execute("PRAGMA user_version=17");
+                statement.execute("PRAGMA user_version=" + Database.SCHEMA_VERSION);
             }
             assertThrows(IllegalStateException.class, () -> new Database(paths));
             try (var original = DriverManager.getConnection("jdbc:sqlite:" + paths.database())) {
-                assertEquals("17", scalar(original, "PRAGMA user_version"));
+                assertEquals(Integer.toString(Database.SCHEMA_VERSION), scalar(original, "PRAGMA user_version"));
                 assertEquals("2", scalar(original, "SELECT COUNT(*) FROM download_tasks"));
                 assertEquals(unconstrained ? "1" : "0", scalar(original,
                         "SELECT COUNT(*) FROM pragma_table_info('download_tasks') WHERE name='skip_content_duplicates'"));

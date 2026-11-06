@@ -1,233 +1,323 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, ref, watch } from 'vue'
 import { api, ApiError } from '../api'
-import { coverageLabel, originalMessageLink, type Coverage, type Media, type MediaCatalogPage, type PostDetail } from '../library'
+import { coverageLabel, originalMessageLink, type CommentPage, type Media, type MediaCatalogPage, type PostDetail } from '../library'
+import { runCommentRead, type CommentReadProgress } from '../commentReadRunner'
 import AppIcon from './AppIcon.vue'
-import LibraryMediaTable from './LibraryMediaTable.vue'
 import MediaCollection from './MediaCollection.vue'
 import MediaViewSwitch from './MediaViewSwitch.vue'
 import InfiniteLoad from './InfiniteLoad.vue'
 
-const props = defineProps<{ postKey: string; authorized: boolean; available: boolean; accountId: string | null }>()
-const emit = defineEmits<{ close: []; accessError: [cause: ApiError] }>()
+const props = defineProps<{ postKey: string; authorized: boolean; available: boolean; accountId: string | null; active?: boolean }>()
+// Notify the catalog after a saved change; the reader stays on this page.
+const emit = defineEmits<{ close: []; update: []; accessError: [cause: ApiError] }>()
 type MediaType = Media['type']
 const typeOptions: { value: MediaType; label: string }[] = [
-  { value: 'VIDEO', label: '视频' }, { value: 'PHOTO', label: '图片' },
-  { value: 'AUDIO', label: '音频' }, { value: 'DOCUMENT', label: '文档' }, { value: 'OTHER', label: '其他' },
+  { value: 'VIDEO', label: '视频' }, { value: 'PHOTO', label: '图片' }, { value: 'AUDIO', label: '音频' },
+  { value: 'DOCUMENT', label: '文档' }, { value: 'OTHER', label: '其他' },
 ]
 const detail = ref<PostDetail | null>(null)
 const mediaPage = ref<MediaCatalogPage | null>(null)
 const loadedMedia = ref<Media[]>([])
-const mediaView = ref<'list' | 'cards'>('list')
+const mediaView = ref<'list' | 'cards'>('cards')
 const types = ref<MediaType[]>([])
-const includeMain = ref(true)
-const detailBusy = ref(false)
-const mediaBusy = ref(false)
-const detailError = ref('')
-const mediaError = ref('')
-const mediaOffset = ref(0)
-const mediaPageVersion = ref(0)
+const detailBusy = ref(false), mediaBusy = ref(false)
+const detailError = ref(''), mediaError = ref('')
+const mediaOffset = ref(0), mediaPageVersion = ref(0)
+const remoteBusy = ref(''), readError = ref(''), notice = ref('')
+const needsCheck = ref(false), stopRequested = ref(false)
+const readProgress = ref<CommentReadProgress | null>(null)
+const lastReadPage = ref<CommentPage | null>(null)
+const pendingMutation = ref<'main' | 'comments' | null>(null)
 const mediaLimit = 50
-const canAccess = computed(() => props.authorized && props.available && Boolean(props.postKey))
-const mainCoverage = computed(() => detail.value?.mainCoverage ?? detail.value?.post.mainCoverage)
-const commentCoverage = computed(() => detail.value?.commentCoverage)
-const mainWarnings = computed(() => [...new Set(detail.value?.post.warnings ?? [])])
-const commentWarnings = computed(() => [...new Set(detail.value?.commentWarnings ?? [])])
-const overallWarnings = computed(() => [...new Set(detail.value?.warnings ?? [])])
-const visibleWarnings = computed(() => [...new Set([...overallWarnings.value, ...mainWarnings.value, ...commentWarnings.value])])
-const readingRisk = computed(() => {
-  if (!detail.value) return ''
-  if ([detail.value.coverage, mainCoverage.value, commentCoverage.value].includes('UNAVAILABLE')) return '部分内容暂不可读取，当前只显示已索引的媒体。'
-  if (detail.value.coverage !== 'COMPLETE' || mainCoverage.value !== 'COMPLETE' || commentCoverage.value !== 'COMPLETE') return '读取范围尚未全部确认，当前只显示已索引的媒体。'
-  return visibleWarnings.value.length ? '最近一次读取仍有以下提示。' : ''
-})
-const albumMethod = computed(() => {
-  const method = detail.value?.post.albumEvidence?.method
-  const labels: Record<string, string> = {
-    SINGLE_MESSAGE: '非相册单条读取', ADJACENT_BOUNDARIES: '双侧连续邻接边界核验', PARTIAL_SCAN: '扫描边界尚未核全',
-  }
-  return method ? labels[method] ?? method : '后台未提供读取方法'
-})
+const canAccess = computed(() => props.authorized && props.available && props.active !== false && !!props.accountId && !!props.postKey)
+const canDisplay = computed(() => props.authorized && !!detail.value && detail.value.post.key === props.postKey && detail.value.post.accountId === props.accountId)
+const controlsEnabled = computed(() => canAccess.value && !remoteBusy.value && !detailBusy.value && !mediaBusy.value)
+const readingComments = computed(() => ['comments', 'comments-restart'].includes(remoteBusy.value))
+const sourceLink = computed(() => detail.value?.post.mainMessages.map(message => originalMessageLink(message.link)).find(Boolean))
+const mainPageItems = computed(() => detail.value?.post.mainMedia ?? [])
+const commentPageItems = computed(() => loadedMedia.value.filter(item => item.source === 'COMMENT'))
 const selectedTypeLabel = computed(() => types.value.length ? typeOptions.filter(option => types.value.includes(option.value)).map(option => option.label).join('、') : '全部类型')
-const mainPageItems = computed(() => loadedMedia.value.filter(item => item.source === 'MAIN'))
-const commentPageItems = computed(() => loadedMedia.value.filter(item => item.source !== 'MAIN'))
-let contextGeneration = 0
-let detailGeneration = 0
-let mediaGeneration = 0
+const commentCoverage = computed(() => detail.value?.commentCoverage ?? lastReadPage.value?.commentCoverage)
+const readingSummary = computed(() => commentCoverage.value === 'COMPLETE' && detail.value?.exhausted ? '本轮评论已读完'
+  : commentCoverage.value === 'UNAVAILABLE' ? '评论暂不可读取，已收录内容仍可浏览' : '当前展示已收录评论，可更新或继续读取')
+const warnings = computed(() => [...new Set([
+  ...(detail.value?.post.warnings ?? []), ...(detail.value?.warnings ?? []), ...(detail.value?.commentWarnings ?? []),
+  ...(lastReadPage.value?.warnings ?? []), ...(lastReadPage.value?.scanWarnings ?? []),
+  ...(lastReadPage.value?.observations?.flatMap(observation => observation.warnings ?? []) ?? []),
+])])
+let contextGeneration = 0, detailGeneration = 0, mediaGeneration = 0
 let disposed = false
-
 function current(context: number) { return !disposed && context === contextGeneration && canAccess.value }
 function errorMessage(cause: unknown) {
-  if (cause instanceof ApiError && cause.status === 401) return `本机访问令牌无效或已过期，请从启动入口重新打开界面。${cause.message}`
-  if (cause instanceof ApiError && cause.status === 403) return `当前请求被拒绝，请检查本机访问和 Telegram 授权状态。${cause.message}`
-  return cause instanceof Error ? cause.message : '读取本机索引失败，请重试。'
+  if (cause instanceof ApiError && cause.status === 401) return '本机访问已失效，请从启动入口重新打开页面。'
+  return cause instanceof Error ? cause.message : '读取未完成，请重试。'
 }
 function reportAccessError(cause: unknown) {
   if (cause instanceof ApiError && [401, 403].includes(cause.status)) emit('accessError', cause)
 }
-function rangeLabel(coverage: Coverage | undefined, range: 'main' | 'comment') {
-  if (!coverage) return '后台未提供独立范围状态'
-  if (range === 'main') return { COMPLETE: '主帖范围已核全', PARTIAL: '主帖范围尚未核全', UNAVAILABLE: '主帖范围不可读取' }[coverage]
-  return { COMPLETE: '本轮评论历史已读完', PARTIAL: '评论范围尚未核全', UNAVAILABLE: '评论历史不可读取' }[coverage]
+function validateDetail(result: PostDetail) {
+  if (!result?.post || result.post.key !== props.postKey || result.post.accountId !== props.accountId
+    || !Array.isArray(result.post.mainMessages) || !Array.isArray(result.post.mainMedia)) throw new Error('主帖或账号已变化，请重新打开这条主帖。')
+}
+async function savedDetail(context: number) {
+  const result = await api<PostDetail>(`/library/posts/${encodeURIComponent(props.postKey)}?limit=1&offset=0`)
+  if (!current(context)) return null
+  validateDetail(result)
+  return result
 }
 async function loadDetail() {
-  const request = ++detailGeneration
-  const context = contextGeneration
-  if (!canAccess.value) return
+  if (!canAccess.value) return false
+  const request = ++detailGeneration, context = contextGeneration
   detailBusy.value = true; detailError.value = ''
-  const key = props.postKey
   try {
-    const result = await api<PostDetail>(`/library/posts/${encodeURIComponent(key)}?limit=1&offset=0`)
-    if (!current(context) || request !== detailGeneration) return
+    const result = await savedDetail(context)
+    if (!result || request !== detailGeneration) return false
     detail.value = result
+    return true
   } catch (cause) {
-    if (!current(context) || request !== detailGeneration) return
-    detailError.value = errorMessage(cause)
-    reportAccessError(cause)
-  } finally {
-    if (current(context) && request === detailGeneration) detailBusy.value = false
-  }
+    if (current(context) && request === detailGeneration) { detailError.value = errorMessage(cause); reportAccessError(cause) }
+    return false
+  } finally { if (current(context) && request === detailGeneration) detailBusy.value = false }
 }
 async function loadMedia(offset = 0, append = false) {
-  if (append && (mediaBusy.value || !mediaPage.value?.hasMore || mediaError.value)) return
-  const request = ++mediaGeneration
-  if (!append) mediaPageVersion.value++
-  const context = contextGeneration
-  if (!append) { mediaPage.value = null; loadedMedia.value = []; mediaOffset.value = 0 }
-  mediaError.value = ''
-  if (!canAccess.value) return
-  mediaBusy.value = true
-  const query = new URLSearchParams({ includeMain: String(includeMain.value), limit: String(mediaLimit), offset: String(offset) })
+  if (!canAccess.value || append && (mediaBusy.value || !mediaPage.value?.hasMore || !!mediaError.value || !!remoteBusy.value)) return false
+  const request = ++mediaGeneration, context = contextGeneration
+  mediaBusy.value = true; mediaError.value = ''
+  const query = new URLSearchParams({ includeMain: 'false', limit: String(mediaLimit), offset: String(offset) })
   for (const type of types.value) query.append('types', type)
-  const key = props.postKey
   try {
-    const result = await api<MediaCatalogPage>(`/library/posts/${encodeURIComponent(key)}/media?${query}`)
-    if (!current(context) || request !== mediaGeneration) return
+    const result = await api<MediaCatalogPage>(`/library/posts/${encodeURIComponent(props.postKey)}/media?${query}`)
+    if (!current(context) || request !== mediaGeneration) return false
     if (result?.scope !== 'INDEXED_ONLY' || result.offset !== offset || !Array.isArray(result.items)
-      || result.items.length > mediaLimit || typeof result.hasMore !== 'boolean'
-      || (result.hasMore && !result.items.length)) throw new Error('媒体读取位置无法确认，请重新加载媒体。')
+      || result.items.length > mediaLimit || typeof result.hasMore !== 'boolean' || (result.hasMore && !result.items.length)
+      || result.items.some(item => item.source !== 'COMMENT')) throw new Error('媒体读取位置无法确认，请重新加载评论媒体。')
     if (append && mediaPage.value && (result.total !== mediaPage.value.total || result.mainMediaCount !== mediaPage.value.mainMediaCount
       || result.commentMediaCount !== mediaPage.value.commentMediaCount)) throw new Error('本机媒体索引已变化，请刷新列表后继续。')
-    const merged = new Map(loadedMedia.value.map(item => [item.key, item]))
+    const merged = new Map((append ? loadedMedia.value : []).map(item => [item.key, item]))
     for (const item of result.items) {
-      if (append && merged.has(item.key)) throw new Error('媒体读取位置发生重叠，请重新加载媒体。')
+      if (merged.has(item.key)) throw new Error('媒体读取位置发生重叠，请重新加载评论媒体。')
       merged.set(item.key, item)
     }
     loadedMedia.value = [...merged.values()]
     mediaPage.value = result; mediaOffset.value = result.offset
+    if (!append) mediaPageVersion.value++
+    return true
   } catch (cause) {
-    if (!current(context) || request !== mediaGeneration) return
-    mediaError.value = errorMessage(cause)
-    reportAccessError(cause)
-  } finally {
-    if (current(context) && request === mediaGeneration) mediaBusy.value = false
-  }
+    if (current(context) && request === mediaGeneration) { mediaError.value = errorMessage(cause); reportAccessError(cause) }
+    return false
+  } finally { if (current(context) && request === mediaGeneration) mediaBusy.value = false }
 }
-function loadMore() {
-  if (mediaPage.value?.hasMore) void loadMedia(mediaPage.value.offset + mediaPage.value.items.length, true)
-}
+function loadMore() { if (mediaPage.value?.hasMore) void loadMedia(mediaPage.value.offset + mediaPage.value.items.length, true) }
 function toggleType(type: MediaType) {
-  if (!canAccess.value) return
+  if (!controlsEnabled.value) return
   const selected = types.value.includes(type) ? types.value.filter(value => value !== type) : [...types.value, type]
   types.value = typeOptions.filter(option => selected.includes(option.value)).map(option => option.value)
 }
-function refreshLocal() {
-  if (!canAccess.value || detailBusy.value || mediaBusy.value) return
-  void loadDetail()
-  void loadMedia(0)
+async function refreshSaved(context: number) {
+  const results = await Promise.all([loadDetail(), loadMedia(0)])
+  return current(context) && results.every(Boolean)
 }
-watch([() => props.postKey, () => props.accountId, () => props.authorized, () => props.available], () => {
-  contextGeneration++; detailGeneration++; mediaGeneration++
-  mediaPageVersion.value++
-  detail.value = null; mediaPage.value = null; loadedMedia.value = []; detailError.value = ''; mediaError.value = ''
-  detailBusy.value = false; mediaBusy.value = false; mediaOffset.value = 0
+async function refreshLocal() {
+  if (!controlsEnabled.value) return
+  const context = contextGeneration, checking = needsCheck.value
+  if (await refreshSaved(context)) {
+    needsCheck.value = false
+    if (checking) {
+      readError.value = ''; notice.value = '已核对保存的位置。需要继续时，请点击“继续读取评论”；本次没有重新提交读取。'
+      emit('update')
+    }
+  }
+}
+async function refreshPost() {
+  if (!controlsEnabled.value || needsCheck.value || !detail.value) return
+  const context = contextGeneration
+  remoteBusy.value = 'main'; readError.value = ''; notice.value = ''; pendingMutation.value = 'main'
+  try {
+    const result = await api<PostDetail>(`/library/posts/${encodeURIComponent(props.postKey)}/refresh`, { method: 'POST', body: {}, timeout: 60000 })
+    if (!current(context)) return
+    validateDetail(result)
+    pendingMutation.value = null; detail.value = result
+    emit('update'); notice.value = '主帖已更新。评论可在下方从头更新，或从已保存的位置继续读取。'
+    if (!await loadMedia(0) && current(context)) readError.value = '主帖已更新，评论列表刷新未完成；已展示的内容仍保留。'
+  } catch (cause) {
+    if (!current(context)) return
+    needsCheck.value = true; readError.value = `${errorMessage(cause)} 请先核对已保存内容。`
+    reportAccessError(cause)
+  } finally { if (current(context)) { pendingMutation.value = null; remoteBusy.value = '' } }
+}
+function validPage(page: CommentPage) {
+  return page && page.postKey === props.postKey && Array.isArray(page.media) && Array.isArray(page.messages)
+    && Number.isSafeInteger(page.messageCount) && page.messageCount >= 0 && typeof page.exhausted === 'boolean'
+    && (page.nextCursor === null || typeof page.nextCursor === 'string')
+    && ['COMPLETE', 'PARTIAL', 'UNAVAILABLE'].includes(page.coverage) && Array.isArray(page.warnings)
+}
+async function readComments(restart = false) {
+  if (!controlsEnabled.value || needsCheck.value || !detail.value?.post.canReadComments) return
+  const context = contextGeneration, key = props.postKey, account = props.accountId
+  const isCurrent = () => current(context) && key === props.postKey && account === props.accountId
+  remoteBusy.value = restart ? 'comments-restart' : 'comments'; readError.value = ''; notice.value = ''
+  stopRequested.value = false; readProgress.value = { pages: 0, messages: 0, media: 0 }
+  try {
+    const latest = await savedDetail(context)
+    if (!latest || !isCurrent()) return
+    detail.value = latest
+    if (!latest.post.canReadComments) throw new Error('这条主帖暂不可读取评论，请先更新主帖。')
+    if (!restart && latest.exhausted) { notice.value = '本轮评论已读完。更新新增或编辑内容时，请选择“从头更新评论”。'; return }
+    const result = await runCommentRead({
+      postKey: key, cursor: restart ? null : latest.nextCursor, isCurrent,
+      shouldStop: () => stopRequested.value,
+      betweenPages: () => new Promise(resolve => window.setTimeout(resolve, 250)),
+      async readPage(cursor) {
+        pendingMutation.value = 'comments'
+        try {
+          const page = await api<CommentPage>(`/library/posts/${encodeURIComponent(key)}/comments`, { method: 'POST', body: { cursor }, timeout: 60000 })
+          if (isCurrent() && !validPage(page)) throw new Error('评论读取回执无法确认。')
+          return page
+        } catch (cause) { if (isCurrent()) needsCheck.value = true; throw cause }
+        finally { if (isCurrent()) pendingMutation.value = null }
+      },
+      async onPage(page, progress) {
+        lastReadPage.value = page; readProgress.value = { ...progress }
+        if (detail.value) detail.value = {
+          ...detail.value, nextCursor: page.nextCursor, exhausted: page.exhausted, coverage: page.coverage,
+          commentCoverage: page.commentCoverage ?? 'PARTIAL', commentWarnings: page.commentWarnings, warnings: page.warnings,
+          indexedCommentMessages: undefined, indexedCommentMedia: undefined,
+        }
+        emit('update')
+        if (!await refreshSaved(context) && isCurrent()) {
+          needsCheck.value = true
+          throw new Error('本页已保存，列表刷新未完成。请先核对已保存内容，再继续读取。')
+        }
+      },
+    })
+    if (!isCurrent() || result.reason === 'stale') return
+    if (result.reason === 'exhausted') notice.value = `本轮评论已读到边界，共读取 ${result.pages} 页、${result.messages} 条消息。`
+    else if (result.reason === 'stopped') notice.value = '已停止后续读取，已保存的内容仍可浏览。需要时可继续读取。'
+    else if (result.reason === 'limit') notice.value = '本次读取已暂停，进度已保存，可继续读取。'
+    else { needsCheck.value = true; readError.value = '读取位置没有继续前进，已暂停。请核对已保存内容后继续。' }
+  } catch (cause) {
+    if (!isCurrent()) return
+    readError.value = errorMessage(cause) + (needsCheck.value ? ' 读取已暂停，请先核对已保存内容；不会自动重新提交。' : '')
+    reportAccessError(cause)
+  } finally { if (isCurrent()) { pendingMutation.value = null; remoteBusy.value = '' } }
+}
+function stopReading() { if (readingComments.value) stopRequested.value = true }
+watch([() => props.postKey, () => props.accountId, () => props.authorized, () => props.available, () => props.active !== false], (values, previous) => {
+  const identityChanged = !previous || values[0] !== previous[0] || values[1] !== previous[1]
+  const interrupted = !!remoteBusy.value
+  contextGeneration++; detailGeneration++; mediaGeneration++; stopRequested.value = true
+  if (pendingMutation.value && !identityChanged) {
+    needsCheck.value = true; notice.value = '读取已暂停，当前请求可能仍在保存。恢复后请先核对已保存内容。'
+  } else if (interrupted && !identityChanged) notice.value = '已停止后续读取，已收录内容仍保留。需要时可继续读取。'
+  pendingMutation.value = null; remoteBusy.value = ''; detailBusy.value = false; mediaBusy.value = false
+  if (identityChanged || !props.authorized) {
+    detail.value = null; mediaPage.value = null; loadedMedia.value = []; detailError.value = ''; mediaError.value = ''
+    readError.value = ''; notice.value = ''; needsCheck.value = false
+    readProgress.value = null; lastReadPage.value = null; mediaOffset.value = 0; mediaPageVersion.value++
+  }
   if (canAccess.value) { void loadDetail(); void loadMedia(0) }
 }, { immediate: true })
-watch([() => types.value.join(','), includeMain], () => { void loadMedia(0) })
-onBeforeUnmount(() => { disposed = true; contextGeneration++; detailGeneration++; mediaGeneration++ })
+watch(() => types.value.join(','), () => { if (canAccess.value && !remoteBusy.value) void loadMedia(0) })
+onBeforeUnmount(() => { disposed = true; stopRequested.value = true; contextGeneration++; detailGeneration++; mediaGeneration++ })
 </script>
 
 <template>
   <article class="library-post-detail" aria-label="主帖资源详情">
     <header class="detail-toolbar">
-      <div class="detail-context" :title="detail ? `${detail.post.channelTitle || '未命名频道'} / ${detail.post.title || '未命名主帖'}` : '主帖详情'"><span v-if="detail" class="detail-context-channel">{{ detail.post.channelTitle || '未命名频道' }}</span><span v-if="detail" class="detail-context-divider" aria-hidden="true">/</span><h2>{{ detail?.post.title || (detailBusy ? '正在读取主帖…' : '主帖详情') }}</h2></div>
-      <div class="detail-actions">
-        <button class="icon-btn close-detail" type="button" aria-label="关闭主帖详情，返回资源目录" title="返回资源目录" @click="emit('close')"><AppIcon name="close" /></button>
-      </div>
+      <button class="btn detail-back" type="button" aria-label="关闭主帖详情，返回资源目录" @click="emit('close')">← 返回资源库</button>
+      <div v-if="canDisplay" class="detail-heading"><h1 :title="detail?.post.title">{{ detail?.post.title || '未命名主帖' }}</h1><span class="detail-channel">{{ detail?.post.channelTitle || '未命名频道' }}</span></div>
+      <a v-if="sourceLink && canDisplay" :href="sourceLink" target="_blank" rel="noopener noreferrer" class="detail-source"><AppIcon name="telegram" />在 Telegram 查看原帖 ↗</a>
     </header>
-
-    <div v-if="!authorized" class="notice warning" role="status"><AppIcon name="lock" /><span>请先完成 Telegram 授权，再查看当前账号的本机资源。</span></div>
-    <div v-else-if="!available" class="notice warning" role="status"><AppIcon name="info" /><span>本机服务当前不可用，资源详情读取已暂停。</span></div>
-    <div v-if="detailError" class="notice danger" role="alert"><AppIcon name="info" /><span>{{ detailError }}</span><button class="btn" type="button" :disabled="!canAccess || detailBusy" @click="loadDetail">重试详情</button></div>
-    <div v-if="detailBusy && !detail" class="detail-loading" role="status"><AppIcon name="clock" />正在读取本机主帖详情…</div>
-
-    <template v-if="detail && canAccess">
-      <div v-if="readingRisk" class="visible-reading-risk" role="status"><p><AppIcon name="info" />{{ readingRisk }}</p><ul v-if="visibleWarnings.length"><li v-for="warning in visibleWarnings" :key="warning">{{ warning }}</li></ul></div>
-    </template>
-
-    <section v-if="canAccess" class="settings-section detail-media" aria-labelledby="catalog-media-title">
-      <div class="section-title"><h3 id="catalog-media-title">媒体清单</h3><button class="btn" type="button" :disabled="!canAccess || detailBusy || mediaBusy" title="刷新已保存的评论媒体清单" @click="refreshLocal"><AppIcon name="refresh" />刷新评论区</button></div>
-      <fieldset class="media-filters" aria-label="评论媒体类型"><div class="filter-chips"><button type="button" :class="['filter-chip', { selected: !types.length }]" :aria-pressed="!types.length" @click="types = []">全部</button><button v-for="option in typeOptions" :key="option.value" type="button" :class="['filter-chip', { selected: types.includes(option.value) }]" :aria-pressed="types.includes(option.value)" @click="toggleType(option.value)">{{ option.label }}</button></div></fieldset>
-      <p class="filter-selection" role="status" aria-live="polite">评论筛选：<strong>{{ selectedTypeLabel }}</strong><span v-if="types.length > 1"> · 满足任一所选类型</span><span v-if="!mediaBusy && mediaPage"> · 命中 {{ mediaPage.commentMediaCount }} 个评论 / 回复媒体</span></p>
-      <label class="main-media-toggle"><input v-model="includeMain" type="checkbox" /><span>包含主帖自身全部媒体</span></label>
-      <div v-if="mediaError" class="notice danger" role="alert"><AppIcon name="info" /><span>{{ mediaError }}</span><button class="btn" type="button" :disabled="mediaBusy" @click="loadMedia(0)">重新加载媒体</button></div>
-      <div v-if="mediaBusy && !mediaPage" class="detail-loading" role="status"><AppIcon name="clock" />正在读取本机媒体…</div>
-      <template v-if="mediaPage">
-        <div class="media-counts"><span>当前条件命中 <strong>{{ mediaPage.total }}</strong> 个本机媒体</span><span>主帖 {{ mediaPage.mainMediaCount }} · 评论 / 回复 {{ mediaPage.commentMediaCount }}</span></div>
-        <div class="media-page-heading"><span>已加载 {{ loadedMedia.length }} / {{ mediaPage.total }} 个本机媒体</span><MediaViewSwitch v-model="mediaView" /></div>
-        <details v-if="includeMain && mediaPage.mainMediaCount > 0" :key="mediaPageVersion" class="media-source-group main-source-group">
-          <summary><strong>主帖附件（{{ mediaPage.mainMediaCount }}）</strong><span>已加载 {{ mainPageItems.length }} 个</span></summary>
-          <LibraryMediaTable :items="mainPageItems" empty-text="主帖附件尚未加载，请继续向下滚动。" />
-        </details>
-        <div class="media-source-group comment-source-group">
-          <h4>评论 / 回复媒体 <span>{{ selectedTypeLabel }} · 已加载 {{ commentPageItems.length }} / 筛选命中 {{ mediaPage.commentMediaCount }} 个</span></h4>
-          <MediaCollection :items="commentPageItems" :layout="mediaView" :post-key="postKey" :account-id="accountId" :authorized="authorized" :available="available" :version="mediaPageVersion" :empty-text="mediaPage.commentMediaCount ? '评论媒体尚未加载，请继续向下滚动。' : `评论 / 回复中没有匹配「${selectedTypeLabel}」的已保存媒体。`" />
-        </div>
-        <InfiniteLoad :has-more="mediaPage.hasMore" :busy="mediaBusy" :blocked="!!mediaError || !canAccess" :version="mediaOffset + ':' + loadedMedia.length" :context="postKey + ':' + mediaPageVersion + ':' + mediaView" @load="loadMore" />
-        <p v-if="!mediaPage.hasMore" class="detail-note">已展示全部 {{ loadedMedia.length }} 个本机匹配媒体。</p>
-      </template>
-    </section>
-    <details v-if="detail && canAccess" class="settings-section reading-details">
-      <summary>读取详情与原消息</summary>
-      <div class="reading-details-body">
-        <p class="detail-note">媒体数量仅统计本地已保存内容；需要读取 Telegram 新内容时，使用页面上方“添加 / 更新主帖”。</p>
-        <section aria-labelledby="catalog-detail-title">
-          <div class="section-title"><h3 id="catalog-detail-title">{{ detail.post.title || '未命名主帖' }}</h3></div>
-          <p class="folded-channel-title">{{ detail.post.channelTitle || '未命名频道' }}</p>
-          <div class="detail-post-text"><span>主帖完整文字</span><p>{{ detail.post.text || '此主帖未返回文字。' }}</p></div>
-          <h4 class="folded-subheading">主帖身份与原消息 · {{ detail.post.mainMessages.length }} 条成员</h4>
-          <dl class="detail-identities"><dt>Telegram 账号 ID</dt><dd><code>{{ detail.post.accountId }}</code></dd><dt>频道 ID</dt><dd><code>{{ detail.post.channelId }}</code></dd><dt>规范主帖消息 ID</dt><dd><code>{{ detail.post.mainMessageId }}</code></dd><dt>主帖稳定标识</dt><dd><code>{{ detail.post.key }}</code></dd><dt>相册 ID</dt><dd>{{ detail.post.albumId === '0' ? '非相册，单条主帖' : detail.post.albumId ?? '未报告相册标识' }}</dd></dl>
-          <ul class="message-links"><li v-for="message in detail.post.mainMessages" :key="`${message.chatId}:${message.messageId}`"><span>聊天 <code>{{ message.chatId }}</code> / 消息 <code>{{ message.messageId }}</code></span><a v-if="originalMessageLink(message.link)" :href="originalMessageLink(message.link)" target="_blank" rel="noopener noreferrer">原消息 ↗</a><span v-else class="link-unavailable">无可用链接</span></li></ul>
-        </section>
-        <section class="discussion-details" aria-labelledby="catalog-range-title">
-          <div class="section-title"><h3 id="catalog-range-title">读取范围</h3><span class="small-tag">最近保存：{{ coverageLabel(detail.coverage) }}</span></div>
-          <div class="range-grid">
-            <div :class="['range-card', mainCoverage?.toLowerCase()]"><span>主帖 / 相册</span><strong>{{ rangeLabel(mainCoverage, 'main') }}</strong><p>{{ detail.post.albumId === '0' ? '非相册，单条主帖' : detail.post.albumEvidence?.complete ? `相册已核全 · ${detail.post.mainMessages.length} 条成员` : `当前索引 ${detail.post.mainMessages.length} 条成员；是否核全请查看边界证据。` }}</p><small>读取方法：{{ albumMethod }}</small><details v-if="detail.post.albumEvidence" class="evidence-details"><summary>相册边界证据</summary><dl class="detail-identities"><dt>核全结果</dt><dd>{{ detail.post.albumEvidence.complete ? '后台已确认核全' : '后台尚未确认核全' }}</dd><dt>较新侧边界 ID</dt><dd><code>{{ detail.post.albumEvidence.newerBoundaryId ?? '未报告' }}</code></dd><dt>较旧侧边界 ID</dt><dd><code>{{ detail.post.albumEvidence.olderBoundaryId ?? '未报告' }}</code></dd><dt>后台方法值</dt><dd><code>{{ detail.post.albumEvidence.method }}</code></dd></dl></details><ul v-if="mainWarnings.length" class="range-warnings"><li v-for="warning in mainWarnings" :key="warning">{{ warning }}</li></ul></div>
-            <div :class="['range-card', commentCoverage?.toLowerCase()]"><span>评论历史</span><strong>{{ rangeLabel(commentCoverage, 'comment') }}</strong><p>{{ detail.exhausted ? '后台报告本轮已到读取边界。' : '尚未确认到达本轮读取边界。' }}到达边界与范围完整分别判断。</p><small>本机累计评论消息：{{ detail.indexedCommentMessages ?? '未提供' }} · 媒体：{{ detail.indexedCommentMedia ?? '未提供' }}</small><ul v-if="commentWarnings.length" class="range-warnings"><li v-for="warning in commentWarnings" :key="warning">{{ warning }}</li></ul></div>
+    <div v-if="!authorized" class="notice warning" role="status">请先完成 Telegram 授权，再查看当前账号的资源。</div>
+    <div v-else-if="!available" class="notice warning" role="status">连接暂不可用，后续读取已停止。已收录的内容仍保留。</div>
+    <div v-if="detailError" class="notice danger" role="alert"><span>{{ detailError }}</span><button class="btn" :disabled="!controlsEnabled" @click="loadDetail">重试详情</button></div>
+    <div v-if="detailBusy && !detail" class="detail-loading" role="status">正在打开主帖…</div>
+    <template v-if="canDisplay && detail">
+      <details class="detail-overview"><summary>主帖信息<span v-if="remoteBusy === 'main'" role="status">正在更新主帖…</span></summary><div class="detail-overview-body"><p class="detail-overview-text">{{ detail.post.text || '此主帖没有文字说明。' }}</p><button class="btn" :disabled="!controlsEnabled || needsCheck" @click="refreshPost"><AppIcon :name="remoteBusy === 'main' ? 'clock' : 'refresh'" />{{ remoteBusy === 'main' ? '正在更新主帖…' : '更新主帖' }}</button></div></details>
+      <section class="detail-comments" aria-labelledby="catalog-media-title">
+        <div class="comments-heading">
+          <h2 id="catalog-media-title">评论媒体 <span v-if="detail.indexedCommentMedia !== undefined">{{ detail.indexedCommentMedia }}</span></h2>
+          <div class="comment-reading-actions">
+            <template v-if="readingComments"><span class="reading-indicator" role="status">{{ stopRequested ? '正在保存当前页…' : '正在读取评论…' }}</span><button class="btn" :disabled="stopRequested" @click="stopReading">{{ stopRequested ? '正在停止…' : '停止读取' }}</button></template>
+            <template v-else><button v-if="needsCheck" class="btn primary" :disabled="!controlsEnabled" @click="refreshLocal"><AppIcon name="refresh" />核对已保存内容</button><template v-else><button class="btn primary" :disabled="!controlsEnabled || !detail.post.canReadComments" @click="readComments(true)"><AppIcon name="refresh" />从头更新评论</button><button v-if="!detail.exhausted" class="btn" :disabled="!controlsEnabled || !detail.post.canReadComments" @click="readComments(false)">继续读取评论</button></template></template>
           </div>
-          <p class="detail-note">这些状态只描述最近保存时的读取范围；评论新增、编辑或删除后，需要手动读取核对。媒体为空、本页不足 50 个均不代表远端已读完。</p>
-        </section>
-        <section class="discussion-details" aria-labelledby="catalog-discussion-title">
-          <div class="section-title"><h3 id="catalog-discussion-title">关联讨论与原消息</h3><span class="small-tag">{{ detail.post.canReadComments ? '评论可读' : '评论不可读' }}</span></div>
-          <dl class="detail-identities"><dt>讨论组 ID</dt><dd><code>{{ detail.post.discussionChatId ?? '未返回讨论组' }}</code></dd><dt>讨论根消息 ID</dt><dd><code>{{ detail.post.discussionRootMessageId ?? '未返回讨论根消息' }}</code></dd></dl>
-          <ul v-if="detail.post.discussionRoots.length" class="message-links"><li v-for="message in detail.post.discussionRoots" :key="`${message.chatId}:${message.messageId}`"><span>聊天 <code>{{ message.chatId }}</code> / 消息 <code>{{ message.messageId }}</code></span><a v-if="originalMessageLink(message.link)" :href="originalMessageLink(message.link)" target="_blank" rel="noopener noreferrer">讨论原消息 ↗</a><span v-else class="link-unavailable">无可用链接</span></li></ul>
-          <p class="detail-note">频道主帖与讨论组保留各自的聊天和消息身份，链接跳转 Telegram 原消息。</p>
-        </section>
-      </div>
-    </details>
+          <MediaViewSwitch v-model="mediaView" />
+        </div>
+        <div class="comments-filters"><fieldset aria-label="评论媒体类型"><button :class="['filter-chip', { selected: !types.length }]" :disabled="!controlsEnabled" :aria-pressed="!types.length" @click="types = []">全部</button><button v-for="option in typeOptions" :key="option.value" :class="['filter-chip', { selected: types.includes(option.value) }]" :disabled="!controlsEnabled" :aria-pressed="types.includes(option.value)" @click="toggleType(option.value)">{{ option.label }}</button></fieldset><button class="local-refresh" :disabled="!controlsEnabled" title="仅刷新已收录的评论列表" @click="refreshLocal"><AppIcon name="refresh" />刷新列表</button></div>
+        <p v-if="readingComments && readProgress" class="reading-progress" role="status" aria-live="polite">本次读取 {{ readProgress.pages }} 页 · {{ readProgress.messages }} 条消息 · {{ readProgress.media }} 个媒体</p>
+        <p v-if="!detail.post.canReadComments || commentCoverage === 'UNAVAILABLE'" class="detail-note" role="status">暂时无法读取这条主帖的评论，已收录内容仍可浏览。可展开“主帖信息”更新主帖，或在 Telegram 查看原消息。</p>
+        <p v-if="needsCheck && !notice && !readError" class="detail-note" role="status">读取位置需要核对，请先核对已保存内容后继续。</p>
+        <p v-if="notice && (!detail.exhausted || needsCheck)" class="reading-notice" role="status">{{ notice }}</p>
+        <p v-if="readError" class="notice danger" role="alert">{{ readError }}</p>
+        <div class="media-page-heading"><span>{{ selectedTypeLabel }}<template v-if="mediaPage"> · 已加载 {{ commentPageItems.length }} / {{ mediaPage.commentMediaCount }} 个媒体</template></span><span v-if="mediaBusy" role="status">正在刷新列表…</span></div>
+        <div v-if="mediaError" class="notice danger" role="alert"><span>{{ mediaError }}</span><button class="btn" :disabled="!controlsEnabled" @click="loadMedia(0)">重新加载媒体</button></div>
+        <MediaCollection class="reading-media" :items="commentPageItems" :layout="mediaView" :post-key="postKey" :account-id="accountId" :authorized="authorized" :available="available && active !== false" :version="mediaPageVersion" :empty-text="mediaBusy ? '正在读取已收录的评论媒体…' : types.length ? `暂无匹配「${selectedTypeLabel}」的评论媒体。` : '还没有收录评论媒体，可从头更新评论。'" />
+        <InfiniteLoad v-if="mediaPage" :has-more="mediaPage.hasMore" :busy="mediaBusy" :blocked="!!mediaError || !canAccess || !!remoteBusy" :version="mediaOffset + ':' + loadedMedia.length" :context="postKey + ':' + mediaPageVersion + ':' + mediaView" @load="loadMore" />
+        <p v-if="mediaPage && !mediaPage.hasMore && loadedMedia.length" class="media-end">已展示全部已收录的匹配评论媒体</p>
+      </section>
+      <details v-if="mainPageItems.length" class="main-source-group"><summary>主帖附件 <span>{{ mainPageItems.length }} 个</span></summary><MediaCollection :items="mainPageItems" layout="list" :post-key="postKey" :account-id="accountId" :authorized="authorized" :available="available && active !== false" :version="mediaPageVersion" empty-text="此主帖没有附件。" /></details>
+      <details class="reading-details"><summary>读取说明与原消息</summary><div class="reading-details-body"><p>{{ readingSummary }}<span v-if="detail.indexedCommentMessages !== undefined"> · {{ detail.indexedCommentMessages }} 条评论消息</span></p><p v-if="readProgress && !readingComments">本次读取 {{ readProgress.pages }} 页 · {{ readProgress.messages }} 条消息 · {{ readProgress.media }} 个媒体</p><p v-if="notice && detail.exhausted && !needsCheck">{{ notice }}</p><p>这里展示已收录内容。更新评论会逐页保存，新内容及修改可通过“从头更新评论”核对；中途停止后可继续读取。</p><p>主帖：{{ coverageLabel(detail.mainCoverage ?? detail.post.mainCoverage ?? 'PARTIAL') }} · 评论：{{ coverageLabel(commentCoverage ?? 'PARTIAL') }}。{{ detail.exhausted ? '本轮已到评论读取边界。' : '评论历史尚未读到边界。' }}</p><ul v-if="warnings.length" class="reading-warnings"><li v-for="warning in warnings" :key="warning">{{ warning }}</li></ul><div class="message-links"><a v-for="message in [...detail.post.mainMessages, ...(detail.post.discussionRoots ?? [])].filter(message => originalMessageLink(message.link))" :key="`${message.chatId}:${message.messageId}`" :href="originalMessageLink(message.link)" target="_blank" rel="noopener noreferrer">{{ message.chatId === detail.post.channelId ? '主帖原消息' : '讨论原消息' }} ↗</a></div><details class="identity-details"><summary>消息标识</summary><dl><dt>频道</dt><dd>{{ detail.post.channelId }}</dd><dt>主帖</dt><dd>{{ detail.post.mainMessageId }}</dd><dt>相册</dt><dd>{{ detail.post.albumId === '0' ? '单条消息' : detail.post.albumId ?? '未提供' }}</dd></dl></details></div></details>
+    </template>
   </article>
 </template>
 
 <style scoped>
-.filter-chip{gap:6px;cursor:pointer}.filter-selection{font-size:10px;line-height:1.8;color:#728da2;margin:10px 0 0}.filter-selection strong{color:#436b8b;font-weight:600}.media-source-group{margin-top:17px}.media-source-group>h4{display:flex;align-items:baseline;flex-wrap:wrap;gap:5px 12px;font-size:11px;color:#4e6d85;font-weight:600;margin:0 0 10px}.media-source-group>h4>span{font-size:9px;color:#8ca1b1;font-weight:400}
-.main-source-group>summary{cursor:pointer;list-style-position:inside;padding:8px 11px;border:1px solid #e7eef4;border-radius:5px;background:#f8fafc;color:#839bad;font-size:10px;line-height:1.8}.main-source-group>summary>strong{font-weight:550;color:#5e7d94;margin-right:12px}.main-source-group>summary>span{font-size:9px;color:#96aaba}.main-source-group>summary:focus-visible{outline:2px solid #2d85cc;outline-offset:3px}.main-source-group[open]>summary{margin-bottom:10px}
-.library-post-detail{min-width:0}.detail-toolbar{display:flex;align-items:center;justify-content:space-between;gap:16px;margin:0 0 17px}.detail-eyebrow{font-size:10px;letter-spacing:1px;color:#5f8099;font-weight:600}.detail-toolbar p{font-size:10px;color:#98a9b7;margin-top:4px}.detail-actions{display:flex;align-items:center;gap:9px;flex-shrink:0}.close-detail{width:32px;height:32px;border:1px solid #e1e8ee;background:#fff;color:#8297a8}.detail-heading,.section-title{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin-bottom:17px}.detail-channel{font-size:10px;color:#8da4b6;margin:0 0 5px}.detail-heading h2{font-size:17px;line-height:1.6;font-weight:600;color:#3a566c;margin:0;overflow-wrap:anywhere}.section-title h3{font-size:12px;font-weight:600;color:#4e6d85;margin:0}.section-title p{font-size:10px;color:#97aab9;margin-top:5px}.section-title>.btn{min-height:31px;font-size:10px}.detail-post-text{background:#f8fafc;border:1px solid #e8eef4;border-radius:6px;padding:13px 15px;margin:0 0 15px}.detail-post-text>span{font-size:9px;color:#99adbc}.detail-post-text>p{font-size:11px;line-height:1.9;color:#728a9d;white-space:pre-wrap;overflow-wrap:anywhere;max-height:300px;overflow-y:auto;margin-top:6px}.detail-identities{display:grid;grid-template-columns:125px minmax(0,1fr);gap:10px 12px;font-size:10px;margin:15px 0}.detail-identities dt{color:#97aab9}.detail-identities dd{margin:0;color:#6e889e;overflow-wrap:anywhere}.detail-identities code{font-size:10px}.identity-details{font-size:10px;color:#829aaf}.identity-details>summary,.evidence-details>summary{cursor:pointer;line-height:1.9}.message-links{list-style:none;margin:12px 0 0;padding:0;border-top:1px solid #edf2f6}.message-links li{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;font-size:10px;color:#8b9fae;padding:10px 0;border-bottom:1px solid #edf2f6}.message-links li>span{overflow-wrap:anywhere}.message-links a{font-size:10px;white-space:nowrap;text-decoration:none;color:#6294bb}.link-unavailable{color:#acb9c4;font-size:9px}.coverage-badge{display:inline-flex;align-items:center;padding:3px 7px;border:1px solid #eee1c7;border-radius:4px;font-size:9px;color:#a18451;background:#fffaf0;white-space:nowrap}.coverage-badge.complete{background:#f0f8f3;border-color:#dcece2;color:#649076}.coverage-badge.unavailable{background:#fcf1ef;border-color:#eeddd7;color:#ac7b70}.range-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.range-card{min-width:0;background:#f8fafc;border:1px solid #e6edf3;border-radius:7px;padding:14px}.range-card>span{display:block;font-size:9px;letter-spacing:.4px;color:#91a6b7}.range-card>strong{display:block;font-size:12px;font-weight:550;color:#7890a3;margin:7px 0 8px}.range-card>p{font-size:10px;color:#91a5b5;line-height:1.9;overflow-wrap:anywhere}.range-card>small{display:block;font-size:9px;color:#91a8b9;line-height:1.9;margin-top:9px}.range-card.complete{background:#f4faf6;border-color:#e0ede4}.range-card.complete>strong{color:#659176}.range-card.partial{background:#fffcf6;border-color:#eee5d4}.range-card.partial>strong{color:#ac905e}.range-card.unavailable{background:#fcf5f3;border-color:#f0e2dd}.range-card.unavailable>strong{color:#b08377}.evidence-details{font-size:9px;color:#8c9eab;margin-top:10px}.evidence-details .detail-identities{grid-template-columns:95px minmax(0,1fr);gap:8px;font-size:9px;margin-bottom:0}.evidence-details code{font-size:9px}.range-warnings{padding-left:16px;margin:10px 0 0;font-size:9px;line-height:1.9;color:#a58b5f;overflow-wrap:anywhere}.detail-warnings{background:#fff9ed;border:1px solid #eee1c8;border-radius:6px;padding:12px 14px;color:#a28a5e;margin-top:15px;font-size:10px}.detail-warnings>strong{display:flex;align-items:center;gap:6px;font-size:10px;font-weight:550}.detail-warnings .icon{width:13px;height:13px}.detail-warnings ul{padding-left:18px;margin:9px 0 0;line-height:1.9;overflow-wrap:anywhere}.detail-note{font-size:9px;line-height:1.9;color:#97aab9;margin-top:12px}.detail-loading{display:flex;align-items:center;justify-content:center;gap:8px;font-size:11px;color:#87a0b4;border:1px dashed #dce6ef;background:#fbfdff;border-radius:7px;padding:35px 18px;margin:0 0 17px}.detail-loading .icon{width:16px;height:16px}.filter-chips{display:flex;flex-wrap:wrap;gap:7px}.filter-chip{display:inline-flex;align-items:center;justify-content:center;border:1px solid #e3eaf0;border-radius:5px;padding:5px 11px;background:#fff;color:#91a4b4;font-size:10px;min-height:30px}.filter-chip:hover{border-color:#bfd1df;background:#f6fafd}.filter-chip.selected{background:#233e55;border-color:#233e55;color:#fff}.main-media-toggle{display:flex;align-items:center;gap:8px;margin:12px 0 16px;font-size:10px;color:#728da2;cursor:pointer}.main-media-toggle input{accent-color:#277fce;margin:0;width:14px;height:14px}.media-counts{display:flex;align-items:center;justify-content:space-between;gap:12px;background:#f6f9fc;border:1px solid #e7eef4;border-radius:6px;padding:11px 13px;margin:0 0 16px;font-size:10px;color:#8ca1b1}.media-counts strong{font-size:13px;font-weight:550;color:#6086a2;margin:0 3px}.media-counts>span:last-child{font-size:9px;color:#98aaba}.media-page-heading{display:flex;align-items:center;justify-content:space-between;gap:12px;color:#88a0b2;font-size:10px;margin-bottom:11px}.media-page-heading>span:last-child{font-size:9px;color:#a1b1bd}.detail-pagination{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-top:16px}.detail-pagination>.btn{font-size:10px;min-height:31px;padding:5px 10px}.detail-pagination>span{font-size:9px;color:#9aafbe;text-align:center}.notice>.btn{margin-left:auto;flex-shrink:0;font-size:10px;min-height:28px}.notice>span{overflow-wrap:anywhere}
-:deep(.probe-inline-empty){font-size:10px;color:#9badbb;text-align:center;line-height:1.9;padding:28px 14px;border:1px dashed #e2eaf1;border-radius:6px;background:#fcfdfe;margin:0}:deep(.probe-table-scroll){width:100%;overflow-x:auto;border:1px solid #e7eef4;border-radius:6px}:deep(.probe-media-table){border-collapse:collapse;width:100%;min-width:510px;text-align:left;table-layout:fixed;font-size:10px}:deep(.probe-media-table th){font-size:9px;font-weight:500;color:#95a8b7;background:#f7fafc;border-bottom:1px solid #e7eef4;padding:10px 12px;white-space:nowrap}:deep(.probe-media-table th:first-child){width:37%}:deep(.probe-media-table th:nth-child(2)){width:17%}:deep(.probe-media-table th:nth-child(3)){width:30%}:deep(.probe-media-table th:nth-child(4)){width:16%}:deep(.probe-media-table td){padding:12px;border-bottom:1px solid #edf2f6;vertical-align:top;overflow-wrap:anywhere;color:#839aab}:deep(.probe-media-table tr:last-child td){border-bottom:0}:deep(.probe-file-name){font-size:10px;color:#668198;font-weight:550}:deep(.probe-media-caption){white-space:pre-wrap;line-height:1.8;max-height:110px;overflow-y:auto;margin-top:5px;font-size:9px;color:#99abb8}:deep(.probe-source){display:block;font-size:8px;color:#a5b4bf;margin-top:5px}:deep(.probe-media-type){display:block;font-size:10px;color:#7c96aa;margin-bottom:4px}:deep(.probe-media-table td>small){font-size:9px;white-space:nowrap;color:#9aacb9}:deep(.probe-message-ids>span){display:block;font-size:8px;line-height:1.9;color:#9aafbe}:deep(.probe-message-ids code){font-size:9px;color:#819bb0}:deep(.probe-message-link){font-size:9px;color:#699cc2;white-space:nowrap;text-decoration:none}:deep(.probe-link-unavailable){font-size:8px;color:#a6b5c0}
-@media(max-width:1050px){.range-grid{grid-template-columns:minmax(0,1fr)}.detail-toolbar{align-items:flex-start;flex-direction:column}.detail-actions{align-self:flex-end}.detail-heading{flex-wrap:wrap}.media-counts{align-items:flex-start;flex-direction:column;gap:5px}}
-@media(max-width:680px){.detail-heading h2{font-size:15px}.detail-toolbar p{font-size:9px}.detail-actions>.btn{font-size:10px}.detail-identities{grid-template-columns:105px minmax(0,1fr);gap:9px;font-size:9px}.detail-identities code{font-size:9px}.message-links li{flex-direction:column;gap:5px;font-size:9px}.section-title{flex-wrap:wrap}.media-page-heading{flex-direction:column;align-items:flex-start;gap:4px}.detail-pagination{flex-wrap:wrap;gap:8px}.detail-pagination>span{order:3;flex-basis:100%;font-size:8px}.filter-chip{padding:5px 9px}.notice{flex-wrap:wrap}.notice>.btn{margin-left:25px}.detail-toolbar{gap:11px}}
-.visible-reading-risk{border-left:2px solid #d9b477;background:#fffaf1;color:#a68a5a;padding:11px 14px;margin:0 0 17px;border-radius:0 5px 5px 0;font-size:10px;line-height:1.9}.visible-reading-risk>p{display:flex;align-items:flex-start;gap:7px}.visible-reading-risk .icon{width:14px;height:14px;margin-top:2px}.visible-reading-risk ul{margin:7px 0 0;padding-left:21px;overflow-wrap:anywhere}.reading-details{padding:16px 22px;background:#fbfcfd}.reading-details>summary{cursor:pointer;font-size:11px;color:#829aab;font-weight:500;line-height:1.9}.reading-details-body{padding-top:22px}.discussion-details{border-top:1px solid #e7eef4;margin-top:22px;padding-top:20px}
-@media(max-width:680px){.reading-details{padding:14px 17px}.visible-reading-risk{font-size:9px;padding:10px 12px}}
-.detail-context{display:flex;align-items:center;gap:8px;flex:1;min-width:0;line-height:1.8}.detail-context-channel{font-size:10px;color:#8ea4b5;max-width:140px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex-shrink:0}.detail-context-divider{font-size:10px;color:#c0ccd5}.detail-context>h2{font-size:12px;font-weight:550;color:#5c7b93;line-height:1.8;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin:0;min-width:0}.reading-details-body .detail-post-text>p{max-height:none;overflow:visible}.folded-channel-title{font-size:10px;color:#9aafbd;margin:-8px 0 13px}.folded-subheading{font-size:10px;color:#839daf;font-weight:500;margin:19px 0 10px}.reading-details-body .section-title h3{overflow-wrap:anywhere}
-@media(min-width:681px) and (max-width:1050px){.detail-toolbar{flex-direction:row;align-items:center}.detail-actions{align-self:auto}.detail-context-channel{max-width:105px}.detail-context>h2{font-size:11px}.detail-actions>.btn{font-size:9px}}
-@media(max-width:680px){.detail-context{width:100%;flex-wrap:wrap;gap:1px 7px}.detail-context-channel{max-width:100%;font-size:9px}.detail-context-divider{display:none}.detail-context>h2{flex-basis:100%;white-space:normal;overflow-wrap:anywhere;font-size:11px}}
+.library-post-detail{width:100%;min-width:0;color:#38556c}
+.detail-toolbar{display:flex;align-items:center;gap:16px;margin-bottom:8px;padding-bottom:12px;border-bottom:1px solid #e2eaf1;min-width:0}
+.detail-back{flex-shrink:0;background:#fff;font-size:12px}
+.detail-heading{display:flex;align-items:baseline;gap:12px;min-width:0;flex:1}
+.detail-heading h1{min-width:0;margin:0;font-size:20px;font-weight:650;line-height:1.5;color:#24455f;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.detail-channel{flex-shrink:0;max-width:30%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px;color:#7890a3}
+.detail-source{display:inline-flex;align-items:center;gap:7px;margin-left:auto;flex-shrink:0;color:#277dbd;text-decoration:none;font-size:12px;white-space:nowrap}
+.detail-source .icon{width:15px;height:15px}
+.detail-overview{margin:0 0 14px;font-size:12px;color:#7890a3}
+.detail-overview>summary{cursor:pointer;line-height:1.8;padding:3px 0}
+.detail-overview>summary>span{margin-left:14px;color:#527b98}
+.detail-overview-body{padding:10px 0 2px}
+.detail-overview-text{margin:0 0 10px;white-space:pre-wrap;overflow-wrap:anywhere;font-size:13px;line-height:1.8;color:#60798d;max-width:1000px}
+.detail-overview-body>.btn{font-size:12px;min-height:33px;background:#fff}
+.detail-comments{min-width:0}
+.comments-heading{display:flex;align-items:center;gap:10px 16px;flex-wrap:wrap;margin-bottom:10px}
+.comments-heading h2{margin:0;font-size:18px;color:#2c4e68;line-height:1.6;white-space:nowrap}
+.comments-heading h2>span{font-size:13px;color:#8ca0af;font-weight:500;margin-left:7px}
+.comment-reading-actions{display:flex;align-items:center;justify-content:flex-end;gap:8px;flex-wrap:wrap;margin-left:auto}
+.comment-reading-actions>.btn{min-height:33px;font-size:12px}
+.reading-indicator{font-size:12px;color:#567b95}
+.reading-progress,.reading-notice,.detail-note{font-size:12px;line-height:1.8;color:#6c8699;margin:8px 0}
+.reading-notice{color:#5f8b77}
+.comments-filters{display:flex;align-items:center;justify-content:space-between;gap:14px;margin:0 0 9px}
+.comments-filters fieldset{display:flex;flex-wrap:wrap;gap:7px;border:0;padding:0;margin:0}
+.filter-chip{min-height:33px;font-size:12px;border:1px solid #dfe8f0;border-radius:6px;padding:6px 13px;background:#fff;color:#6c8497;cursor:pointer}
+.filter-chip.selected{background:#eaf3fd;border-color:#bad4ec;color:#2878b8}
+.filter-chip:disabled{cursor:default;opacity:.6}
+.local-refresh{display:inline-flex;align-items:center;gap:6px;border:0;background:none;color:#7e97aa;font-size:11px;cursor:pointer;white-space:nowrap;padding:7px 0 7px 9px}
+.local-refresh .icon{width:13px;height:13px}
+.local-refresh:disabled{opacity:.5;cursor:default}
+.media-page-heading{display:flex;justify-content:space-between;gap:12px;font-size:11px;color:#8ba1b2;line-height:1.8;margin-bottom:10px}
+.media-end{font-size:11px;text-align:center;color:#9aabb8;padding:15px 0 10px}
+.main-source-group{margin:20px 0 0;border:1px solid #e1eaf1;border-radius:9px;background:#fff;padding:0 16px}
+.main-source-group>summary{font-size:13px;color:#5e7c94;cursor:pointer;padding:12px 0}
+.main-source-group>summary>span{font-size:12px;color:#94a6b4;margin-left:8px}
+.main-source-group[open]{padding-bottom:16px}
+.reading-details{border-top:1px solid #e3eaf0;margin-top:18px;padding:13px 2px;color:#839aaa}
+.reading-details>summary{font-size:12px;cursor:pointer}
+.reading-details-body{padding-top:13px;font-size:12px;color:#8096a7;line-height:1.9}
+.reading-details-body p{margin:0 0 9px}
+.reading-warnings{padding-left:19px;color:#9b896c;overflow-wrap:anywhere}
+.message-links{display:flex;flex-wrap:wrap;gap:9px 20px;margin:13px 0}
+.message-links a{color:#4285b5;text-decoration:none;font-size:12px}
+.identity-details{font-size:11px}
+.identity-details>summary{cursor:pointer}
+.identity-details dl{display:grid;grid-template-columns:70px minmax(0,1fr);gap:6px 12px}
+.identity-details dd{margin:0;overflow-wrap:anywhere}
+.notice{font-size:12px;line-height:1.8;margin:10px 0}
+.notice>span{overflow-wrap:anywhere}
+.notice>.btn{margin-left:auto;font-size:12px}
+.detail-loading{font-size:13px;color:#7f98ab;padding:55px 20px;text-align:center}
+:deep(.reading-media.cards){grid-template-columns:repeat(auto-fill,minmax(235px,1fr));gap:20px}:deep(.reading-media.cards .media-collection-item){border-radius:10px;contain-intrinsic-size:auto 345px}:deep(.reading-media.cards .collection-image){height:205px}:deep(.reading-media.cards .collection-description){padding:13px 15px 9px;min-height:85px}:deep(.reading-media.cards .collection-description p){-webkit-line-clamp:2}:deep(.reading-media.cards .collection-meta){padding:0 15px 14px}:deep(.collection-description strong){font-size:13px;color:#3e627d}:deep(.collection-description p){font-size:12px;color:#7891a4;line-height:1.85}:deep(.collection-description small),:deep(.collection-meta),:deep(.collection-meta small){font-size:11px}:deep(.reading-media.list .media-collection-item){grid-template-columns:128px minmax(0,1fr) 80px 120px;gap:18px;padding:17px}:deep(.reading-media.list .collection-image){width:128px;height:96px}:deep(.reading-media.list .collection-description p){-webkit-line-clamp:3}:deep(.collection-empty){font-size:13px;line-height:1.9;padding:60px 18px;background:#f5f9fc;border:1px dashed #dce7ef}:deep(.infinite-load){font-size:12px}:deep(a:focus-visible),button:focus-visible,summary:focus-visible{outline:2px solid #3889c8;outline-offset:3px}
+@media(min-width:1600px){:deep(.reading-media.cards){grid-template-columns:repeat(auto-fill,minmax(260px,1fr))}:deep(.reading-media.cards .collection-image){height:225px}}
+@media(max-width:950px){.detail-toolbar{flex-wrap:wrap;gap:8px 12px}.detail-heading{flex-wrap:wrap;gap:0 10px}.detail-heading h1{max-width:100%}.detail-channel{max-width:100%}:deep(.reading-media.cards){grid-template-columns:repeat(auto-fill,minmax(205px,1fr));gap:15px}:deep(.reading-media.cards .collection-image){height:185px}}
+@media(max-width:600px){.detail-toolbar{padding-bottom:10px}.detail-heading{flex-basis:calc(100% - 145px)}.detail-source{font-size:11px}.detail-channel{font-size:11px}.comments-heading{gap:7px 10px}.comments-heading h2{margin-right:auto}.comment-reading-actions{order:1;flex-basis:100%;justify-content:flex-start;margin-left:0}.comments-filters{align-items:flex-start;gap:8px}.filter-chip{padding:5px 10px;font-size:11px}.local-refresh{font-size:10px}.media-page-heading{flex-wrap:wrap}:deep(.reading-media.cards){grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}:deep(.reading-media.cards .collection-image){height:150px}:deep(.reading-media.cards .collection-description){padding:10px 11px 7px;min-height:80px}:deep(.reading-media.cards .collection-meta){padding:0 11px 11px}:deep(.reading-media.list .media-collection-item){grid-template-columns:85px minmax(0,1fr);gap:7px 12px;padding:13px}:deep(.reading-media.list .collection-image){width:85px;height:75px;grid-row:span 3}:deep(.reading-media.list .collection-meta){display:flex;gap:9px}}
+@media(max-width:380px){:deep(.reading-media.cards){grid-template-columns:minmax(0,1fr)}:deep(.reading-media.cards .collection-image){height:200px}}
 </style>

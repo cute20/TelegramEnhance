@@ -17,6 +17,8 @@ export interface Post {
   mainMessageId: string
   title: string
   text: string
+  /** Telegram publication time; absent on older indexed records. Never inferred from index updates. */
+  publishedAt?: number | null
   albumId: string | null
   albumEvidence?: {
     complete: boolean
@@ -72,7 +74,11 @@ export interface CatalogItem {
   indexedCommentMessages: number
   indexedCommentMedia: number
   updatedAt: number
+  publishedAt?: number | null
+  mediaTypeCounts?: Record<Media['type'], number>
 }
+export type CatalogSort = 'published-desc' | 'title-asc' | 'updated-desc'
+export interface LibraryTagFacet { tag: string; count: number }
 export interface CatalogPage {
   items: CatalogItem[]
   limit: number
@@ -82,6 +88,7 @@ export interface CatalogPage {
   indexedChannels: number
   hasMore: boolean
   scope: 'INDEXED_ONLY'
+  facets?: { tags: LibraryTagFacet[] }
 }
 export interface MediaCatalogPage {
   items: Media[]
@@ -120,4 +127,14 @@ export function formatMediaBytes(bytes: number) {
   let unit = 0
   while (value >= 1024 && unit < units.length - 1) { value /= 1024; unit++ }
   return `${value.toFixed(value < 10 ? 2 : 1)} ${units[unit]}`
+}
+
+/** Match the catalog's space/comma separated tag input while retaining the source spelling. */
+export function libraryTagTerms(value: string) {
+  const terms = new Map<string, string>()
+  for (const raw of value.split(/[\s,，]+/u)) {
+    const tag = raw.trim().replace(/^#+/u, '')
+    if (tag) terms.set(tag.normalize('NFKC').toLocaleLowerCase('en-US'), tag)
+  }
+  return [...terms.values()]
 }

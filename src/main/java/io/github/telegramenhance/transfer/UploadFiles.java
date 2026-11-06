@@ -17,10 +17,12 @@ import org.springframework.stereotype.Component;
 /** Own immutable sending copies, and journalled, no-overwrite archival after formal receipts. */
 @Component
 public final class UploadFiles {
-    private final AppPaths app;private final DownloadPaths paths;private final UploadRepository repository;private final VideoUploadPreparer videos;
+    @FunctionalInterface interface CopyWriter { int write(FileChannel output,ByteBuffer bytes)throws IOException; }
+    private final AppPaths app;private final DownloadPaths paths;private final UploadRepository repository;private final VideoUploadPreparer videos;private final CopyWriter copyWriter;
     public UploadFiles(AppPaths app,DownloadPaths paths,UploadRepository repository){this(app,paths,repository,new VideoUploadPreparer());}
     @org.springframework.beans.factory.annotation.Autowired
-    public UploadFiles(AppPaths app,DownloadPaths paths,UploadRepository repository,VideoUploadPreparer videos){this.app=app;this.paths=paths;this.repository=repository;this.videos=Objects.requireNonNull(videos);}
+    public UploadFiles(AppPaths app,DownloadPaths paths,UploadRepository repository,VideoUploadPreparer videos){this(app,paths,repository,videos,FileChannel::write);}
+    UploadFiles(AppPaths app,DownloadPaths paths,UploadRepository repository,VideoUploadPreparer videos,CopyWriter copyWriter){this.app=app;this.paths=paths;this.repository=repository;this.videos=Objects.requireNonNull(videos);this.copyWriter=Objects.requireNonNull(copyWriter);}
     public Staged stage(Task task,Item item,Runnable check)throws IOException{
         Path source=source(task,item);verifyOriginal(source,item.file(),check);
         Path dir=directory(app.root().resolve("outgoing"),Path.of(task.id(),item.id()));
@@ -33,7 +35,7 @@ public final class UploadFiles {
                 if(!item.file().mediaType().equals("VIDEO")||item.staged().video()!=null){cleanupStageOwners(item,item.staged());return item.staged();}
                 return registerStage(task,item,withVideo(item.staged(),item,check),check);
             }
-            if(!Files.isRegularFile(owner,LinkOption.NOFOLLOW_LINKS)||Files.isSymbolicLink(owner)||Files.size(owner)>256||!Files.readString(owner).equals(item.id()+"\n"+DownloadFileStore.fileKey(output))||!matches(output,item.file().size(),item.file().sha256(),check))throw new IOException("Unknown staged file");
+            if(!owned(owner,item.id(),output)||!matches(output,item.file().size(),item.file().sha256(),check))throw new IOException("Unknown staged file");
             int[] dimensions=dimensions(output,item);var recovered=new Staged(output.toString(),item.file().size(),item.file().sha256(),DownloadFileStore.fileKey(output),dimensions[0],dimensions[1]);
             return registerStage(task,item,withVideo(recovered,item,check),check);
         }
@@ -70,19 +72,56 @@ public final class UploadFiles {
         checkQuota(bytes.length,check);
         if(!Files.exists(part,LinkOption.NOFOLLOW_LINKS)){
             if(Files.exists(owner,LinkOption.NOFOLLOW_LINKS))throw new IOException("Uncertain thumbnail ownership");
-            Files.createFile(part);Files.writeString(owner,token+"\n"+DownloadFileStore.fileKey(part),StandardOpenOption.CREATE_NEW);
+            Files.createFile(part);Files.writeString(owner,checkpoint(token,part,0,emptyHash()),StandardOpenOption.CREATE_NEW);
         }
         if(!owned(owner,token,part))throw new IOException("Unknown thumbnail temporary file");
         try(var channel=FileChannel.open(part,StandardOpenOption.WRITE,LinkOption.NOFOLLOW_LINKS,ExtendedOpenOption.NOSHARE_WRITE,ExtendedOpenOption.NOSHARE_DELETE)){
             if(!owned(owner,token,part))throw new IOException("Thumbnail replaced before opening");
-            check.run();channel.truncate(0);channel.position(0);ByteBuffer data=ByteBuffer.wrap(bytes);while(data.hasRemaining()){check.run();channel.write(data);}channel.force(true);
+            check.run();channel.truncate(0);channel.position(0);ByteBuffer data=ByteBuffer.wrap(bytes);
+            try{while(data.hasRemaining()){check.run();channel.write(data);}channel.force(true);}
+            finally{saveCheckpoint(channel,owner,token,part,data.position(),DownloadPaths.digest().digest(Arrays.copyOf(bytes,data.position())));}
         }
         if(!matches(part,bytes.length,hash,check))throw new IOException("Thumbnail verification failed");
         check.run();Files.move(part,output);
         if(!owned(owner,token,output)||!matches(output,bytes.length,hash,check))throw new IOException("Thumbnail publication changed");
         return new VideoThumbnail(output.toString(),bytes.length,hash,DownloadFileStore.fileKey(output),width,height);
     }
-    private static boolean owned(Path owner,String token,Path content)throws IOException{return !Files.isSymbolicLink(owner)&&Files.isRegularFile(owner,LinkOption.NOFOLLOW_LINKS)&&Files.size(owner)<=256&&Files.readString(owner).equals(token+"\n"+DownloadFileStore.fileKey(content));}
+    private record Owner(String text,String identity,Long size,String hash) { }
+    private static Owner owner(Path path,String token)throws IOException{
+        if(Files.isSymbolicLink(path)||!Files.isRegularFile(path,LinkOption.NOFOLLOW_LINKS)||Files.size(path)>256)return null;
+        String text=Files.readString(path);String[] fields=text.split("\n",-1);
+        if((fields.length!=2&&fields.length!=4)||!fields[0].equals(token)||fields[1].isBlank())return null;
+        if(fields.length==2)return new Owner(text,fields[1],null,null);
+        try{long size=Long.parseLong(fields[2]);return size>=0&&fields[3].matches("[0-9a-f]{64}")?new Owner(text,fields[1],size,fields[3]):null;}
+        catch(NumberFormatException invalid){return null;}
+    }
+    private static boolean owned(Path owner,String token,Path content)throws IOException{var proof=owner(owner,token);return proof!=null&&proof.identity().equals(DownloadFileStore.fileKey(content));}
+    private static String emptyHash(){return HexFormat.of().formatHex(DownloadPaths.digest().digest());}
+    private static String checkpoint(String token,Path file,long size,String hash)throws IOException{return token+"\n"+DownloadFileStore.fileKey(file)+"\n"+size+"\n"+hash;}
+    /** Record even an interrupted copy's exact owned prefix while its write lease is still held. */
+    private static void saveCheckpoint(FileChannel lease,Path owner,String token,Path file,long written,byte[] hash){
+        boolean interrupted=Thread.interrupted();
+        try{
+            if(!lease.isOpen()||!owned(owner,token,file))return;
+            long actual=Files.size(file);
+            if(actual!=written){
+                // A filesystem can write a partial block and then throw (for example disk full).
+                // The caller still holds the exclusive write/delete lease: hash precisely that
+                // owned prefix instead of leaving a stale zero/previous-block checkpoint.
+                var digest=DownloadPaths.digest();var buffer=ByteBuffer.allocate(1024*1024);
+                try(var input=FileChannel.open(file,StandardOpenOption.READ,LinkOption.NOFOLLOW_LINKS)){
+                    for(int read;(read=input.read(buffer))!=-1;){if(read>0)digest.update(buffer.array(),0,read);buffer.clear();}
+                }
+                if(!lease.isOpen()||!owned(owner,token,file)||Files.size(file)!=actual)return;
+                written=actual;hash=digest.digest();
+            }
+            byte[] bytes=checkpoint(token,file,written,HexFormat.of().formatHex(hash)).getBytes(java.nio.charset.StandardCharsets.UTF_8);
+            try(var channel=FileChannel.open(owner,StandardOpenOption.WRITE,StandardOpenOption.TRUNCATE_EXISTING,LinkOption.NOFOLLOW_LINKS)){
+                var buffer=ByteBuffer.wrap(bytes);while(buffer.hasRemaining())channel.write(buffer);channel.force(true);
+            }
+        }catch(IOException ignored){/* An unjournalled or changed temporary file is preserved during collection. */}
+        finally{if(interrupted)Thread.currentThread().interrupt();}
+    }
     private static void cleanupStageOwners(Item item,Staged staged){
         Path main=Path.of(staged.path());try{Path owner=main.getParent().resolve("content.twb-owner");if(owned(owner,item.id(),main))Files.delete(owner);}catch(IOException ignored){/* An unverified marker is preserved. */}
         if(staged.video()!=null&&staged.video().thumbnail()!=null)try{Path thumbnail=thumbnailPath(staged),owner=thumbnail.getParent().resolve("thumbnail.twb-owner");if(owned(owner,item.id(),thumbnail))Files.delete(owner);}catch(IOException ignored){/* An unverified marker is preserved. */}
@@ -112,6 +151,57 @@ public final class UploadFiles {
         var lease=new Lease();try{for(var file:staged){check.run();lease.channels.add(hold(Path.of(file.path())));if(file.video()!=null)lease.channels.add(hold(thumbnailPath(file)));verifyStaged(file,check);}return lease;}catch(IOException|RuntimeException failure){lease.close();throw failure;}
     }
     private static FileChannel hold(Path path)throws IOException{return FileChannel.open(path,StandardOpenOption.READ,LinkOption.NOFOLLOW_LINKS,ExtendedOpenOption.NOSHARE_WRITE,ExtendedOpenOption.NOSHARE_DELETE);}
+    /** Collect terminal, never-sent tasks on the same worker that stages/sends files. Never walk source trees. */
+    public void cleanupCancelled(Task task,Runnable check){
+        var saved=repository.cancelledForCleanup(task.accountId(),task.id());if(saved==null)return;
+        for(var group:saved.groups())for(var item:group.items()){
+            check.run();
+            try{
+                Path dir=cancelledDirectory(saved,item);if(dir==null)continue;
+                Path main=dir.resolve(Path.of(item.file().relativePath()).getFileName());var staged=item.staged();
+                if(staged!=null&&main.equals(Path.of(staged.path())))
+                    deleteVerified(main,staged.identity(),staged.size(),staged.sha256(),check);
+                if(staged!=null&&staged.video()!=null){
+                    Path thumbnail=thumbnailPath(staged);var proof=staged.video().thumbnail();
+                    if(thumbnail.getParent().equals(dir))deleteVerified(thumbnail,proof.identity(),proof.size(),proof.sha256(),check);
+                }
+                cleanupMarker(dir.resolve("content.twb-owner"),item.id(),List.of(main,dir.resolve("content.twb-part")),item.file(),check);
+                if(item.file().mediaType().equals("VIDEO"))cleanupMarker(dir.resolve("thumbnail.twb-owner"),item.id(),
+                        List.of(dir.resolve("thumbnail.twb.jpg"),dir.resolve("thumbnail.twb-part")),null,check);
+                try{Files.delete(dir);Files.delete(dir.getParent());}catch(DirectoryNotEmptyException keepUnknownFiles){/* Only empty directories are removed. */}
+            }catch(IOException|java.nio.file.InvalidPathException unverified){/* Never delete changed, aliased, unknown or locked content. */}
+        }
+    }
+    private Path cancelledDirectory(Task task,Item item)throws IOException{
+        if(!task.id().matches("[0-9a-f-]{36}")||!item.id().matches("[0-9a-f-]{36}"))throw new IOException("Invalid cache identity");
+        Path dir=app.root().resolve("outgoing").resolve(task.id()).resolve(item.id());
+        for(Path path:List.of(app.root(),app.root().resolve("outgoing"),dir.getParent(),dir)){
+            if(!Files.exists(path,LinkOption.NOFOLLOW_LINKS))return null;
+            if(!Files.isDirectory(path,LinkOption.NOFOLLOW_LINKS)||Files.isSymbolicLink(path)||!path.toRealPath().equals(path))throw new IOException("Cache directory changed");
+        }
+        return dir;
+    }
+    private static boolean deleteVerified(Path file,String identity,long size,String hash,Runnable check)throws IOException{
+        if(!Files.exists(file,LinkOption.NOFOLLOW_LINKS))return true;
+        if(identity==null||hash==null||size<0||!hash.matches("[0-9a-f]{64}")||Files.isSymbolicLink(file)
+                ||!identity.equals(DownloadFileStore.fileKey(file))||!matches(file,size,hash,check))return false;
+        check.run();if(!identity.equals(DownloadFileStore.fileKey(file)))return false;
+        Files.delete(file);return true;
+    }
+    private static void cleanupMarker(Path marker,String token,List<Path> candidates,FileVersion fallback,Runnable check)throws IOException{
+        var proof=owner(marker,token);if(proof==null)return;
+        for(var file:candidates){
+            if(!Files.exists(file,LinkOption.NOFOLLOW_LINKS)||Files.isSymbolicLink(file)||!proof.identity().equals(DownloadFileStore.fileKey(file)))continue;
+            // Old two-line main markers can still be checked against the frozen source version.
+            // Old unregistered thumbnails have no content digest, so retain them rather than guess.
+            long size=proof.size()!=null?proof.size():fallback==null?-1:fallback.size();
+            String hash=proof.hash()!=null?proof.hash():fallback==null?null:fallback.sha256();
+            if(!deleteVerified(file,proof.identity(),size,hash,check))return;
+        }
+        // If the file was already removed before shutdown, only remove this same owned marker.
+        var current=owner(marker,token);if(current!=null&&current.text().equals(proof.text())
+            &&candidates.stream().noneMatch(p->Files.exists(p,LinkOption.NOFOLLOW_LINKS)))Files.delete(marker);
+    }
     public void archive(Task task,Item original,Runnable check)throws IOException{
         if(original.formalId()==null)throw new IOException("Formal receipt required");
         Path source=source(task,original),held=source.resolveSibling(".twb-"+original.id()+".twb-hold");
@@ -146,7 +236,7 @@ public final class UploadFiles {
     }
     private void finish(Task task,Item item,Path held,Runnable check)throws IOException{
         check.run();if(Files.exists(held,LinkOption.NOFOLLOW_LINKS)){verifyOriginal(held,item.file(),check);Files.delete(held);}
-        if(item.archiveRelative()!=null&&item.archiveIdentity()!=null){Path target=Path.of(task.prepared().scan().archiveDirectory()).resolve(item.archiveRelative());Path owner=target.getParent().resolve(".twb-"+item.id()+".twb-owner");if(Files.isRegularFile(owner,LinkOption.NOFOLLOW_LINKS)&&!Files.isSymbolicLink(owner)&&Files.size(owner)<=256&&Files.readString(owner).equals(item.id()+"\n"+item.archiveIdentity())&&!Files.exists(target.getParent().resolve(".twb-"+item.id()+".twb-part"),LinkOption.NOFOLLOW_LINKS))Files.delete(owner);}
+        if(item.archiveRelative()!=null&&item.archiveIdentity()!=null){Path target=Path.of(task.prepared().scan().archiveDirectory()).resolve(item.archiveRelative());Path owner=target.getParent().resolve(".twb-"+item.id()+".twb-owner");var proof=owner(owner,item.id());if(proof!=null&&proof.identity().equals(item.archiveIdentity())&&!Files.exists(target.getParent().resolve(".twb-"+item.id()+".twb-part"),LinkOption.NOFOLLOW_LINKS))Files.delete(owner);}
         repository.archived(task,item);cleanupStage(item);
     }
     private static void cleanupStage(Item item){
@@ -170,15 +260,17 @@ public final class UploadFiles {
         if(Files.isSymbolicLink(path)||!Files.isRegularFile(path,LinkOption.NOFOLLOW_LINKS))throw new IOException("Source missing or linked");var attrs=Files.readAttributes(path,BasicFileAttributes.class,LinkOption.NOFOLLOW_LINKS);
         if(attrs.size()!=file.size()||attrs.lastModifiedTime().toMillis()!=file.modifiedMillis()||!file.identity().equals(DownloadFileStore.fileKey(path))||!matches(path,file.size(),file.sha256(),check))throw new IOException("Source version changed");
     }
-    private static void copyOwned(Path source,Path part,Path owner,String token,long size,String hash,Runnable check)throws IOException{
+    private void copyOwned(Path source,Path part,Path owner,String token,long size,String hash,Runnable check)throws IOException{
         if(!Files.exists(part,LinkOption.NOFOLLOW_LINKS)){
-            if(Files.exists(owner,LinkOption.NOFOLLOW_LINKS))throw new IOException("Uncertain temporary ownership");Files.createFile(part);Files.writeString(owner,token+"\n"+DownloadFileStore.fileKey(part),StandardOpenOption.CREATE_NEW);
+            if(Files.exists(owner,LinkOption.NOFOLLOW_LINKS))throw new IOException("Uncertain temporary ownership");Files.createFile(part);Files.writeString(owner,checkpoint(token,part,0,emptyHash()),StandardOpenOption.CREATE_NEW);
         }
-        if(Files.isSymbolicLink(owner)||!Files.isRegularFile(owner,LinkOption.NOFOLLOW_LINKS)||Files.size(owner)>256||!Files.readString(owner).equals(token+"\n"+DownloadFileStore.fileKey(part)))throw new IOException("Unknown temporary file");
+        if(!owned(owner,token,part))throw new IOException("Unknown temporary file");
         if(Files.getFileStore(part).getUsableSpace()<size+16L*1024*1024)throw new IOException("Insufficient space");
         try(var input=FileChannel.open(source,StandardOpenOption.READ,LinkOption.NOFOLLOW_LINKS);var output=FileChannel.open(part,StandardOpenOption.WRITE,LinkOption.NOFOLLOW_LINKS,ExtendedOpenOption.NOSHARE_WRITE,ExtendedOpenOption.NOSHARE_DELETE)){
-            if(!Files.readString(owner).equals(token+"\n"+DownloadFileStore.fileKey(part)))throw new IOException("Temporary file replaced before opening");output.truncate(0);output.position(0);
-            ByteBuffer block=ByteBuffer.allocate(1024*1024);long remaining=size;while(remaining>0){check.run();block.clear().limit((int)Math.min(block.capacity(),remaining));int n=input.read(block);if(n<=0)throw new IOException("Source length changed");block.flip();while(block.hasRemaining())output.write(block);remaining-=n;}if(input.read(ByteBuffer.allocate(1))!=-1)throw new IOException("Source grew");output.force(true);
+            if(!owned(owner,token,part))throw new IOException("Temporary file replaced before opening");output.truncate(0);output.position(0);
+            ByteBuffer block=ByteBuffer.allocate(1024*1024);long remaining=size,written=0;var digest=DownloadPaths.digest();
+            try{while(remaining>0){check.run();block.clear().limit((int)Math.min(block.capacity(),remaining));int n=input.read(block);if(n<=0)throw new IOException("Source length changed");block.flip();while(block.hasRemaining()){int before=block.position(),count=copyWriter.write(output,block);if(count>0){digest.update(block.array(),before,count);written+=count;}}remaining-=n;}if(input.read(ByteBuffer.allocate(1))!=-1)throw new IOException("Source grew");output.force(true);}
+            finally{saveCheckpoint(output,owner,token,part,written,digest.digest());}
         }
         if(!matches(part,size,hash,check))throw new IOException("Copy verification failed");
     }

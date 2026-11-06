@@ -17,6 +17,16 @@ import org.junit.jupiter.api.io.TempDir;
 
 class UploadEngineTest {
     @TempDir Path root;
+    @Test void legacyReadyTaskCanStartAfterOnlyTheTargetPublicationDateIsBackfilled() throws Exception {
+        try (var f = new Fixture(1, true)) {
+            var old = f.store.prepared.target();
+            when(f.targets.read(anyString(), eq("1"), eq(1L), anySet())).thenReturn(new io.github.telegramenhance.transfer.UploadPreviewModels.Target(
+                    old.post().withPublishedAt(1_700_000_123_000L), old.discussionTitle(), old.permission(), old.slowModeSeconds(), 2));
+            f.store.repository.start("1", f.store.task.id());
+            waitFor(() -> f.store.fresh().state().equals("COMPLETED"));
+            assertEquals(1, f.sends.get()); assertEquals(1, f.store.repository.view(f.store.fresh()).archived());
+        }
+    }
     @Test void aSavedReadyTaskNeverSendsUntilAnExplicitStartAndThenArchivesOnlyConfirmedMembers()throws Exception{
         try(var f=new Fixture(2,true)){Thread.sleep(1400);assertEquals(0,f.sends.get());assertEquals("READY",f.store.fresh().state());f.store.repository.start("1",f.store.task.id());waitFor(()->f.store.fresh().state().equals("COMPLETED"));assertEquals(1,f.sends.get());assertEquals(2,f.store.repository.view(f.store.fresh()).archived());assertFalse(Files.exists(f.store.source.resolve("file1.bin")));}
     }

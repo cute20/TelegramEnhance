@@ -10,6 +10,8 @@ import io.github.telegramenhance.library.LibraryModels.CatalogEntry;
 import io.github.telegramenhance.library.LibraryModels.CatalogPage;
 import io.github.telegramenhance.library.LibraryModels.Channel;
 import io.github.telegramenhance.library.LibraryModels.MediaPage;
+import io.github.telegramenhance.library.LibraryModels.Facets;
+import io.github.telegramenhance.library.LibraryModels.TagFacet;
 import io.github.telegramenhance.storage.Database;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
@@ -391,9 +393,21 @@ public final class ResourceRepository {
     }
 
     public CatalogPage catalog(String accountId, PostSearch.Query query, int limit, int offset) {
+        return catalog(accountId, query, limit, offset, "published-desc");
+    }
+
+    public CatalogPage catalog(String accountId, PostSearch.Query query, int limit, int offset, String sort) {
         requireText(accountId, "账号标识无效");
         validateBounds(limit, offset);
         if (query == null) throw invalid("缺少资源筛选条件");
+        String published = "CASE WHEN json_type(p.post_json,'$.publishedAt') IN ('integer','real')"
+                + " AND json_extract(p.post_json,'$.publishedAt')>0 THEN json_extract(p.post_json,'$.publishedAt') END";
+        String order = switch (sort == null ? "published-desc" : sort) {
+            case "published-desc" -> published + " IS NULL," + published + " DESC,p.updated_at DESC,p.post_key";
+            case "title-asc" -> "COALESCE(json_extract(p.post_json,'$.title'),'') COLLATE NOCASE,p.post_key";
+            case "updated-desc" -> "p.updated_at DESC,p.post_key";
+            default -> throw invalid("资源排序方式无效，请重新选择");
+        };
         backfillSearch(accountId);
         return database.read(connection -> {
             List<String> parameters = new ArrayList<>(); parameters.add(accountId);
@@ -401,6 +415,17 @@ public final class ResourceRepository {
             if (!query.channelIds().isEmpty()) {
                 filter.append(" AND p.channel_id IN (").append(placeholders(query.channelIds().size())).append(')');
                 parameters.addAll(query.channelIds());
+            }
+            // Facets describe the entire selected channel scope, including tags excluded by
+            // the current AND search, so selecting a tag never hides other available choices.
+            List<TagFacet> tagFacets = new ArrayList<>();
+            try (PreparedStatement statement = connection.prepareStatement(
+                    "SELECT t.normalized_tag,COUNT(*) FROM resource_posts p JOIN resource_post_tags t ON t.post_key=p.post_key"
+                            + filter + " GROUP BY t.normalized_tag ORDER BY COUNT(*) DESC,t.normalized_tag")) {
+                bind(statement, parameters);
+                try (ResultSet rows = statement.executeQuery()) {
+                    while (rows.next()) tagFacets.add(new TagFacet(rows.getString(1), rows.getLong(2)));
+                }
             }
             for (String tag : query.tags()) {
                 filter.append(" AND EXISTS (SELECT 1 FROM resource_post_tags t WHERE t.post_key=p.post_key AND t.normalized_tag=?)");
@@ -422,31 +447,57 @@ public final class ResourceRepository {
                 statement.setString(1, accountId);
                 try (ResultSet rows = statement.executeQuery()) { rows.next(); indexedPosts = rows.getLong(1); indexedChannels = rows.getLong(2); }
             }
-            List<CatalogEntry> items = new ArrayList<>();
+            Map<String, Long> selected = new LinkedHashMap<>();
             try (PreparedStatement statement = connection.prepareStatement("SELECT p.post_key,p.updated_at" + from + filter
-                    + " ORDER BY p.updated_at DESC,p.post_key LIMIT ? OFFSET ?")) {
+                    + " ORDER BY " + order + " LIMIT ? OFFSET ?")) {
                 bind(statement, parameters);
                 statement.setInt(parameters.size() + 1, limit); statement.setInt(parameters.size() + 2, offset);
                 try (ResultSet rows = statement.executeQuery()) {
-                    while (rows.next()) {
-                        String key = rows.getString(1);
-                        // The synchronized Database read keeps these authoritative scope/count reads
-                        // in the same snapshot as the selected catalog page.
-                        Detail detail = detail(key, 1, 0);
-                        List<String> tags = new ArrayList<>();
-                        try (PreparedStatement selectTags = connection.prepareStatement(
-                                "SELECT normalized_tag FROM resource_post_tags WHERE post_key=? ORDER BY normalized_tag")) {
-                            selectTags.setString(1, key);
-                            try (ResultSet tagRows = selectTags.executeQuery()) { while (tagRows.next()) tags.add(tagRows.getString(1)); }
-                        }
-                        items.add(new CatalogEntry(detail.post(), List.copyOf(tags), detail.indexedCommentMessages(),
-                            detail.indexedCommentMedia(), rows.getLong(2)));
-                    }
+                    while (rows.next()) selected.put(rows.getString(1), rows.getLong(2));
                 }
             }
+            // All comment type counts for the selected page are read in one query. Cards
+            // need no separate per-post media requests, including for comment-only videos.
+            Map<String, Map<String, Long>> mediaCounts = catalogMediaTypeCounts(connection, List.copyOf(selected.keySet()));
+            List<CatalogEntry> items = new ArrayList<>();
+            for (var entry : selected.entrySet()) {
+                String key = entry.getKey();
+                // The synchronized Database read keeps authoritative coverage and counts in
+                // the same snapshot as the selected catalog page and its media aggregation.
+                Detail detail = detail(key, 1, 0);
+                Map<String, Long> types = mediaCounts.get(key);
+                for (Media media : detail.post().mainMedia()) incrementType(types, media.type(), 1);
+                List<String> tags = new ArrayList<>();
+                try (PreparedStatement selectTags = connection.prepareStatement(
+                        "SELECT normalized_tag FROM resource_post_tags WHERE post_key=? ORDER BY normalized_tag")) {
+                    selectTags.setString(1, key);
+                    try (ResultSet tagRows = selectTags.executeQuery()) { while (tagRows.next()) tags.add(tagRows.getString(1)); }
+                }
+                items.add(new CatalogEntry(detail.post(), tags, detail.indexedCommentMessages(),
+                        detail.indexedCommentMedia(), entry.getValue(), detail.post().publishedAt(), types));
+            }
             return new CatalogPage(List.copyOf(items), limit, offset, total, indexedPosts, indexedChannels,
-                (long) offset + items.size() < total, "INDEXED_ONLY");
+                (long) offset + items.size() < total, "INDEXED_ONLY", new Facets(tagFacets));
         });
+    }
+
+    private Map<String, Map<String, Long>> catalogMediaTypeCounts(Connection connection, List<String> keys) throws SQLException {
+        Map<String, Map<String, Long>> counts = new LinkedHashMap<>();
+        keys.forEach(key -> counts.put(key, LibraryModels.emptyMediaTypeCounts()));
+        if (keys.isEmpty()) return counts;
+        try (PreparedStatement statement = connection.prepareStatement(
+                "SELECT post_key,json_extract(media_json,'$.type'),COUNT(*) FROM resource_comment_media WHERE post_key IN ("
+                        + placeholders(keys.size()) + ") GROUP BY post_key,json_extract(media_json,'$.type')")) {
+            bind(statement, keys);
+            try (ResultSet rows = statement.executeQuery()) {
+                while (rows.next()) incrementType(counts.get(rows.getString(1)), rows.getString(2), rows.getLong(3));
+            }
+        }
+        return counts;
+    }
+
+    private static void incrementType(Map<String, Long> counts, String type, long amount) {
+        counts.merge(MEDIA_TYPES.contains(type == null ? "" : type) ? type : "OTHER", amount, Long::sum);
     }
 
     public MediaPage media(String accountId, String key, List<String> types, boolean includeMain, int limit, int offset) {
@@ -687,10 +738,16 @@ public final class ResourceRepository {
         // A failed/unknown mapping is not evidence that Telegram rebound the thread. Keep its
         // last known identities so a later successful refresh can resume the original checkpoint.
         Post mapping = fresh.canReadComments() ? fresh : previous;
+        Long publishedAt = fresh.publishedAt();
+        if (!mainMessageId.equals(fresh.mainMessageId())) {
+            publishedAt = mainMessageId.equals(previous.mainMessageId()) ? previous.publishedAt() : null;
+        } else if (publishedAt == null && mainMessageId.equals(previous.mainMessageId())) {
+            publishedAt = previous.publishedAt();
+        }
         return new Post(fresh.key(), fresh.accountId(), fresh.channelId(), fresh.channelTitle(), mainMessageId,
                 fresh.title(), fresh.text(), fresh.albumId(), members, media, mapping.discussionChatId(),
                 mapping.discussionRootMessageId(), mapping.discussionRoots(), fresh.canReadComments(),
-                fresh.coverage(), List.copyOf(warnings), fresh.albumEvidence(), fresh.mainCoverage());
+                fresh.coverage(), List.copyOf(warnings), fresh.albumEvidence(), fresh.mainCoverage(), publishedAt);
     }
 
     private boolean sameAlbum(Post first, Post second) {

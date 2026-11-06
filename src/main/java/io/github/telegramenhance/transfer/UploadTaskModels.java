@@ -19,6 +19,7 @@ public final class UploadTaskModels {
     public record Evidence(String oldId, String formalId, String chatId, String threadId, String replyId, String albumId,
                            String mediaType, String caption, String uniqueId, boolean outgoing, boolean success, int date) { }
     public record Initial(String id, int sendingId, boolean pending, Evidence evidence) { }
+    public record Progress(long totalBytes,long uploadedBytes,Long speedBytesPerSecond,Long etaSeconds,Long observedAt,int observedItems,int totalItems) { }
     public record ItemView(String id, String fileName, String mediaType, long size, String state, String formalMessageId, String archivePath, String error) { }
     public record GroupView(String id, int number, String mediaType, String state, String error, boolean canAcceptDocument, boolean hasRetries, List<ItemView> items) { }
     public record View(String id, String state, String channelTitle, String postTitle, String postLink, String discussionTitle,

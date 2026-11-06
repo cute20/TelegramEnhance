@@ -12,7 +12,7 @@ import * as library from '../src/library.ts'
 
 const ID='00000000-0000-0000-0000-000000000001',LINK='https://t.me/synthetic/1'
 const flush=async()=>{await vue.nextTick();await new Promise(setImmediate)}
-const selection=()=>vue.reactive({link:LINK,sourceDirectory:'D:\\shared-upload',recursive:false,captionMode:'EMPTY'})
+const selection=()=>vue.reactive({link:LINK,sourceDirectory:'D:\\shared-upload',recursive:false,captionMode:'EMPTY',albumSize:4})
 function preview(input){return {id:ID,accountId:'1',state:'PREVIEW_ONLY',...input,channelTitle:'Synthetic',postTitle:'Synthetic',postText:'Synthetic',postLink:input.link,discussionTitle:'Synthetic',permission:'MEDIA_ALLOWED_AT_CHECK',slowModeSeconds:0,fileCount:1,totalBytes:10,groups:[{number:1,mediaType:'DOCUMENT',mode:'SINGLE',files:[{relativePath:'one.txt',fileName:'one.txt',mediaType:'DOCUMENT',size:10,caption:input.captionMode==='FILENAME'?'one.txt':''}]}],otherFiles:0,deferredFiles:0,linkedEntries:0,duplicateFiles:0,warnings:[],targetCheckedAt:1,createdAt:1,expiresAt:600001}}
 function savedTask(){return {id:ID,state:'READY',channelTitle:'Synthetic',postTitle:'Synthetic',postLink:LINK,discussionTitle:'Synthetic',sourceDirectory:'D:\\shared-upload',archiveDirectory:'D:\\shared-upload-已上传',stopRequested:false,total:1,confirmed:0,archived:0,error:null,createdAt:1,updatedAt:1,groups:[{id:'1',number:1,mediaType:'DOCUMENT',state:'READY',items:[{id:'one',fileName:'one.txt',mediaType:'DOCUMENT',size:10,state:'READY',formalMessageId:null,archivePath:null,error:null}]}]}}
 function savedRule(input){return {mode:'AUTO_UPLOAD',state:'PAUSED',scanning:false,nextAllowedAt:1,rule:{id:ID,accountId:'1',version:1,revision:1,enabled:false,nextScanAt:0,createdAt:1,updatedAt:1,input,observation:null}}}
@@ -39,7 +39,7 @@ test('shared upload fields map to the original preview API with the same sibling
   f.expect('/transfers/upload/preview',preview(input));await f.state.prepare()
   assert.deepEqual(f.calls[0].options.body,input);assert.equal(f.state.preview.value.fileCount,1)
   assert.equal(f.state.fieldsLocked.value,false);assert.equal(f.state.transitionLocked.value,false)
-  assert.deepEqual({...shared},{link:LINK,sourceDirectory:'D:\\shared-upload',recursive:false,captionMode:'EMPTY'})
+  assert.deepEqual({...shared},{link:LINK,sourceDirectory:'D:\\shared-upload',recursive:false,captionMode:'EMPTY',albumSize:4})
 })
 
 test('editing a shared source invalidates readonly preview and derives a new sibling archive',async t=>{
@@ -76,7 +76,7 @@ test('a single shared upload selection survives the once-to-rule controller swit
   const f=mount(t,'RuleWorkspace',{selection:shared,createOnly:true,embedded:true},[{path:'/rules/name',value:{accountId:'1',link:LINK,name:'Synthetic rule'}}]);await flush()
   assert.equal(f.state.formOpen.value,true);assert.equal(f.state.form.link,shared.link);assert.equal(f.state.form.sourceDirectory,shared.sourceDirectory)
   assert.equal(f.state.form.archiveDirectory,'D:\\shared-upload-已上传');assert.equal(f.state.form.recursive,false);assert.equal(f.state.form.captionMode,'EMPTY')
-  assert.equal(f.state.form.name,'Synthetic rule');assert.equal(f.state.form.executionMode,'AUTO_UPLOAD')
+  assert.equal(f.state.form.name,'Synthetic rule');assert.equal(f.state.form.executionMode,'AUTO_UPLOAD');assert.equal(f.state.form.albumSize,4)
   const frozen=structuredClone({...f.state.form,window:{...f.state.form.window}})
   f.expect('/rules',savedRule(frozen));await f.state.save()
   assert.deepEqual(f.calls.at(-1).options.body.input,frozen);assert.deepEqual(f.events.at(-1),['saved','upload'])
@@ -134,4 +134,17 @@ test('saving after asynchronous naming snapshots the latest shared source and ca
   assert.deepEqual(f.calls.at(-1).options.body.input,expected)
   assert.equal(expected.archiveDirectory,'D:\\updated-during-name-已上传')
   assert.deepEqual(f.events.at(-1),['saved','upload'])
+})
+
+test('changing only shared album size invalidates an existing preview and updates automatic rule input',async t=>{
+  const shared=selection(),once=mount(t,'UploadPreparation',{selection:shared});await flush()
+  once.expect('/transfers/upload/preview',preview({...shared,archiveDirectory:rules.ruleArchiveDirectory(shared.sourceDirectory)}));await once.state.prepare()
+  shared.albumSize=1;await flush();assert.equal(once.state.albumSize.value,1);assert.equal(once.state.preview.value,null)
+  once.destroy()
+  const rule=mount(t,'RuleWorkspace',{selection:shared,createOnly:true,embedded:true},[{path:'/rules/name',value:{accountId:'1',link:LINK,name:'Synthetic rule'}}]);await flush()
+  assert.equal(rule.state.form.albumSize,1)
+  shared.albumSize=7;await flush();assert.equal(rule.state.form.albumSize,7)
+  const input={...rule.state.form,window:{...rule.state.form.window}}
+  rule.expect('/rules',savedRule(input));await rule.state.save()
+  assert.equal(rule.calls.at(-1).options.body.input.albumSize,7)
 })

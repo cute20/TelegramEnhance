@@ -64,13 +64,55 @@ class DownloadTaskServiceTest {
             assertThrows(ExecutionException.class, () -> f.service.create(f.input()).get()); assertFalse(Files.exists(f.output)); assertTrue(f.repository.list("1", 20, 0).isEmpty());
         }
     }
-    @Test void malformedOrUnboundedSelectionsFailBeforeAnySourceRead() {
+    @Test void malformedOrDuplicateSelectionsFailBeforeAnySourceRead() {
         try (var f = new Fixture()) {
             var input = f.input();
             assertThrows(IllegalArgumentException.class, () -> f.service.create(new DownloadTaskService.Create(input.operationId(), input.sourceId(), List.of(), true, f.output.toString())));
             assertThrows(IllegalArgumentException.class, () -> f.service.create(new DownloadTaskService.Create(input.operationId(), input.sourceId(), List.of("same", "same"), true, f.output.toString())));
             assertThrows(IllegalArgumentException.class, () -> f.service.create(new DownloadTaskService.Create(input.operationId(), input.sourceId(), input.mediaKeys(), true, f.paths.root().toString())));
             verifyNoInteractions(f.sources, f.files);
+        }
+    }
+    @Test void moreThan100ObservedFilesPersistAsOneIdempotentStandaloneTask()throws Exception{
+        try(var f=new Fixture()){
+            var post=DownloadPersistenceTest.post("large selected source");
+            var frozen=java.util.stream.IntStream.range(0,158).mapToObj(index->{var media=DownloadBatchServiceTest.media(1000+index,false);return new DownloadModels.FrozenFile(media,"large-"+index,media.size(),media.fileName());}).toList();
+            var selected=frozen.stream().map(DownloadModels.FrozenFile::media).toList();
+            when(f.sources.selection(anyString(),anyList(),anyBoolean())).thenReturn(CompletableFuture.completedFuture(new DownloadSourceService.Selection(post,selected)));
+            when(f.files.freeze(any(),anyList(),anyLong())).thenReturn(frozen);
+            var input=f.input();var request=new DownloadTaskService.Create(input.operationId(),input.sourceId(),selected.stream().map(io.github.telegramenhance.library.ResourceModels.Media::key).toList(),false,input.targetDirectory());
+            var result=f.service.create(request).get();assertEquals(158,result.total());assertEquals(158,f.repository.task("1",result.id()).items().size());assertEquals(result,f.service.create(request).get());
+            verify(f.sources,times(1)).selection(anyString(),anyList(),anyBoolean());assertFalse(Files.exists(f.output));
+        }
+    }
+    @Test void invalidDirectoryAndExpiredSelectionAreExplicitlyRejectedBeforeAnyTaskIsCreated() throws Exception {
+        try (var f = new Fixture()) {
+            var input = f.input();
+            assertThrows(CreationRejectedException.class, () -> f.service.create(new DownloadTaskService.Create(
+                    input.operationId(), input.sourceId(), input.mediaKeys(), true, "relative-folder")));
+            verifyNoInteractions(f.sources, f.files);
+            when(f.sources.selection(anyString(), anyList(), anyBoolean())).thenReturn(
+                    CompletableFuture.failedFuture(new IllegalArgumentException("Preview expired")));
+            var failure = assertThrows(ExecutionException.class, () -> f.service.create(input).get());
+            assertInstanceOf(CreationRejectedException.class, failure.getCause());
+            assertTrue(f.repository.list("1", 20, 0).isEmpty());
+        }
+    }
+    @Test void aContextChangeAfterCommitNeverClaimsThatTheCreationWasRejected() throws Exception {
+        try (var f = new Fixture()) {
+            var repository = spy(f.repository);
+            doAnswer(call -> {
+                var saved = call.callRealMethod();
+                f.generation.incrementAndGet();
+                return saved;
+            }).when(repository).create(anyString(), anyString(), anyString(), any(), any(), anyList());
+            var service = new DownloadTaskService(f.sources, f.work, f.files, repository,
+                    new DownloadPaths(f.paths), f.telegram, f.engine);
+            var input = f.input();
+            var failure = assertThrows(ExecutionException.class, () -> service.create(input).get());
+            assertInstanceOf(IllegalArgumentException.class, failure.getCause());
+            assertFalse(failure.getCause() instanceof CreationRejectedException);
+            assertNotNull(repository.byOperation("1", input.operationId()));
         }
     }
     private final class Fixture implements AutoCloseable {

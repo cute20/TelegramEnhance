@@ -52,7 +52,7 @@ public final class UploadPreviewService implements AutoCloseable {
     public CompletableFuture<View> verify(String id) {
         Session session = capture(); var snapshot = snapshot(id, session);
         return reads.readWork(() -> { current(session); var fresh = targets.read(snapshot.input().link(), session.account(), session.generation(), types(snapshot.scan())); current(session);
-            if (!snapshot.target().post().equals(fresh.post())) throw new IllegalArgumentException("目标主帖或讨论映射已变化，旧分组保留，请重新生成预览"); return fresh; })
+            if (!snapshot.target().post().sameContent(fresh.post())) throw new IllegalArgumentException("目标主帖或讨论映射已变化，旧分组保留，请重新生成预览"); return fresh; })
             .thenCompose(fresh -> submit(() -> { current(session); scanner.verify(snapshot.scan(), () -> current(session)); snapshot(id, session); return view(snapshot, fresh.checkedAt()); }));
     }
     private synchronized void remember(Snapshot snapshot) { current(snapshot.session()); prune(snapshot.session()); snapshots.put(snapshot.id(), snapshot); while (snapshots.size() > 8) snapshots.remove(snapshots.keySet().iterator().next()); }
@@ -68,7 +68,7 @@ public final class UploadPreviewService implements AutoCloseable {
         try { return CompletableFuture.supplyAsync(work, local); } catch (RejectedExecutionException failure) { throw new IllegalArgumentException("上传预览队列已满，请等待当前目录读取完成"); }
     }
     static View view(Snapshot snapshot, long checkedAt) {
-        var scan = snapshot.scan();var files=scan.files();var groups=groups(files,snapshot.input().captionMode());
+        var scan = snapshot.scan();var files=scan.files();var groups=groups(files,snapshot.input().captionMode(),snapshot.input().albumSize());
         var warnings = new ArrayList<String>(); warnings.add("预览不发送或移动文件；保存任务后仍需到任务中心确认开始。预览保留10分钟，已保存任务独立持久化。");
         warnings.add("媒体按扩展名识别，图片、视频、音频、文档分别分组，GIF逐条；其他文件按文档处理。格式编码和发送权限需在执行前再次核对。");
         if (files.isEmpty()) warnings.add("目录中没有可预览的稳定媒体，请放入文件并等待复制完成后重新预览。");
@@ -76,14 +76,18 @@ public final class UploadPreviewService implements AutoCloseable {
         if (scan.linkedEntries() > 0) warnings.add("已跳过" + scan.linkedEntries() + "个链接或重解析条目，不读取目录外内容。");
         if (scan.duplicateFiles() > 0) warnings.add("已排除" + scan.duplicateFiles() + "个同类型相同内容文件，保留自然顺序中的第一份；不会删除文件。");
         if (snapshot.target().slowModeSeconds() > 0) warnings.add("讨论组启用了慢速模式，后续执行需要遵守等待时间。");
-        var post = snapshot.target().post(); return new View(snapshot.id(), snapshot.session().account(), "PREVIEW_ONLY", scan.sourceDirectory(), scan.archiveDirectory(), scan.recursive(), snapshot.input().captionMode(),
+        var post = snapshot.target().post(); return new View(snapshot.id(), snapshot.session().account(), "PREVIEW_ONLY", scan.sourceDirectory(), scan.archiveDirectory(), scan.recursive(), snapshot.input().captionMode(), snapshot.input().albumSize(),
                 post.channelTitle(), post.title(), post.text(), snapshot.input().link().strip(), snapshot.target().discussionTitle(), snapshot.target().permission(), snapshot.target().slowModeSeconds(),
                 files.size(), files.stream().mapToLong(FileVersion::size).sum(), groups, scan.otherFiles(), scan.deferredFiles(), scan.linkedEntries(), scan.duplicateFiles(), warnings, checkedAt, snapshot.createdAt(), snapshot.expiresAt());
     }
     public static List<Group> groups(List<FileVersion> files,String captionMode){
+        return groups(files,captionMode,UploadPreviewModels.DEFAULT_ALBUM_SIZE);
+    }
+    public static List<Group> groups(List<FileVersion> files,String captionMode,int albumSize){
+        int selectedMaximum=UploadPreviewModels.normalizeAlbumSize(albumSize);
         var groups=new ArrayList<Group>();
         for (String type : List.of("PHOTO", "VIDEO", "AUDIO", "DOCUMENT", "ANIMATION")) {
-            int maximum = type.equals("ANIMATION") ? 1 : 10; long bytes=0, limit=8L*1024*1024*1024;
+            int maximum = type.equals("ANIMATION") ? 1 : selectedMaximum; long bytes=0, limit=8L*1024*1024*1024;
             var members=new ArrayList<Member>();
             for (var file : files) {
                 if(!file.mediaType().equals(type))continue;

@@ -8,6 +8,28 @@ import java.util.stream.IntStream;
 import org.junit.jupiter.api.Test;
 
 class BotPaginationTest {
+    @Test void largePageCountersDoNotLimitContinuationCompletionOrConflictDetection(){
+        for(String number:List.of("1000001","10000001","2147483647","2147483648","999999999999999999999999999999")){
+            var total=new java.math.BigInteger(number);var at=total.subtract(java.math.BigInteger.ONE);String next=total.toString();
+            var middle=analyze("页码"+at+"/"+total,"·"+at+"·",next,"上一页");
+            assertEquals("MORE",middle.status(),number);assertEquals(next,middle.nextButtonId(),number);assertEquals(at,middle.exactCurrent());assertEquals(total,middle.exactTotal());
+            if(at.bitLength()<32)assertEquals(at.intValue(),middle.current());else assertNull(middle.current());
+            if(total.bitLength()<32)assertEquals(total.intValue(),middle.total());else assertNull(middle.total());
+            var end=analyze("页码"+total+"/"+total,"上一页");assertEquals("END",end.status(),number);assertNull(end.nextButtonId());
+            assertEquals("UNKNOWN",analyze("页码"+total.add(java.math.BigInteger.ONE)+"/"+total,"下一页").status(),number);
+            assertEquals("UNKNOWN",analyze("页码"+total+"/"+total,"下一页").status(),number);
+            assertEquals("UNKNOWN",analyze("页码"+at+"/"+total,total.add(java.math.BigInteger.ONE).toString()).status(),number);
+        }
+    }
+    @Test void hugeNextGroupTargetsAndKeyboardWindowsRetainExactNavigationWithoutDisplayOverflow(){
+        var target=new java.math.BigInteger("999999999999999999999999999999");
+        var result=analyze("本组文件已发送","下一组 ("+target+"/"+target.add(java.math.BigInteger.ONE)+")");
+        assertEquals("MORE",result.status());assertNull(result.current());assertNull(result.total());assertNull(result.buttons().getFirst().page());
+        assertEquals(target.subtract(java.math.BigInteger.ONE),result.exactCurrent());assertEquals(target,result.buttons().getFirst().exactPage());
+        var window=analyze("页码"+target+"/"+target.add(java.math.BigInteger.TEN),"下10000000页");assertEquals("MORE",window.status());assertEquals("WINDOW",window.buttons().getFirst().kind());
+        String serialized=tools.jackson.databind.json.JsonMapper.builder().build().writeValueAsString(result);
+        assertFalse(serialized.contains("exactCurrent"));assertFalse(serialized.contains("exactTotal"));assertFalse(serialized.contains("exactPage"));assertFalse(serialized.contains("\"current\":-"));
+    }
     @Test void partialFolderBatchCompletionRecommendsNextWithoutInventingPageCounters() {
         var result=analyze("✅当前批次发送完成\n已发送：26/38条消息\n点击下方按钮查看下一组文件↓", "➡点击查看下一组", "📍1-26/38 跳转", "📁文件夹详情", "☆收藏", "🏷little_le_mni");
         assertEquals("MORE",result.status());assertEquals("➡点击查看下一组",result.nextButtonId());assertNull(result.current());assertNull(result.total());

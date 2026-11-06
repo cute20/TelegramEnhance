@@ -11,7 +11,7 @@ import * as library from '../src/library.ts'
 import * as preparation from '../src/rulePreparation.ts'
 import {byteSplitGroups,byteSplitCounts} from './fixtures/uploadByteGroups.mjs'
 const ID='00000000-0000-0000-0000-000000000001'
-const input=()=>({name:'sample',link:'https://t.me/synthetic/1',sourceDirectory:'D:\\source',archiveDirectory:'D:\\archive',recursive:true,captionMode:'FILENAME',window:{mode:'ALL_DAY',start:null,end:null,timezone:'Asia/Shanghai'},executionMode:'OBSERVE_ONLY'})
+const input=()=>({name:'sample',link:'https://t.me/synthetic/1',sourceDirectory:'D:\\source',archiveDirectory:'D:\\archive',recursive:true,captionMode:'FILENAME',albumSize:10,window:{mode:'ALL_DAY',start:null,end:null,timezone:'Asia/Shanghai'},executionMode:'OBSERVE_ONLY'})
 const result=()=>({mode:'OBSERVE_ONLY',state:'PAUSED',scanning:false,nextAllowedAt:1,rule:{id:ID,accountId:'1',version:1,revision:1,enabled:false,nextScanAt:0,createdAt:1,updatedAt:1,input:input(),observation:null}})
 const flush=async()=>{await vue.nextTick();await new Promise(setImmediate)}
 function mount(t,initialProps={}){
@@ -49,6 +49,22 @@ test('upload rules update only on an explicit refresh and retain the open draft'
 test('only observation results for this account pass validation',()=>{const r=result();assert.equal(rules.validRule(r,'1'),true);assert.equal(rules.validRule(r,'2'),false);r.mode='AUTO_UPLOAD';assert.equal(rules.validRule(r,'1'),false)})
 test('saving creates a paused rule and never creates or starts a transfer',async t=>{const f=mount(t);await flush();f.state.edit(null);Object.assign(f.state.form,input());f.expect('/rules',result());await f.state.save();assert.equal(f.state.items.value[0].rule.enabled,false);assert.equal(f.calls.length,2);assert.equal(f.calls[1].options.body.input.window.mode,'ALL_DAY');assert.equal(f.calls.some(c=>c.path.includes('transfers')),false)})
 test('editing reactive rule copies fields and saves a new version with original revision',async t=>{const f=mount(t);await flush();f.state.items.value=[result()];f.state.edit(f.state.items.value[0]);f.state.form.window={mode:'WINDOW',start:'22:00',end:'08:00',timezone:'Asia/Shanghai'};assert.equal(f.state.items.value[0].rule.input.window.mode,'ALL_DAY');const next=result();next.rule.version=2;next.rule.revision=2;next.rule.input.window=f.state.form.window;f.expect('/rules/'+ID,next,'PUT');await f.state.save();assert.equal(f.calls[1].options.body.revision,1);assert.equal(f.state.items.value[0].rule.version,2)})
+test('editing upload group size preserves the saved rule until an explicit paused revision is saved',async t=>{
+  const f=mount(t);await flush();const saved=result();saved.rule.input.albumSize=3;f.state.edit(saved)
+  assert.equal(f.state.form.albumSize,3)
+  const size=nodes(f.render()).find(node=>node.type==='select'&&nodes(node).filter(child=>child.type==='option').length===10)
+  assert.ok(size);size.props['onUpdate:modelValue'](1);await flush()
+  assert.equal(f.state.form.albumSize,1);assert.equal(saved.rule.input.albumSize,3)
+  const next=result();next.rule.version=2;next.rule.revision=2;next.rule.input.albumSize=1
+  f.expect('/rules/'+ID,next,'PUT');await f.state.save()
+  assert.equal(f.calls.at(-1).options.body.input.albumSize,1);assert.equal(f.state.items.value[0].rule.input.albumSize,1)
+  assert.equal(f.state.items.value[0].rule.enabled,false);assert.equal(f.calls.some(call=>call.path.endsWith('/enabled')),false)
+})
+test('old upload rules default to ten while invalid explicit group sizes are rejected',async t=>{
+  const f=mount(t);await flush();const legacy=result();delete legacy.rule.input.albumSize
+  assert.equal(rules.validRule(legacy,'1'),true);f.state.edit(legacy);assert.equal(f.state.form.albumSize,10)
+  for(const invalid of [0,11,2.5,'3']){const value=result();value.rule.input.albumSize=invalid;assert.equal(rules.validRule(value,'1'),false)}
+})
 test('observation activation never invokes upload preview or send',async t=>{const f=mount(t);await flush();const enabled=result();enabled.rule.enabled=true;enabled.rule.revision=2;enabled.state='OBSERVING';f.expect('/rules/'+ID+'/enabled',enabled);await f.state.act(result(),'enabled');assert.deepEqual(f.calls[1].options.body,{revision:1,enabled:true});assert.equal(f.state.items.value[0].rule.enabled,true);assert.equal(f.calls.length,2)})
 test('manual observation is available while paused and uses expected revision',async t=>{const f=mount(t);await flush();f.expectPreparation(result(),'observe',result());await f.state.act(result(),'observe');assert.equal(f.calls[1].options.body.revision,1);assert.equal(f.calls[1].options.body.kind,'observe');assert.ok(f.calls[1].options.body.operationId);assert.equal(f.state.items.value[0].state,'PAUSED')})
 test('unknown save response is not retried and is resolved by GET operation lookup',async t=>{const f=mount(t);await flush();f.state.edit(null);Object.assign(f.state.form,input());f.expect('/rules',new Error('timeout'));await f.state.save();assert.equal(f.state.uncertain.value,true);await f.state.save();assert.equal(f.calls.length,2);f.expect('/rules/by-operation/'+f.calls[1].options.body.operationId,result(),'GET');await f.state.lookup();assert.equal(f.state.uncertain.value,false);assert.equal(f.state.items.value[0].rule.id,ID);assert.equal(f.calls.filter(c=>c.options.method==='POST').length,1)})
@@ -97,7 +113,7 @@ test('unknown upload edit and its frozen revision survive a service reconnect',a
   assert.equal(f.state.uncertain.value,true);await f.state.save();assert.equal(f.calls.filter(call=>call.options.method==='PUT').length,1)
 })
 test('late observation cannot update an account that changed while reading',async t=>{const f=mount(t);await flush();let release;f.expectPreparation(result(),'observe',new Promise(r=>release=r));const pending=f.state.act(result(),'observe');f.props.authorized=false;await flush();release(result());await pending;assert.equal(f.state.items.value.length,0);assert.equal(f.state.busy.value,'')})
-test('rule grouping preview is read only and no action can send a transfer',async t=>{const f=mount(t);await flush();const preview={id:ID,accountId:'1',state:'PREVIEW_ONLY',permission:'MEDIA_ALLOWED_AT_CHECK',sourceDirectory:'D:\\source',archiveDirectory:'D:\\archive',channelTitle:'sample',postTitle:'sample',postText:'',discussionTitle:'discussion',postLink:input().link,recursive:true,captionMode:'FILENAME',fileCount:0,totalBytes:0,otherFiles:0,deferredFiles:0,linkedEntries:0,duplicateFiles:0,slowModeSeconds:0,targetCheckedAt:1,createdAt:1,expiresAt:600001,groups:[],warnings:[]};f.expectPreparation(result(),'preview',{ruleId:ID,version:1,revision:1,preview});await f.state.act(result(),'preview');assert.equal(f.state.preview.value.preview.state,'PREVIEW_ONLY');assert.equal(f.calls.some(c=>c.path.includes('/transfers/')),false)})
+test('rule grouping preview is read only and no action can send a transfer',async t=>{const f=mount(t);await flush();const preview={id:ID,accountId:'1',state:'PREVIEW_ONLY',permission:'MEDIA_ALLOWED_AT_CHECK',sourceDirectory:'D:\\source',archiveDirectory:'D:\\archive',channelTitle:'sample',postTitle:'sample',postText:'',discussionTitle:'discussion',postLink:input().link,recursive:true,captionMode:'FILENAME',albumSize:10,fileCount:0,totalBytes:0,otherFiles:0,deferredFiles:0,linkedEntries:0,duplicateFiles:0,slowModeSeconds:0,targetCheckedAt:1,createdAt:1,expiresAt:600001,groups:[],warnings:[]};f.expectPreparation(result(),'preview',{ruleId:ID,version:1,revision:1,preview});await f.state.act(result(),'preview');assert.equal(f.state.preview.value.preview.state,'PREVIEW_ONLY');assert.equal(f.calls.some(c=>c.path.includes('/transfers/')),false)})
 
 test('archive is a sibling named after source with suffix, including trailing slash and normalized parent',()=>{
   assert.equal(rules.ruleArchiveDirectory('D:\\素材\\'), 'D:\\素材-已上传');assert.equal(rules.ruleArchiveDirectory('D:/a/../素材/'),'D:\\素材-已上传');assert.equal(rules.ruleArchiveDirectory('D:\\'), '');assert.equal(rules.ruleArchiveDirectory('\\\\server\\share\\x'),'')
@@ -109,7 +125,7 @@ test('archive follows source changes and old saved rule stays frozen until save'
 test('failed name lookup preserves manual fallback and is not repeated by blur',async t=>{const f=mount(t);await flush();f.state.edit(null);f.state.form.link=input().link;f.expect('/rules/name',new Error('timeout'));await f.state.resolveName();await f.state.resolveName();assert.equal(f.calls.length,2);assert.match(f.state.nameError.value,/手动填写/);f.state.form.name='手动名称';f.state.nameAutomatic.value=false;await f.state.resolveName();assert.equal(f.state.form.name,'手动名称')})
 
 const automatic=()=>{const r=result();r.mode='AUTO_UPLOAD';r.rule.input.executionMode='AUTO_UPLOAD';return r}
-const activationPreview=()=>({ruleId:ID,version:1,revision:1,preview:{id:ID,accountId:'1',state:'PREVIEW_ONLY',permission:'MEDIA_ALLOWED_AT_CHECK',sourceDirectory:'D:\\source',archiveDirectory:'D:\\archive',channelTitle:'sample',postTitle:'sample',postText:'',discussionTitle:'discussion',postLink:input().link,recursive:true,captionMode:'FILENAME',fileCount:0,totalBytes:0,otherFiles:0,deferredFiles:0,linkedEntries:0,duplicateFiles:0,slowModeSeconds:0,targetCheckedAt:Date.now(),createdAt:Date.now(),expiresAt:Date.now()+600000,groups:[],warnings:[]}})
+const activationPreview=()=>({ruleId:ID,version:1,revision:1,preview:{id:ID,accountId:'1',state:'PREVIEW_ONLY',permission:'MEDIA_ALLOWED_AT_CHECK',sourceDirectory:'D:\\source',archiveDirectory:'D:\\archive',channelTitle:'sample',postTitle:'sample',postText:'',discussionTitle:'discussion',postLink:input().link,recursive:true,captionMode:'FILENAME',albumSize:10,fileCount:0,totalBytes:0,otherFiles:0,deferredFiles:0,linkedEntries:0,duplicateFiles:0,slowModeSeconds:0,targetCheckedAt:Date.now(),createdAt:Date.now(),expiresAt:Date.now()+600000,groups:[],warnings:[]}})
 test('new rules default to automatic upload but saving still requires separate preview and enable',async t=>{const f=mount(t);await flush();f.state.edit(null);assert.equal(f.state.form.executionMode,'AUTO_UPLOAD');Object.assign(f.state.form,automatic().rule.input);f.expect('/rules',automatic());await f.state.save();assert.equal(f.calls[1].options.body.input.executionMode,'AUTO_UPLOAD');assert.equal(f.state.items.value[0].rule.enabled,false);assert.match(f.state.notice.value,/暂停/);assert.equal(f.calls.length,2)})
 test('editing a legacy rule without a mode field keeps observation rather than inheriting the new default',async t=>{const f=mount(t);await flush();const old=result();delete old.rule.input.executionMode;const before=JSON.stringify(old);f.state.edit(old);assert.equal(f.state.form.executionMode,'OBSERVE_ONLY');assert.equal(JSON.stringify(old),before);assert.equal(f.calls.length,1)})
 test('a saved mode mismatch remains locked until GET confirms the requested mode, without resubmitting',async t=>{const f=mount(t);await flush();f.state.edit(null);Object.assign(f.state.form,automatic().rule.input);f.expect('/rules',result());await f.state.save();assert.equal(f.state.uncertain.value,true);const operation=f.calls[1].options.body.operationId;f.expect('/rules/by-operation/'+operation,result(),'GET');await f.state.lookup();assert.equal(f.state.uncertain.value,true);f.expect('/rules/by-operation/'+operation,automatic(),'GET');await f.state.lookup();assert.equal(f.state.uncertain.value,false);assert.equal(f.calls.filter(c=>c.options.method==='POST').length,1)})
@@ -182,6 +198,69 @@ const deferred=()=>{let resolve;const promise=new Promise(done=>{resolve=done});
 function nodes(node){if(!node||typeof node!=='object')return[];if(Array.isArray(node))return node.flatMap(nodes);const children=Array.isArray(node.children)?node.children:node.children&&typeof node.children==='object'?Object.values(node.children).filter(value=>typeof value==='function').flatMap(slot=>slot()):[];return[node,...children.flatMap(nodes)]}
 const text=node=>typeof node==='string'?node:Array.isArray(node)?node.map(text).join(''):node&&typeof node==='object'?text(node.children):''
 const beginRunning=(f,rule=result(),kind='observe')=>f.expect('/rules/'+ID+'/preparations',()=>f.receipt(f.state.preparationRequest.value))
+
+test('another enabled rule can be paused during or after waiting for a preparation without replacing its operation',async t=>{
+  for(const stopWaiting of [false,true]){
+    const f=mount(t);await flush()
+    const a=automatic(),b=automatic();b.rule.id='00000000-0000-0000-0000-000000000002';b.rule.input.name='Other upload';b.rule.enabled=true;b.state='OBSERVING'
+    f.state.items.value=[a,b];beginRunning(f,a,'preview');await f.state.prepareActivation(a)
+    const request={...f.state.preparationRequest.value}
+    if(stopWaiting)f.state.pausePreparation()
+    const record=nodes(f.render()).find(node=>node.type?.__name==='CompactRecord'&&node.key===b.rule.id)
+    const pause=nodes(record).find(node=>node.type==='button'&&text(node)==='暂停自动上传')
+    assert.ok(pause);assert.equal(pause.props.disabled,false)
+    const response=deferred(),paused=structuredClone(b);paused.rule.enabled=false;paused.rule.revision=2;paused.state='PAUSED'
+    f.expect('/rules/'+b.rule.id+'/enabled',response.promise)
+    const pending=pause.props.onClick();await f.state.act(b,'enabled')
+    assert.equal(f.calls.length,3,'repeated pause cannot overlap the pending pause')
+    assert.deepEqual(f.calls[2].options.body,{revision:1,enabled:false})
+    assert.equal(f.state.preparationRequest.value.operationId,request.operationId)
+    assert.equal(f.state.preparationWaiting.value,!stopWaiting)
+    response.resolve(paused);await pending
+    assert.equal(f.state.items.value.find(item=>item.rule.id===b.rule.id).rule.enabled,false)
+    f.expect(lookupPath(request),f.receipt(request,'COMPLETED',activationPreview()),'GET')
+    if(stopWaiting){f.state.resumePreparation();await flush()}else await f.advance(2000)
+    assert.ok(f.state.activation.value,'the original preparation can still complete after pausing the unrelated rule')
+    assert.equal(f.state.preparationRequest.value,null)
+    assert.equal(f.calls.filter(call=>call.path.endsWith('/preparations')&&call.options.method==='POST').length,1)
+    assert.equal(f.calls.some(call=>call.path==='/rules/'+ID+'/enabled'||call.path.includes('/transfers/')),false)
+  }
+})
+
+test('a preparation still blocks changing its own rule or enabling another paused rule',async t=>{
+  const f=mount(t);await flush();const a=automatic(),b=automatic();a.rule.enabled=true;b.rule.id='00000000-0000-0000-0000-000000000002'
+  f.state.items.value=[a,b];beginRunning(f);await f.state.act(a,'observe');f.state.pausePreparation()
+  await f.state.act(a,'enabled');await f.state.act(b,'enabled');await f.state.act(b,'observe');f.state.edit(b)
+  assert.equal(f.calls.length,2);assert.equal(f.state.formOpen.value,false);assert.ok(f.state.preparationRequest.value)
+})
+
+test('completion of the original preparation does not discard a pending independent pause or implicitly enable it',async t=>{
+  const f=mount(t);await flush();const a=automatic(),b=automatic();b.rule.id='00000000-0000-0000-0000-000000000002';b.rule.enabled=true;b.state='OBSERVING'
+  f.state.items.value=[a,b];beginRunning(f,a,'preview');await f.state.prepareActivation(a);const request={...f.state.preparationRequest.value}
+  const response=deferred(),paused=structuredClone(b);paused.rule.enabled=false;paused.rule.revision=2;paused.state='PAUSED'
+  f.expect('/rules/'+b.rule.id+'/enabled',response.promise);const pausing=f.state.act(b,'enabled')
+  f.expect(lookupPath(request),f.receipt(request,'COMPLETED',activationPreview()),'GET');await f.advance(2000)
+  assert.ok(f.state.activation.value);assert.equal(f.state.preparationRequest.value,null)
+  await f.state.confirmActivation();assert.equal(f.calls.length,4,'activation waits for the explicit pause response')
+  response.resolve(paused);await pausing
+  assert.equal(f.state.items.value.find(item=>item.rule.id===b.rule.id).rule.enabled,false)
+  assert.equal(f.state.pausingRule.value,'');assert.equal(f.calls.filter(call=>call.path.endsWith('/enabled')).length,1)
+})
+
+test('a late list read cannot undo an independent pause and failed pause evidence survives preparation polling',async t=>{
+  const f=mount(t);await flush();const a=automatic(),b=automatic();b.rule.id='00000000-0000-0000-0000-000000000002';b.rule.enabled=true;b.state='OBSERVING'
+  f.state.items.value=[a,b];beginRunning(f);await f.state.act(a,'observe');const request={...f.state.preparationRequest.value};f.state.pausePreparation()
+  const stale=deferred();f.expect('/rules',stale.promise,'GET');const listing=f.state.refresh()
+  const paused=structuredClone(b);paused.rule.enabled=false;paused.rule.revision=2;paused.state='PAUSED'
+  f.expect('/rules/'+b.rule.id+'/enabled',paused);await f.state.act(b,'enabled')
+  stale.resolve({mode:'RULES',items:[a,b]});await listing
+  assert.equal(f.state.items.value.find(item=>item.rule.id===b.rule.id).rule.enabled,false)
+  const other=structuredClone(b);other.rule.id='00000000-0000-0000-0000-000000000003';f.state.items.value.push(other)
+  f.expect('/rules/'+other.rule.id+'/enabled',new Error('lost pause response'));await f.state.act(other,'enabled')
+  f.expect(lookupPath(request),f.receipt(request),'GET');f.state.resumePreparation();await flush()
+  assert.match(f.state.ruleAlert(other),/lost pause response.*不会自动重试/)
+  assert.equal(f.state.preparationRequest.value.operationId,request.operationId);assert.equal(f.calls.filter(call=>call.path=== '/rules/'+other.rule.id+'/enabled').length,1)
+})
 
 test('real Vue preparation state accepts the initial plain request and polls serial GETs without refreshing the list',async t=>{
   const f=mount(t);await flush();f.state.items.value=[result()];const original=f.state.items.value
@@ -291,4 +370,40 @@ test('completed byte-bounded preparation displays all 66 videos in ten confirmat
   assert.match(text(f.render()),/当前预览 66 个媒体、10 组/);assert.match(text(f.render()),/确认启用自动上传/)
   assert.equal(f.state.preparationRequest.value,null);assert.equal(f.timers.size,0)
   assert.equal(f.calls.some(call=>call.path.endsWith('/enabled')||call.path.includes('/transfers/')),false)
+})
+
+test('leaving the rule page pauses preparation polling and returns to the original read-only operation',async t=>{
+  const f=mount(t);await flush();beginRunning(f);await f.state.act(result(),'observe')
+  const request={...f.state.preparationRequest.value};assert.equal(f.timers.size,1)
+  f.props.active=false;await flush();assert.equal(f.timers.size,0)
+  await f.advance(6000);assert.equal(f.calls.length,2);assert.equal(f.state.preparationRequest.value.operationId,request.operationId)
+  f.expect(lookupPath(request),f.receipt(request,'COMPLETED',result()),'GET');f.props.active=true;await flush()
+  assert.equal(f.state.preparationRequest.value,null);assert.equal(f.calls.filter(call=>call.options.method==='POST').length,1)
+})
+
+test('a preparation receipt arriving while hidden is retained without starting hidden polling',async t=>{
+  const f=mount(t);await flush();let release
+  f.expect('/rules/'+ID+'/preparations',new Promise(resolve=>release=resolve));const starting=f.state.act(result(),'observe')
+  const request={...f.state.preparationRequest.value};f.props.active=false;await flush()
+  release(f.receipt(request));await starting;assert.equal(f.state.preparationRequest.value.operationId,request.operationId);assert.equal(f.timers.size,0)
+  f.expect(lookupPath(request),f.receipt(request,'COMPLETED',result()),'GET');f.props.active=true;await flush()
+  assert.equal(f.state.preparationRequest.value,null);assert.equal(f.calls.filter(call=>call.options.method==='POST').length,1)
+})
+
+test('page visibility preserves an uncertain rule save and its exact frozen operation',async t=>{
+  const f=mount(t);await flush();f.state.edit(null);Object.assign(f.state.form,input())
+  f.expect('/rules',new Error('timeout'));await f.state.save();const operation=f.calls[1].options.body.operationId
+  f.props.active=false;await flush();assert.equal(f.state.uncertain.value,true);assert.equal(f.state.formOpen.value,true)
+  f.props.active=true;await flush();assert.equal(f.calls.length,2);assert.equal(f.state.form.name,'sample')
+  f.expect('/rules/by-operation/'+operation,result(),'GET');await f.state.lookup()
+  assert.equal(f.state.uncertain.value,false);assert.equal(f.calls.filter(call=>call.options.method==='POST').length,1)
+})
+
+test('manually stopped preparation is not silently resumed after leaving and returning',async t=>{
+  const f=mount(t);await flush();beginRunning(f);await f.state.act(result(),'observe');f.state.pausePreparation()
+  const request={...f.state.preparationRequest.value};f.props.active=false;await flush()
+  f.expect('/rules',{mode:'RULES',items:[result()]},'GET');f.props.active=true;await flush();await f.advance(4000)
+  assert.equal(f.state.preparationWaiting.value,false);assert.equal(f.state.preparationRequest.value.operationId,request.operationId);assert.equal(f.timers.size,0)
+  f.expect(lookupPath(request),f.receipt(request,'COMPLETED',result()),'GET');f.state.resumePreparation();await flush()
+  assert.equal(f.state.preparationRequest.value,null);assert.equal(f.calls.filter(call=>call.options.method==='POST').length,1)
 })

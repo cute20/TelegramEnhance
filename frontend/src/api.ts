@@ -1,3 +1,5 @@
+import { invalidateThumbnails } from './thumbnailMemory'
+
 export type ProxyType = 'DIRECT' | 'SOCKS5' | 'HTTP'
 export interface Settings {
   apiId: number
@@ -29,7 +31,8 @@ export interface Diagnostics {
   dpapi: string
   stage: string
 }
-export interface Bootstrap { stage: string; settings: Settings; telegram: TelegramStatus; diagnostics: Diagnostics }
+export interface TransferPreferences { defaultDownloadDirectory:string; downloadConcurrency:number }
+export interface Bootstrap { stage: string; settings: Settings; telegram: TelegramStatus; diagnostics: Diagnostics; transferPreferences?:TransferPreferences }
 
 // Read the per-process launch token, then remove the fragment before rendering.
 const incomingToken = new URLSearchParams(window.location.hash.slice(1)).get('token')
@@ -41,19 +44,33 @@ try {
 } catch { /* Initial tab still works when the browser blocks sessionStorage. */ }
 export const hasAppToken = Boolean(appToken)
 export function clearAppToken() {
+  if (appToken) invalidateThumbnails()
   appToken = ''
   try { sessionStorage.removeItem('telegram-workbench-token') } catch { /* Storage unavailable. */ }
 }
+// These writes can change indexed media or remove the backend's thumbnail files.
+// Metadata-only previews, reads, and transfer/rule writes keep reusable thumbnails.
+function changesThumbnails(path: string, method: string): boolean {
+  const route = path.split('?')[0]!.replace(/\/$/, '')
+  if (method === 'PUT' && route === '/settings/thumbnail-cache') return true
+  if (method !== 'POST') return false
+  return route === '/settings/thumbnail-cache/clear' || route === '/library/probe'
+    || route === '/library/import/posts' || /^\/library\/import\/all\/(?:start|step)$/.test(route)
+    || /^\/library\/posts\/[^/]+\/(?:refresh|comments)$/.test(route)
+}
 export class ApiError extends Error {
   readonly status: number
-  constructor(message: string, status: number) { super(message); this.name = 'ApiError'; this.status = status }
+  readonly code?: string
+  constructor(message: string, status: number, code?: string) { super(message); this.name = 'ApiError'; this.status = status; this.code = code }
 }
 export async function api<T>(path: string, options: { method?: string; body?: unknown; timeout?: number } = {}): Promise<T> {
   if (!appToken) throw new ApiError('请从项目启动脚本打开本机界面。', 401)
   const controller = new AbortController()
   const timer = window.setTimeout(() => controller.abort(), options.timeout ?? 35000)
-  const method = options.method ?? 'GET'
+  const method = (options.method ?? 'GET').toUpperCase()
   const mutation = !['GET', 'HEAD'].includes(method)
+  const invalidates = changesThumbnails(path, method)
+  if (invalidates) invalidateThumbnails()
   try {
     const response = await fetch(`/api${path}`, {
       method,
@@ -63,8 +80,9 @@ export async function api<T>(path: string, options: { method?: string; body?: un
     })
     if (!response.ok) {
       let message = `请求失败（HTTP ${response.status}）`
-      try { const error = await response.json() as { message?: unknown }; if (typeof error.message === 'string') message = error.message } catch { /* Keep HTTP error. */ }
-      throw new ApiError(message, response.status)
+      let code: string | undefined
+      try { const error = await response.json() as { message?: unknown; code?: unknown }; if (typeof error.message === 'string') message = error.message; if (typeof error.code === 'string') code = error.code } catch { /* Keep HTTP error. */ }
+      throw new ApiError(message, response.status, code)
     }
     if (response.status === 204) return undefined as T
     const body = await response.text()
@@ -73,5 +91,10 @@ export async function api<T>(path: string, options: { method?: string; body?: un
     if (error instanceof ApiError) throw error
     if (controller.signal.aborted) throw new Error('本机服务响应超时，请检查后台是否仍在运行后重试。')
     throw new Error('无法连接本机服务，请检查后台是否仍在运行。')
-  } finally { window.clearTimeout(timer) }
+  } finally {
+    window.clearTimeout(timer)
+    // Even a failed/unknown response may have committed. Also discard images loaded
+    // while the write was in flight, rather than restoring a pre-write generation.
+    if (invalidates) invalidateThumbnails()
+  }
 }

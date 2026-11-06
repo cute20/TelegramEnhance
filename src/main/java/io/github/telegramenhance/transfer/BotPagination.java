@@ -1,6 +1,7 @@
 package io.github.telegramenhance.transfer;
 
 import java.text.Normalizer;
+import java.math.BigInteger;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.LinkedHashSet;
@@ -11,18 +12,17 @@ import java.util.regex.Pattern;
 
 /** Conservative button advice only. This class never invokes a callback or treats silence as EOF. */
 public final class BotPagination {
-    private static final int MAX_COUNTER = 1_000_000;
-    private static final Pattern PAIR = Pattern.compile("(?:页码|頁碼|当前页|當前頁|page|group|batch|第)\\s*[:：]?\\s*(\\d{1,7})\\s*(?:页|頁|组|組|批)?\\s*(?:/|of)\\s*(\\d{1,7})(?!\\d)");
-    private static final Pattern CURRENT = Pattern.compile("(?:第\\s*(\\d{1,7})\\s*(?:页|頁|组|組|批)|(?:当前页|當前頁|当前组|當前組)\\s*[:：]?\\s*(\\d{1,7}))(?!\\d)");
-    private static final Pattern TOTAL = Pattern.compile("(?:共(?:收到|获取到|獲取到|有)?\\s*(\\d{1,7})\\s*(?:页|頁|组|組|批))");
-    private static final Pattern BUTTON_PAIR = Pattern.compile("(?<!\\d)(\\d{1,7})\\s*/\\s*(\\d{1,7})(?!\\d)");
-    private static final Pattern NUMBER = Pattern.compile("^(?:第\\s*)?(\\d{1,7})\\s*(?:页|頁)?$");
-    private static final Pattern MARKED_NUMBER = Pattern.compile("^[·•●\\[({（【「〈]\\s*(\\d{1,7})\\s*[·•●\\])}）】」〉]$");
-    private static final Pattern NON_PAGING = Pattern.compile("(?:文件[夹夾]?|資料夾)(?:详[情細]|詳情|列表)|\\bfolders?\\s+(?:details?|list)\\b|\\bfile\\s+details?\\b|\\d{1,7}\\s*[-–—~～至]\\s*\\d{1,7}\\s*/\\s*\\d{1,7}(?!\\d)");
+    private static final Pattern PAIR = Pattern.compile("(?:页码|頁碼|当前页|當前頁|page|group|batch|第)\\s*[:：]?\\s*(\\d+)\\s*(?:页|頁|组|組|批)?\\s*(?:/|of)\\s*(\\d+)(?!\\d)");
+    private static final Pattern CURRENT = Pattern.compile("(?:第\\s*(\\d+)\\s*(?:页|頁|组|組|批)|(?:当前页|當前頁|当前组|當前組)\\s*[:：]?\\s*(\\d+))(?!\\d)");
+    private static final Pattern TOTAL = Pattern.compile("(?:共(?:收到|获取到|獲取到|有)?\\s*(\\d+)\\s*(?:页|頁|组|組|批))");
+    private static final Pattern BUTTON_PAIR = Pattern.compile("(?<!\\d)(\\d+)\\s*/\\s*(\\d+)(?!\\d)");
+    private static final Pattern NUMBER = Pattern.compile("^(?:第\\s*)?(\\d+)\\s*(?:页|頁)?$");
+    private static final Pattern MARKED_NUMBER = Pattern.compile("^[·•●\\[({（【「〈]\\s*(\\d+)\\s*[·•●\\])}）】」〉]$");
+    private static final Pattern NON_PAGING = Pattern.compile("(?:文件[夹夾]?|資料夾)(?:详[情細]|詳情|列表)|\\bfolders?\\s+(?:details?|list)\\b|\\bfile\\s+details?\\b|\\d+\\s*[-–—~～至]\\s*\\d+\\s*/\\s*\\d+(?!\\d)");
     private static final Pattern FOLDER_END = Pattern.compile("(?:文件[夹夾]|資料夾|目录|目錄)\\s*(?:内容|內容|内文件|內文件|内全部文件|內全部文件|全部文件)?\\s*(?:已|已经|已經)?\\s*(?:全部)?\\s*(?:发送|發送|推送)\\s*(?:完毕|完畢|完成|结束|結束)");
     private static final Pattern BLOCKED = Pattern.compile("关闭|關閉|取消|退出|删除|刪除|收藏|分享|会员|會員|充值|付费|付費|支付|购买|購買|打赏|打賞|解锁|解鎖|广告|廣告|推广|推廣|点赞|點讚|关注|關注|投票|评分|評分|下载链接|下載連結|[❤♥♡👍❌✖✕]|(?<![a-z])(?:close|cancel|delete|remove|save|share|forward|bookmark|favourites?|favorites?|collect|subscribe|subscription|member|premium|pay|payment|buy|purchase|recharge|donate|ad|ads|advert|advertisement|advertising|promo|promotion|like|love|follow|vote|rating|start)(?![a-z])|download\\s+link");
     private static final Pattern PREVIOUS = Pattern.compile("上一[页頁组組批]|上[页頁组組]|前一[页頁组組批]|上\\s*\\d+\\s*[页頁]|返回|(?<![a-z])(?:previous|prev|back)(?![a-z])");
-    private static final Pattern WINDOW = Pattern.compile("下\\s*(?:[2-9]|[1-9]\\d{1,5})\\s*[页頁]|(?<![a-z])next\\s+(?:[2-9]|[1-9]\\d{1,5})\\s+pages?(?![a-z])");
+    private static final Pattern WINDOW = Pattern.compile("下\\s*(?:[2-9]|[1-9]\\d+)\\s*[页頁]|(?<![a-z])next\\s+(?:[2-9]|[1-9]\\d+)\\s+pages?(?![a-z])");
     private static final Pattern NEXT = Pattern.compile("下一[页頁组組批套辑輯集]|下[页頁组組批]|继续获取|繼續獲取|继续加载|繼續載入|(?<![a-z])next(?:\\s+(?:page|group|batch))?(?![a-z])");
     private static final Set<String> NEXT_ARROWS = Set.of("→", "➡", "➜", "➔", "▶", "▶▶", "»", "›", ">", ">>", "⏭", "⏩", "👉");
     private static final Set<String> PREVIOUS_ARROWS = Set.of("←", "⬅", "◀", "◀◀", "«", "‹", "<", "<<", "⏮", "⏪", "👈");
@@ -31,9 +31,15 @@ public final class BotPagination {
     private BotPagination() { }
 
     public record InputButton(String id, String text, boolean callback) { }
-    public record ButtonClassification(String id, String kind, Integer page) { }
-    public record Result(String status, Integer current, Integer total, String nextButtonId, List<ButtonClassification> buttons) {
+    public record ButtonClassification(String id, String kind, Integer page,
+            @com.fasterxml.jackson.annotation.JsonIgnore BigInteger exactPage) {
+        public ButtonClassification(String id,String kind,Integer page){this(id,kind,page,page==null?null:BigInteger.valueOf(page));}
+    }
+    public record Result(String status, Integer current, Integer total, String nextButtonId, List<ButtonClassification> buttons,
+            @com.fasterxml.jackson.annotation.JsonIgnore BigInteger exactCurrent,
+            @com.fasterxml.jackson.annotation.JsonIgnore BigInteger exactTotal) {
         public Result { buttons = List.copyOf(buttons); }
+        public Result(String status,Integer current,Integer total,String nextButtonId,List<ButtonClassification> buttons){this(status,current,total,nextButtonId,buttons,current==null?null:BigInteger.valueOf(current),total==null?null:BigInteger.valueOf(total));}
     }
 
     public static Result analyze(String text, List<InputButton> buttons) {
@@ -59,7 +65,7 @@ public final class BotPagination {
             var marked = MARKED_NUMBER.matcher(label);
             if (marked.matches()) counters.current(marked.group(1));
             String kind;
-            Integer page = page(label);
+            BigInteger page = page(label);
             if (!button.callback() || BLOCKED.matcher(label).find() || NON_PAGING.matcher(label).find()) kind = "UNSUPPORTED";
             else if (page != null) kind = "PAGE";
             else if (PREVIOUS.matcher(label).find() || PREVIOUS_ARROWS.contains(label)) kind = "PREVIOUS";
@@ -70,32 +76,32 @@ public final class BotPagination {
             if ("NEXT".equals(kind)) {
                 var target = BUTTON_PAIR.matcher(label);
                 while (target.find()) {
-                    Integer targetPage = positive(target.group(1)), targetTotal = positive(target.group(2));
-                    if (targetPage == null || targetTotal == null || targetPage > targetTotal) counters.conflict = true;
+                    BigInteger targetPage = positive(target.group(1)), targetTotal = positive(target.group(2));
+                    if (targetPage == null || targetTotal == null || targetPage.compareTo(targetTotal)>0) counters.conflict = true;
                     else {
                         if (page != null && !page.equals(targetPage)) counters.conflict = true;
                         page = targetPage;
                         counters.total(target.group(2));
-                        if (targetPage > 1) counters.current(Integer.toString(targetPage - 1));
+                        if (targetPage.compareTo(BigInteger.ONE)>0) counters.current(targetPage.subtract(BigInteger.ONE).toString());
                     }
                 }
             }
-            classified.add(new ButtonClassification(button.id(), kind, page));
+            classified.add(new ButtonClassification(button.id(), kind, display(page),page));
         }
 
-        Integer at = counters.current(), count = counters.total();
+        BigInteger at = counters.current(), count = counters.total();
         boolean explicitEnd = explicitEnd(body);
         boolean hasForward = classified.stream().anyMatch(button -> "NEXT".equals(button.kind()) || "WINDOW".equals(button.kind())
-                || "PAGE".equals(button.kind()) && at != null && button.page() > at);
-        if (at != null && count != null && at > count) counters.conflict = true;
-        if (count != null && classified.stream().anyMatch(button -> "PAGE".equals(button.kind()) && button.page() > count)) counters.conflict = true;
-        if (explicitEnd && (hasForward || at != null && count != null && at < count)) counters.conflict = true;
+                || "PAGE".equals(button.kind()) && at != null && button.exactPage().compareTo(at)>0);
+        if (at != null && count != null && at.compareTo(count)>0) counters.conflict = true;
+        if (count != null && classified.stream().anyMatch(button -> "PAGE".equals(button.kind()) && button.exactPage().compareTo(count)>0)) counters.conflict = true;
+        if (explicitEnd && (hasForward || at != null && count != null && at.compareTo(count)<0)) counters.conflict = true;
         if (at != null && at.equals(count) && hasForward) counters.conflict = true;
         if (counters.conflict) return result("UNKNOWN", at, count, null, classified);
         if (explicitEnd || at != null && at.equals(count)) return result("END", at, count, null, classified);
 
         if (at != null) {
-            var consecutive = classified.stream().filter(button -> "PAGE".equals(button.kind()) && button.page() == at + 1).toList();
+            var consecutive = classified.stream().filter(button -> "PAGE".equals(button.kind()) && button.exactPage().equals(at.add(BigInteger.ONE))).toList();
             if (consecutive.size() == 1) return result("MORE", at, count, consecutive.getFirst().id(), classified);
             if (consecutive.size() > 1) return result("UNKNOWN", at, count, null, classified);
         }
@@ -105,14 +111,17 @@ public final class BotPagination {
 
         // A numbered keyboard window is not a media page. Advance it only after reaching its final known page.
         var windows = classified.stream().filter(button -> "WINDOW".equals(button.kind())).toList();
-        boolean inaccessibleGap = at != null && classified.stream().anyMatch(button -> "PAGE".equals(button.kind()) && button.page() > at + 1);
+        boolean inaccessibleGap = at != null && classified.stream().anyMatch(button -> "PAGE".equals(button.kind()) && button.exactPage().compareTo(at.add(BigInteger.ONE))>0);
         if (windows.size() == 1 && at != null && !inaccessibleGap) return result("MORE", at, count, windows.getFirst().id(), classified);
         return result("UNKNOWN", at, count, null, classified);
     }
 
-    private static Result result(String state, Integer current, Integer total, String next, List<ButtonClassification> buttons) {
-        return new Result(state, current, total, next, buttons);
+    private static Result result(String state, BigInteger current, BigInteger total, String next, List<ButtonClassification> buttons) {
+        return new Result(state, display(current), display(total), next, buttons,current,total);
     }
+    // The existing optional display counters keep their wire shape. Navigation never
+    // depends on whether a bot's exact count fits that legacy display representation.
+    private static Integer display(BigInteger value){return value!=null&&value.bitLength()<32?value.intValue():null;}
     private static boolean explicitEnd(String body) {
         return explicitEnd(body, END, false) || explicitEnd(body, FOLDER_END, true);
     }
@@ -136,23 +145,23 @@ public final class BotPagination {
         return Normalizer.normalize(value, Normalizer.Form.NFKC).toLowerCase(Locale.ROOT)
                 .replace("\uFE0E", "").replace("\uFE0F", "").replace("\u200B", "").replace("\u200D", "").strip();
     }
-    private static Integer page(String label) {
+    private static BigInteger page(String label) {
         var plain = NUMBER.matcher(label);
         if (plain.matches()) return positive(plain.group(1));
         var marked = MARKED_NUMBER.matcher(label);
         return marked.matches() ? positive(marked.group(1)) : null;
     }
-    private static Integer positive(String text) {
-        try { int value = Integer.parseInt(text); return value > 0 && value <= MAX_COUNTER ? value : null; }
+    private static BigInteger positive(String text) {
+        try { var value = new BigInteger(text); return value.signum()>0 ? value : null; }
         catch (NumberFormatException ignored) { return null; }
     }
     private static final class Counters {
-        final Set<Integer> current = new LinkedHashSet<>(), total = new LinkedHashSet<>();
+        final Set<BigInteger> current = new LinkedHashSet<>(), total = new LinkedHashSet<>();
         boolean conflict;
         void current(String text) { var value = positive(text); if (value == null) conflict = true; else { current.add(value); if (current.size() > 1) conflict = true; } }
         void total(String text) { var value = positive(text); if (value == null) conflict = true; else { total.add(value); if (total.size() > 1) conflict = true; } }
         void pair(String at, String count) { current(at); total(count); }
-        Integer current() { return current.size() == 1 ? current.iterator().next() : null; }
-        Integer total() { return total.size() == 1 ? total.iterator().next() : null; }
+        BigInteger current() { return current.size() == 1 ? current.iterator().next() : null; }
+        BigInteger total() { return total.size() == 1 ? total.iterator().next() : null; }
     }
 }

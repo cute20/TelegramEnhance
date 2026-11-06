@@ -6,7 +6,7 @@ import {validTask,taskLabels,type DownloadTask} from '../downloadTasks'
 import {validRuleDownload,ruleDownloadLabels,validRuleFilePage,type RuleDownloadTask,type RuleFileSource,type RuleFileEntry,type RuleFileTotals} from '../ruleDownloadTasks'
 import CompactRecord from './CompactRecord.vue'
 import InfiniteLoad from './InfiniteLoad.vue'
-const props=defineProps<{authorized:boolean;available:boolean;accountId:string|null;active?:boolean;refreshVersion?:number}>()
+const props=defineProps<{authorized:boolean;available:boolean;accountId:string|null;active?:boolean;refreshVersion?:number;focusId?:string}>()
 const emit=defineEmits<{accessError:[cause:ApiError];count:[value:number]}>()
 const groups=ref<RuleDownloadTask[]>([]),error=ref(''),loading=ref(false),busy=ref(''),uncertain=ref<string[]>([])
 const members=ref<Record<string,DownloadTask[]>>({}),offsets=ref<Record<string,number>>({}),more=ref<Record<string,boolean>>({}),memberErrors=ref<Record<string,string>>({}),memberBusy=ref('')
@@ -104,9 +104,9 @@ async function load(sourceGroup?:string){
   try{
     await Promise.allSettled([...fileReads.values(),...(memberRead?[memberRead]:[])])
     if(!alive())return
-    const result=await api<{items:RuleDownloadTask[]}>('/transfers/download/rule-tasks')
+    const result=props.focusId?{items:[await api<RuleDownloadTask>('/transfers/download/rule-tasks/'+encodeURIComponent(props.focusId))]}:await api<{items:RuleDownloadTask[]}>('/transfers/download/rule-tasks')
     if(!alive())return
-    if(!Array.isArray(result.items)||result.items.length>20||result.items.some(g=>!validRuleDownload(g))||new Set(result.items.map(g=>g.id)).size!==result.items.length)throw new Error('规则下载汇总无法确认，请刷新。')
+    if(!Array.isArray(result.items)||result.items.some(g=>!validRuleDownload(g)||props.focusId&&g.id!==props.focusId)||new Set(result.items.map(g=>g.id)).size!==result.items.length)throw new Error('规则下载汇总无法确认，请刷新。')
     const taskReads=new Map<string,DownloadTask>()
     async function readTask(id:string,ruleId:string){
       if(!alive())return null
@@ -236,7 +236,7 @@ async function action(group:RuleDownloadTask,task:DownloadTask,verb:'pause'|'res
   }catch(cause){if(current(request,account)){uncertain.value=[...uncertain.value,group.id];error.value=(cause instanceof Error?cause.message:'操作未完成。')+' 请刷新任务核对，不会自动重试。';access(cause)}}
   finally{if(request===generation&&account===props.accountId)busy.value='';if(queued&&ready())void load();else schedule()}
 }
-watch([()=>props.authorized,()=>props.accountId],()=>{
+watch([()=>props.authorized,()=>props.accountId,()=>props.focusId],()=>{
   generation++;fileEpoch++;stop();hasListed.value=false;groups.value=[];members.value={};offsets.value={};more.value={};memberErrors.value={};memberBusy.value='';busy.value='';loading.value=false;error.value='';uncertain.value=[];files.value={};opened.value={};sourceOpen.value={};staleSources.value={};refreshingFiles.value='';emit('count',0)
   queued=ready();if(!pending&&ready())void load()
 },{immediate:true})
@@ -262,7 +262,7 @@ onBeforeUnmount(()=>{disposed=true;generation++;fileEpoch++;stop()})
   <div class="rule-download-tasks">
     <p v-if="error" class="notice warning" role="alert">{{error}}</p>
     <p v-if="loading&&!groups.length" class="rule-loading" role="status">正在读取规则下载…</p>
-    <CompactRecord v-for="group in groups" :key="group.id" class="rule-download-task" :title="group.name" :description="`${group.channelTitle} · 已保存 ${group.completed}/${group.total} · 主帖附件 ${group.mainTotal} · 评论媒体 ${group.commentTotal} · ${formatMediaBytes(group.totalBytes)}`" :status="ruleDownloadLabels[group.state]" :tone="group.state==='FAILED'?'warning':['RUNNING','QUEUED','PAUSING'].includes(group.state)?'active':'neutral'" :timestamp="group.updatedAt" :default-expanded="false" :active="active" @toggle.capture="openFiles(group,$event)">
+    <CompactRecord v-for="group in groups" :key="group.id" class="rule-download-task" :title="group.name" :description="`${group.channelTitle} · 已保存 ${group.completed}/${group.total} · 主帖附件 ${group.mainTotal} · 评论媒体 ${group.commentTotal} · ${formatMediaBytes(group.totalBytes)}`" :status="ruleDownloadLabels[group.state]" :tone="group.state==='FAILED'?'warning':['RUNNING','QUEUED','PAUSING'].includes(group.state)?'active':'neutral'" :timestamp="group.updatedAt" :default-expanded="!!focusId" :active="active" @toggle.capture="openFiles(group,$event)">
       <dl class="rule-task-facts"><dt>保存目录</dt><dd><code>{{group.targetDirectory}}</code></dd><dt>执行时段</dt><dd>{{group.window.mode==='ALL_DAY'?'全天':`${group.window.start}—${group.window.end}`}} · 北京时间</dd><dt>累计下载</dt><dd>{{group.completed}} / {{group.total}} 个媒体<span v-if="group.duplicates"> · 重复媒体 {{group.duplicates}}</span><span v-if="group.failedTasks"> · {{group.failedTasks}} 批需要处理</span></dd></dl>
       <div class="rule-detail-toolbar"><button class="btn" :disabled="refreshingRange||refreshingFiles===group.id||fileSources.some(source=>fileState(group.id,source).busy)||!ready()" @click="refreshFiles(group)">刷新明细</button></div>
       <details v-for="source in displaySources" :key="source" class="rule-source-files" :open="sourceIsOpen(group.id,source)" @toggle="setSourceOpen(group.id,source,$event)">

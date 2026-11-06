@@ -4,6 +4,7 @@ import io.github.telegramenhance.library.ResourceModels.Post;
 import io.github.telegramenhance.library.ResourceModels.MessageRef;
 import io.github.telegramenhance.storage.Database;
 import io.github.telegramenhance.storage.DownloadSettings;
+import io.github.telegramenhance.downloadrules.DownloadRulePolicy;
 import io.github.telegramenhance.transfer.DownloadModels.*;
 import io.github.telegramenhance.transfer.DownloadBatchModels.BatchStatus;
 import io.github.telegramenhance.transfer.DownloadBatchModels.TaskSummary;
@@ -12,6 +13,7 @@ import java.nio.file.Path;
 import java.sql.Connection;
 import java.sql.ResultSet;
 import java.sql.SQLException;
+import java.time.Clock;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
@@ -20,10 +22,44 @@ import tools.jackson.databind.json.JsonMapper;
 
 @Repository
 public final class DownloadRepository {
+    private static final long MAX_RETRY_TIME=8_640_000_000_000_000L;
     private final Database database; private final JsonMapper json = JsonMapper.builder().build();
+    private final Clock clock;
+    private final DownloadRulePolicy retryPolicy;
+    @org.springframework.beans.factory.annotation.Autowired
     public DownloadRepository(Database database) {
-        this.database = database;
-        database.write(c -> { update(c, "UPDATE download_tasks SET state='PAUSED',pause_requested=1,error_message=?,updated_at=? WHERE state IN ('QUEUED','RUNNING')", "应用已重启，请核对后继续未完成项", now()); return null; });
+        this(database,Clock.systemUTC());
+    }
+    public DownloadRepository(Database database,Clock clock){
+        this.database=database;this.clock=java.util.Objects.requireNonNull(clock);this.retryPolicy=new DownloadRulePolicy(database,clock);
+        database.write(c->{
+            update(c,"""
+                UPDATE download_tasks AS t SET state='QUEUED',updated_at=? WHERE state='RUNNING' AND pause_requested=0
+                  AND EXISTS(SELECT 1 FROM download_task_retries r WHERE r.task_id=t.task_id AND r.account_id=t.account_id)
+                  AND NOT EXISTS(SELECT 1 FROM download_task_deletions d WHERE d.task_id=t.task_id AND d.account_id=t.account_id)
+                  AND NOT EXISTS(SELECT 1 FROM download_rule_tasks b WHERE b.task_id=t.task_id AND b.account_id=t.account_id AND b.held=1)
+                """,now());
+            update(c,"""
+                UPDATE download_tasks AS t SET state='PAUSED',pause_requested=1,error_message=?,updated_at=? WHERE state IN ('QUEUED','RUNNING')
+                  AND (pause_requested=1 OR NOT EXISTS(SELECT 1 FROM download_task_retries r WHERE r.task_id=t.task_id AND r.account_id=t.account_id)
+                    OR EXISTS(SELECT 1 FROM download_task_deletions d WHERE d.task_id=t.task_id AND d.account_id=t.account_id)
+                    OR EXISTS(SELECT 1 FROM download_rule_tasks b WHERE b.task_id=t.task_id AND b.account_id=t.account_id AND b.held=1))
+                ""","应用已重启，请核对后继续未完成项",now());
+            update(c,"""
+                DELETE FROM download_task_retries WHERE NOT EXISTS(SELECT 1 FROM download_tasks t
+                  WHERE t.task_id=download_task_retries.task_id AND t.account_id=download_task_retries.account_id
+                    AND t.state IN ('QUEUED','RUNNING') AND t.pause_requested=0
+                    AND NOT EXISTS(SELECT 1 FROM download_task_deletions d WHERE d.task_id=t.task_id AND d.account_id=t.account_id)
+                    AND NOT EXISTS(SELECT 1 FROM download_rule_tasks b WHERE b.task_id=t.task_id AND b.account_id=t.account_id AND b.held=1))
+                """);
+            var pending=new ArrayList<String[]>();
+            try(var q=c.prepareStatement("SELECT t.account_id,t.task_id FROM download_tasks t JOIN download_task_retries r ON r.task_id=t.task_id AND r.account_id=t.account_id WHERE t.state='QUEUED' AND t.pause_requested=0");var rows=q.executeQuery()){
+                while(rows.next())pending.add(new String[]{rows.getString(1),rows.getString(2)});
+            }
+            for(var ref:pending)try{retryPolicy.beforeItem(task(c,ref[0],ref[1]));}
+                catch(DownloadRulePolicy.Blocked blocked){pauseRejectedRetry(c,ref[0],ref[1],blocked.reason());}
+            return null;
+        });
     }
     public Task byOperation(String account, String operation) { return database.read(c -> {
         try (var s = c.prepareStatement("SELECT task_id FROM download_tasks WHERE account_id=? AND operation_id=?")) {
@@ -63,10 +99,11 @@ public final class DownloadRepository {
             return task(c, account, id);
     }
     public DownloadBatchModels.Receipt createBatch(String account,String operation,String fingerprint,DownloadBatchModels.Snapshot snapshot,Path root,List<DownloadBatchModels.Job> jobs){
-        if(jobs==null||jobs.isEmpty()||jobs.size()>29||snapshot.postCount()<1||snapshot.postCount()>20||!DownloadPaths.key(root).equals(DownloadPaths.key(Path.of(snapshot.targetDirectory()))))throw new IllegalArgumentException("批量下载清单无效。");
+        if(snapshot==null||jobs==null||jobs.isEmpty()||snapshot.postCount()<1||!DownloadPaths.key(root).equals(DownloadPaths.key(Path.of(snapshot.targetDirectory()))))throw new IllegalArgumentException("批量下载清单无效。");
+        var dates=DownloadDateRange.parse(snapshot.startDate(),snapshot.endDate());
         var keys=new java.util.HashSet<String>();int total=0;long bytes=0;
-        for(var job:jobs){if(!account.equals(job.post().accountId())||job.files().isEmpty()||job.files().size()>100)throw new IllegalArgumentException("批量主帖或媒体数量无效。");for(var file:job.files()){if(!keys.add(file.media().key())||file.size()<=0)throw new IllegalArgumentException("批量清单包含重复或无效媒体。");total++;bytes=Math.addExact(bytes,file.size());}}
-        if(total>1000||total!=snapshot.total()||bytes!=snapshot.totalBytes())throw new IllegalArgumentException("批量媒体统计不符。");
+        for(var job:jobs){if(!account.equals(job.post().accountId())||job.files().isEmpty()||job.files().size()>100||!Boolean.TRUE.equals(dates.matches(job.post().publishedAt())))throw new IllegalArgumentException("批量主帖、日期范围或媒体分片无效。");for(var file:job.files()){if(!keys.add(file.media().key())||file.size()<=0)throw new IllegalArgumentException("批量清单包含重复或无效媒体。");total=Math.incrementExact(total);bytes=Math.addExact(bytes,file.size());}}
+        if(total!=snapshot.total()||bytes!=snapshot.totalBytes())throw new IllegalArgumentException("批量媒体统计不符。");
         return database.write(c->{var previous=batchByOperation(c,account,operation,fingerprint);if(previous!=null)return previous;
             String policy=DownloadSettings.readPolicy(c);
             String id=UUID.randomUUID().toString();long stamp=now();update(c,"INSERT INTO download_batches VALUES(?,?,?,?,?,?)",id,account,operation,fingerprint,encode(snapshot),stamp);
@@ -98,7 +135,7 @@ public final class DownloadRepository {
     }
     public BatchStatus pauseBatch(String account,String id){return pauseBatch(account,id,()->{});}
     public BatchStatus pauseBatch(String account,String id,Runnable guard){return database.write(c->{
-        guard.run();var before=batchStatus(c,account,id);if(!before.canPause()){guard.run();return before;}
+        guard.run();var before=batchStatus(c,account,id);clearBatchRetries(c,account,id);if(!before.canPause()){guard.run();return before;}
         update(c,"""
             UPDATE download_tasks SET pause_requested=1,state=CASE WHEN state='RUNNING' THEN 'RUNNING' ELSE 'PAUSED' END,updated_at=?
             WHERE account_id=? AND (state='QUEUED' OR (state='RUNNING' AND pause_requested=0))
@@ -112,6 +149,12 @@ public final class DownloadRepository {
         guard.run();var before=batchStatus(c,account,id);
         if("PAUSING".equals(before.state()))throw new IllegalArgumentException("本批仍在收尾暂停，请等待当前任务停稳后再继续");
         if(!before.canResume()){guard.run();return before;}
+        update(c,"""
+            DELETE FROM download_task_retries WHERE account_id=?
+              AND task_id IN (SELECT t.task_id FROM download_tasks t JOIN download_batch_tasks bt ON bt.task_id=t.task_id
+                  JOIN download_batches b ON b.id=bt.batch_id AND b.account_id=t.account_id
+                  WHERE t.account_id=? AND b.account_id=? AND b.id=? AND t.state IN ('PAUSED','FAILED'))
+            """,account,account,account,id);
         // Identify resumable children before changing their states. Success rows, their evidence,
         // byte checkpoints and output plans are never reset by this control operation.
         update(c,"""
@@ -173,7 +216,7 @@ public final class DownloadRepository {
             }
         }
         if(snapshot==null)throw new IllegalArgumentException("当前账号中没有这条批量下载任务");
-        if(tasks.isEmpty()||tasks.size()>29)throw invalidBatch();
+        if(tasks.isEmpty())throw invalidBatch();
         int total=0,completedTasks=0,runningTasks=0,queuedTasks=0,pausedTasks=0,failedTasks=0;
         long bytes=0,completed=0,skipped=0,duplicates=0,downloaded=0,written=0;boolean pausing=false;
         try{
@@ -200,35 +243,65 @@ public final class DownloadRepository {
     private DownloadBatchModels.Snapshot batchSnapshot(String value){
         try{
             var snapshot=decode(value,DownloadBatchModels.Snapshot.class);
-            if(snapshot==null||snapshot.total()<1||snapshot.total()>1000||snapshot.totalBytes()<1||snapshot.postCount()<1||snapshot.postCount()>20)throw invalidBatch();
+            if(snapshot==null||snapshot.total()<1||snapshot.totalBytes()<1||snapshot.postCount()<1)throw invalidBatch();
+            DownloadDateRange.parse(snapshot.startDate(),snapshot.endDate());
             return snapshot;
         }catch(RuntimeException invalid){throw invalidBatch();}
     }
     private static IllegalStateException invalidBatch(){return new IllegalStateException("批量下载的冻结清单、子任务或完成证据不一致，请核对已有任务");}
-    public Task task(String account, String id) { return database.read(c -> task(c, account, id)); }
+    public Task task(String account, String id) { return database.read(c -> { requireVisible(c,account,id);return task(c, account, id); }); }
+    /** Keep immutable snapshots, operation receipts, and successful history while removing the task from active views. */
+    public boolean deletePausedStandalone(String account,String id,Runnable guard){return database.write(c->{
+        guard.run();var task=task(c,account,id);
+        if(deleted(c,account,id)){clearRetry(c,account,id);guard.run();return true;}
+        if(!"PAUSED".equals(task.state()))throw new IllegalArgumentException("仅能删除已暂停且停稳的独立下载任务，请先暂停任务");
+        try(var q=c.prepareStatement("SELECT 1 FROM download_batch_tasks WHERE task_id=? UNION ALL SELECT 1 FROM download_rule_tasks WHERE task_id=? LIMIT 1")){
+            q.setString(1,id);q.setString(2,id);try(var rows=q.executeQuery()){if(rows.next())throw new IllegalArgumentException("批量或规则下载的子任务不能单独删除，请在对应父任务中处理");}}
+        long stamp=now();update(c,"INSERT INTO download_task_deletions(task_id,account_id,deleted_at,cleanup_pending) VALUES(?,?,?,1)",id,account,stamp);
+        clearRetry(c,account,id);
+        update(c,"UPDATE download_tasks SET pause_requested=1,updated_at=? WHERE task_id=? AND account_id=?",stamp,id,account);
+        guard.run();return false;
+    });}
+    public List<Task> deletionCleanup(String account,int limit){return database.read(c->{
+        var ids=new ArrayList<String>();try(var q=c.prepareStatement("SELECT d.task_id FROM download_task_deletions d JOIN download_tasks t ON t.task_id=d.task_id AND t.account_id=d.account_id WHERE d.account_id=? AND d.cleanup_pending=1 ORDER BY d.deleted_at,d.task_id LIMIT ?")){
+            q.setString(1,account);q.setInt(2,limit);try(var rows=q.executeQuery()){while(rows.next())ids.add(rows.getString(1));}}
+        var result=new ArrayList<Task>();for(var id:ids)result.add(task(c,account,id));return List.copyOf(result);
+    });}
+    public void deletionCleaned(String account,String id){database.write(c->{update(c,"UPDATE download_task_deletions SET cleanup_pending=0 WHERE account_id=? AND task_id=?",account,id);return null;});}
+    private static boolean deleted(Connection c,String account,String id)throws SQLException{
+        try(var q=c.prepareStatement("SELECT 1 FROM download_task_deletions WHERE account_id=? AND task_id=?")){q.setString(1,account);q.setString(2,id);try(var row=q.executeQuery()){return row.next();}}
+    }
+    private static void requireVisible(Connection c,String account,String id)throws SQLException{if(deleted(c,account,id))throw new IllegalArgumentException("下载任务已删除");}
     public List<Task> list(String account, int limit, int offset) { return list(account,limit,offset,false); }
     public List<Task> list(String account, int limit, int offset, boolean standalone) { return database.read(c -> {
         var ids = new ArrayList<String>();
-        try (var q = c.prepareStatement("SELECT task_id FROM download_tasks t WHERE account_id=?" + (standalone ? " AND NOT EXISTS(SELECT 1 FROM download_rule_tasks b WHERE b.task_id=t.task_id AND b.account_id=t.account_id)" : "") + " ORDER BY created_at DESC,task_id LIMIT ? OFFSET ?")) {
+        try (var q = c.prepareStatement("SELECT task_id FROM download_tasks t WHERE account_id=? AND NOT EXISTS(SELECT 1 FROM download_task_deletions d WHERE d.task_id=t.task_id AND d.account_id=t.account_id)" + (standalone ? " AND NOT EXISTS(SELECT 1 FROM download_rule_tasks b WHERE b.task_id=t.task_id AND b.account_id=t.account_id)" : "") + " ORDER BY created_at DESC,task_id LIMIT ? OFFSET ?")) {
             q.setString(1, account); q.setInt(2, limit); q.setInt(3, offset); try (var r = q.executeQuery()) { while (r.next()) ids.add(r.getString(1)); }
         }
         var tasks = new ArrayList<Task>(); for (var id : ids) tasks.add(task(c, account, id)); return List.copyOf(tasks);
     }); }
     public Task next(String account) { return database.write(c -> {
-        String id = null; try (var q = c.prepareStatement("SELECT task_id FROM download_tasks WHERE account_id=? AND state='QUEUED' AND pause_requested=0 ORDER BY created_at,task_id LIMIT 1")) {
-            q.setString(1, account); try (var r = q.executeQuery()) { if (r.next()) id = r.getString(1); }
+        for(;;){
+        String id = null; try (var q = c.prepareStatement("SELECT task_id FROM download_tasks t WHERE account_id=? AND state='QUEUED' AND pause_requested=0 AND NOT EXISTS(SELECT 1 FROM download_task_deletions d WHERE d.task_id=t.task_id AND d.account_id=t.account_id) AND NOT EXISTS(SELECT 1 FROM download_task_retries r WHERE r.task_id=t.task_id AND r.account_id=t.account_id AND r.next_attempt_at>?) ORDER BY created_at,task_id LIMIT 1")) {
+            q.setString(1, account);q.setLong(2,now()); try (var r = q.executeQuery()) { if (r.next()) id = r.getString(1); }
         }
         if (id == null) return null;
+        if(retry(c,account,id)!=null)try{retryPolicy.beforeItem(task(c,account,id));}
+            catch(DownloadRulePolicy.Blocked blocked){pauseRejectedRetry(c,account,id,blocked.reason());continue;}
         update(c, "UPDATE download_tasks SET state='RUNNING',updated_at=? WHERE task_id=?", now(), id); return task(c, account, id);
+        }
     }); }
     public Task pause(String account, String id) { return database.write(c -> {
-        var task = task(c, account, id); if (task.state().equals("COMPLETED")) return task;
+        requireVisible(c,account,id);
+        var task = task(c, account, id);clearRetry(c,account,id); if (task.state().equals("COMPLETED")) return task;
         update(c, "UPDATE download_tasks SET pause_requested=1,state=CASE WHEN state='RUNNING' THEN 'RUNNING' ELSE 'PAUSED' END,updated_at=? WHERE task_id=? AND account_id=?", now(), id, account);
         return task(c, account, id);
     }); }
     public Task resume(String account, String id) { return database.write(c -> {
+        requireVisible(c,account,id);
         var task = task(c, account, id);
         if (!List.of("PAUSED", "FAILED").contains(task.state())) throw new IllegalArgumentException("任务当前不能继续，请刷新状态");
+        clearRetry(c,account,id);
         update(c, "UPDATE download_tasks SET state='QUEUED',pause_requested=0,error_message=NULL,updated_at=? WHERE task_id=? AND account_id=?", now(), id, account);
         update(c, "UPDATE download_items SET error_message=NULL WHERE task_id=?", id); return task(c, account, id);
     }); }
@@ -237,9 +310,58 @@ public final class DownloadRepository {
             q.setString(1, account); q.setString(2, id); try (var r = q.executeQuery()) { return !r.next() || r.getBoolean(1) || !"RUNNING".equals(r.getString(2)); }
         }
     }); }
-    public void finishState(String account, String id, String state, String error) { database.write(c -> {
-        update(c, "UPDATE download_tasks SET state=?,error_message=?,updated_at=?,pause_requested=CASE WHEN ?='COMPLETED' THEN 0 ELSE pause_requested END WHERE account_id=? AND task_id=?", state, error, now(), state, account, id); return null;
+    public void finishState(String account, String id, String state, String error) {
+        if(!List.of("PAUSED","FAILED","COMPLETED").contains(state))throw new IllegalArgumentException("下载结束状态无效");
+        database.write(c -> {
+        var before=task(c,account,id);clearRetry(c,account,id);if("COMPLETED".equals(before.state())||deleted(c,account,id))return null;
+        // A pause stops unfinished work; a fully published success receipt stays completed.
+        boolean finished="COMPLETED".equals(state)&&before.items().stream().allMatch(item->List.of("COMPLETED","SKIPPED_HISTORY").contains(item.state()));
+        boolean halted=!finished&&(before.pauseRequested()||held(c,account,id));
+        String actual=halted?"PAUSED":state;String message=halted&&before.error()!=null?before.error():error;
+        update(c, "UPDATE download_tasks SET state=?,error_message=?,updated_at=?,pause_requested=? WHERE account_id=? AND task_id=?",actual,message,now(),halted?1:"COMPLETED".equals(actual)?0:before.pauseRequested()?1:0,account,id);return null;
     }); }
+    /** Requeue an interrupted native read without resetting verified bytes, file identities, or output plans. */
+    public boolean scheduleRetry(String account,String id,String reason,long minimumDelayMillis){return database.write(c->{
+        var before=task(c,account,id);
+        if(!"RUNNING".equals(before.state()))return false;
+        if(before.pauseRequested()||deleted(c,account,id)||held(c,account,id)){
+            clearRetry(c,account,id);update(c,"UPDATE download_tasks SET state='PAUSED',pause_requested=1,error_message=?,updated_at=? WHERE account_id=? AND task_id=?",before.error()!=null?before.error():reason,now(),account,id);return false;
+        }
+        // The rule check shares the same local transaction as enqueueing; no parent change can race it.
+        try{retryPolicy.beforeItem(before);}catch(DownloadRulePolicy.Blocked blocked){pauseRejectedRetry(c,account,id,blocked.reason());return false;}
+        var previous=retry(c,account,id);int attempt=previous==null?1:previous.attempt()==Integer.MAX_VALUE?Integer.MAX_VALUE:previous.attempt()+1;
+        long backoff=attempt==1?300_000L:1_800_000L;long delay=Math.max(backoff,Math.max(0,minimumDelayMillis));long stamp=now();
+        long next=stamp>=MAX_RETRY_TIME||delay>=MAX_RETRY_TIME-stamp?MAX_RETRY_TIME:stamp+delay;
+        update(c,"INSERT INTO download_task_retries(task_id,account_id,attempt,next_attempt_at) VALUES(?,?,?,?) ON CONFLICT(task_id) DO UPDATE SET attempt=excluded.attempt,next_attempt_at=excluded.next_attempt_at",id,account,attempt,next);
+        update(c,"UPDATE download_tasks SET state='QUEUED',pause_requested=0,error_message=?,updated_at=? WHERE account_id=? AND task_id=?",reason,stamp,account,id);return true;
+    });}
+    public Retry retry(String account,String id){return database.read(c->{
+        try(var q=c.prepareStatement("SELECT 1 FROM download_tasks t WHERE t.account_id=? AND t.task_id=? AND t.state='QUEUED' AND t.pause_requested=0 AND NOT EXISTS(SELECT 1 FROM download_task_deletions d WHERE d.task_id=t.task_id AND d.account_id=t.account_id)")){
+            q.setString(1,account);q.setString(2,id);try(var row=q.executeQuery()){return row.next()?retry(c,account,id):null;}}
+    });}
+    private static Retry retry(Connection c,String account,String id)throws SQLException{
+        try(var q=c.prepareStatement("SELECT attempt,next_attempt_at FROM download_task_retries WHERE account_id=? AND task_id=?")){q.setString(1,account);q.setString(2,id);try(var row=q.executeQuery()){return row.next()?new Retry(row.getInt(1),row.getLong(2)):null;}}
+    }
+    private static boolean held(Connection c,String account,String id)throws SQLException{
+        try(var q=c.prepareStatement("SELECT 1 FROM download_rule_tasks WHERE account_id=? AND task_id=? AND held=1")){q.setString(1,account);q.setString(2,id);try(var row=q.executeQuery()){return row.next();}}
+    }
+    private static void clearRetry(Connection c,String account,String id)throws SQLException{update(c,"DELETE FROM download_task_retries WHERE account_id=? AND task_id=?",account,id);}
+    private void pauseRejectedRetry(Connection c,String account,String id,String reason)throws SQLException{
+        clearRetry(c,account,id);update(c,"UPDATE download_tasks SET state='PAUSED',pause_requested=1,error_message=?,updated_at=? WHERE account_id=? AND task_id=?",reason,now(),account,id);
+    }
+    private static void clearBatchRetries(Connection c,String account,String id)throws SQLException{
+        update(c,"DELETE FROM download_task_retries WHERE account_id=? AND task_id IN (SELECT bt.task_id FROM download_batch_tasks bt JOIN download_batches b ON b.id=bt.batch_id WHERE b.account_id=? AND b.id=?)",account,account,id);
+    }
+    /** Native polling must never overwrite the writer's forced prefix, hash or output plan. */
+    public void networkProgress(String account,String taskId,String itemId,long downloaded){database.write(c->{
+        update(c,"UPDATE download_items SET state='DOWNLOADING',downloaded_bytes=MIN(size,MAX(written_bytes,?)) WHERE task_id=? AND item_id=? AND state NOT IN ('COMPLETED','SKIPPED_HISTORY') AND task_id IN(SELECT task_id FROM download_tasks WHERE account_id=?)",downloaded,taskId,itemId,account);
+        update(c,"UPDATE download_tasks SET updated_at=? WHERE task_id=?",now(),taskId);return null;
+    });}
+    /** Force-confirmed target bytes retain any native progress observed in this attempt. */
+    public void streamCheckpoint(String account,String taskId,String itemId,long written,String hash,String relativeFile){database.write(c->{
+        update(c,"UPDATE download_items SET state='DOWNLOADING',downloaded_bytes=MIN(size,MAX(downloaded_bytes,?)),written_bytes=?,sha256=?,relative_file=?,error_message=NULL WHERE task_id=? AND item_id=? AND state NOT IN ('COMPLETED','SKIPPED_HISTORY') AND task_id IN(SELECT task_id FROM download_tasks WHERE account_id=?)",written,written,hash,relativeFile,taskId,itemId,account);
+        update(c,"UPDATE download_tasks SET updated_at=? WHERE task_id=?",now(),taskId);return null;
+    });}
     public void progress(String account, String taskId, String itemId, String state, long downloaded, long written, String hash, String relativeFile) { database.write(c -> {
         update(c, "UPDATE download_items SET state=?,downloaded_bytes=?,written_bytes=?,sha256=?,relative_file=?,error_message=NULL WHERE task_id=? AND item_id=? AND state NOT IN ('COMPLETED','SKIPPED_HISTORY') AND task_id IN(SELECT task_id FROM download_tasks WHERE account_id=?)", state, downloaded, written, hash, relativeFile, taskId, itemId, account);
         update(c, "UPDATE download_tasks SET updated_at=? WHERE task_id=?", now(), taskId); return null;
@@ -339,11 +461,6 @@ public final class DownloadRepository {
         }
     }); }
     public void own(String account, String uniqueId, int fileId) { database.write(c -> {
-        try (var q = c.prepareStatement("SELECT COUNT(*),SUM(CASE WHEN unique_id=? THEN 1 ELSE 0 END) FROM download_cache_owned WHERE account_id=?")) {
-            q.setString(1, uniqueId); q.setString(2, account); try (var r = q.executeQuery()) {
-                if (r.next() && r.getLong(1) >= 128 && r.getLong(2) == 0) throw new IllegalArgumentException("待核对的原文件缓存较多，请先继续或核对已有任务");
-            }
-        }
         update(c, "INSERT INTO download_cache_owned VALUES(?,?,?) ON CONFLICT(account_id,unique_id) DO UPDATE SET file_id=excluded.file_id", account, uniqueId, fileId); return null;
     }); }
     public boolean owned(String account, String uniqueId) { return database.read(c -> {
@@ -352,20 +469,29 @@ public final class DownloadRepository {
         }
     }); }
     public List<CacheOwner> owners(String account, int limit) { return database.read(c -> {
-        var items = new ArrayList<CacheOwner>(); try (var q = c.prepareStatement("SELECT unique_id,file_id FROM download_cache_owned WHERE account_id=? ORDER BY rowid LIMIT ?")) {
+        var items = new ArrayList<CacheOwner>(); try (var q = c.prepareStatement("""
+            SELECT o.unique_id,o.file_id FROM download_cache_owned o WHERE o.account_id=?
+            ORDER BY EXISTS(SELECT 1 FROM download_items i JOIN download_tasks t ON t.task_id=i.task_id
+                WHERE t.account_id=o.account_id AND i.unique_id=o.unique_id AND i.state NOT IN ('COMPLETED','SKIPPED_HISTORY')
+                AND NOT EXISTS(SELECT 1 FROM download_task_deletions d WHERE d.task_id=t.task_id AND d.account_id=t.account_id)),o.rowid LIMIT ?
+            """)) {
             q.setString(1, account); q.setInt(2, limit); try (var r = q.executeQuery()) { while (r.next()) items.add(new CacheOwner(account, r.getString(1), r.getInt(2))); }
         } return List.copyOf(items);
     }); }
     public boolean pendingReference(String account, String uniqueId) { return database.read(c -> {
-        try (var q = c.prepareStatement("SELECT 1 FROM download_items i JOIN download_tasks t ON t.task_id=i.task_id WHERE t.account_id=? AND i.unique_id=? AND i.state NOT IN ('COMPLETED','SKIPPED_HISTORY') LIMIT 1")) {
+        try (var q = c.prepareStatement("SELECT 1 FROM download_items i JOIN download_tasks t ON t.task_id=i.task_id WHERE t.account_id=? AND i.unique_id=? AND i.state NOT IN ('COMPLETED','SKIPPED_HISTORY') AND NOT EXISTS(SELECT 1 FROM download_task_deletions d WHERE d.task_id=t.task_id AND d.account_id=t.account_id) LIMIT 1")) {
             q.setString(1, account); q.setString(2, uniqueId); try (var r = q.executeQuery()) { return r.next(); }
         }
     }); }
+    public boolean deletedReference(String account,String uniqueId){return database.read(c->{
+        try(var q=c.prepareStatement("SELECT 1 FROM download_task_deletions d JOIN download_tasks t ON t.task_id=d.task_id AND t.account_id=d.account_id JOIN download_items i ON i.task_id=t.task_id WHERE d.account_id=? AND i.unique_id=? LIMIT 1")){
+            q.setString(1,account);q.setString(2,uniqueId);try(var rows=q.executeQuery()){return rows.next();}}
+    });}
     public void released(String account, String uniqueId) { database.write(c -> { update(c, "DELETE FROM download_cache_owned WHERE account_id=? AND unique_id=?", account, uniqueId); return null; }); }
     public TaskView view(Task task) {
         Path directory = Path.of(task.targetRoot()).resolve(task.relativeDirectory());
         var items = task.items().stream().map(i -> new ItemView(i.id(), i.file().fileName(), i.file().media().type(), i.state(), i.file().size(), i.downloadedBytes(), i.writtenBytes(), i.state().equals("SKIPPED_HISTORY") ? null : i.plan()==null?directory.resolve(i.relativeFile()).toString():Path.of(task.targetRoot()).resolve(i.plan().relativePath()).toString(), i.error(), i.history(),i.file().media().message().link(),i.plan()==null?null:i.plan().duplicate(),i.plan()==null||i.plan().manifestRelative()==null?null:Path.of(task.targetRoot()).resolve(i.plan().manifestRelative()).toString())).toList();
-        return new TaskView(task.id(), task.post().title(), task.post().channelTitle(), task.state(), task.pauseRequested(), directory.toString(), "OBSERVED_SELECTION", items.size(), items.stream().filter(i -> i.state().equals("COMPLETED")).count(), items.stream().filter(i -> i.state().equals("SKIPPED_HISTORY")).count(), items.stream().mapToLong(ItemView::size).sum(), task.error(), task.createdAt(), task.updatedAt(), items,task.duplicatePolicy(),items.stream().filter(i->i.state().equals("COMPLETED")&&i.duplicate()!=null).count(),Path.of(task.targetRoot(),"重复媒体").toString(),automation(task));
+        return new TaskView(task.id(), task.post().title(), task.post().channelTitle(), task.state(), task.pauseRequested(), directory.toString(), "OBSERVED_SELECTION", items.size(), items.stream().filter(i -> i.state().equals("COMPLETED")).count(), items.stream().filter(i -> i.state().equals("SKIPPED_HISTORY")).count(), items.stream().mapToLong(ItemView::size).sum(), task.error(), task.createdAt(), task.updatedAt(), items,task.duplicatePolicy(),items.stream().filter(i->i.state().equals("COMPLETED")&&i.duplicate()!=null).count(),Path.of(task.targetRoot(),"重复媒体").toString(),automation(task),"QUEUED".equals(task.state())&&!task.pauseRequested()?retry(task.accountId(),task.id()):null);
     }
     private Automation automation(Task task){return database.read(c->{try(var q=c.prepareStatement("SELECT b.rule_id,b.rule_version,b.snapshot_json,b.manual,b.held,r.enabled,r.current_version FROM download_rule_tasks b JOIN download_rules r ON r.id=b.rule_id AND r.account_id=b.account_id WHERE b.task_id=? AND b.account_id=? LIMIT 1")){q.setString(1,task.id());q.setString(2,task.accountId());try(var r=q.executeQuery()){if(!r.next())return null;var frozen=decode(r.getString(3),io.github.telegramenhance.downloadrules.DownloadRuleModels.Input.class);return new Automation(r.getString(1),r.getLong(2),frozen.name(),r.getBoolean(4),r.getBoolean(5),r.getBoolean(6),r.getLong(7),frozen.window());}}});}
     private Task task(Connection c, String account, String id) throws SQLException {
@@ -389,6 +515,6 @@ public final class DownloadRepository {
     }
     private String encode(Object value) { return json.writeValueAsString(value); }
     private <T> T decode(String value, Class<T> type) { return json.readValue(value, type); }
-    private static long now() { return System.currentTimeMillis(); }
+    private long now() { return clock.millis(); }
     private static void update(Connection c, String sql, Object... values) throws SQLException { try (var q = c.prepareStatement(sql)) { for (int i = 0; i < values.length; i++) q.setObject(i + 1, values[i]); q.executeUpdate(); } }
 }

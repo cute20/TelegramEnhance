@@ -57,6 +57,17 @@ function mount(t,initial=group()){
 function nodes(node){if(!node||typeof node!=='object')return[];if(Array.isArray(node))return node.flatMap(nodes);const children=Array.isArray(node.children)?node.children:node.children&&typeof node.children==='object'?Object.values(node.children).filter(child=>typeof child==='function').flatMap(slot=>slot()):[];return[node,...nodes(children)]}
 const text=node=>typeof node==='string'?node:Array.isArray(node)?node.map(text).join(''):node&&typeof node==='object'?text(node.children):''
 
+test('the complete rule-download summary accepts more than twenty groups and unbounded cumulative media counts',async t=>{
+  const f=mount(t);await flush()
+  const values=Array.from({length:25},(_,i)=>group({id:'00000000-0000-0000-0000-'+String(i+100).padStart(12,'0'),taskCount:1001,total:100_001,completed:0,duplicates:0,mainTotal:0,commentTotal:100_001,totalBytes:100_001*37,downloadedBytes:0,writtenBytes:0}))
+  f.expect(BASE,{items:values});await f.state.load()
+  assert.equal(f.state.groups.value.length,25);assert.equal(f.state.error.value,'');assert.equal(f.state.groups.value.at(-1).total,100_001)
+  assert.equal(nodes(f.render()).filter(node=>node.type?.__name==='CompactRecord').length,25)
+  const files=page();files.totals={...files.totals,total:100_001,completed:100_001,totalBytes:100_001*37,downloadedBytes:100_001*37,writtenBytes:100_001*37}
+  assert.equal(ruleModule.validRuleFilePage(files,ID,'COMMENT'),true,'one fifty-file response does not cap its cumulative total')
+  assert.equal(f.calls.length,2);assert.ok(f.calls.every(call=>(call.options.method??'GET')==='GET'))
+})
+
 test('rule record activity follows its panel and every existing or newly returned rule starts closed',async t=>{
   const f=mount(t);await flush();let records=nodes(f.render()).filter(node=>node.type?.__name==='CompactRecord')
   assert.equal(records.length,1);assert.equal(records[0].props.active,true);assert.equal(records[0].props['default-expanded'],false)

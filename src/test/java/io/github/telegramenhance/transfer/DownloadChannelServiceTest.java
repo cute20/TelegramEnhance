@@ -14,8 +14,21 @@ import java.util.concurrent.*;
 import java.util.concurrent.atomic.*;
 import java.util.function.Supplier;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
+import java.nio.file.Path;
+import io.github.telegramenhance.config.AppPaths;
+import io.github.telegramenhance.storage.Database;
 
 class DownloadChannelServiceTest {
+    @TempDir Path directory;
+    @Test void realPauseGateKeepsAnAdmittedPageAndPinsItsRevisionUntilExplicitResume()throws Exception{try(var f=new Fixture();var db=new Database(new AppPaths(directory))){
+        var history=new ScanTaskStore(db,f.telegram,f.clock::get);f.service.trackScans(history);f.pages.add(page(List.of(candidate(100),candidate(90)),null,true));var initial=f.start("","");String historyId=history.list().getFirst().id();
+        f.duringPost=()->assertEquals("PAUSING",history.action(historyId,"pause").state());var checkpoint=await(f.service.next(initial.id(),new Position(initial.revision())));f.duringPost=()->{};
+        assertEquals(2,checkpoint.revision());assertEquals(1,checkpoint.scanned());assertEquals("PAUSED",history.list().getFirst().state());assertThrows(ScanTaskStore.Paused.class,()->f.service.next(initial.id(),new Position(checkpoint.revision())));
+        f.clock.addAndGet(900000);for(int n=0;n<9;n++)f.start("","");assertEquals(checkpoint.revision(),f.service.get(initial.id()).revision(),"paused previews survive TTL and replacement pressure");
+        history.action(historyId,"resume");assertEquals(checkpoint.revision(),f.service.get(initial.id()).revision());var done=await(f.service.next(initial.id(),new Position(checkpoint.revision())));assertTrue(done.exhausted());assertEquals(2,done.scanned());
+        f.clock.addAndGet(600000);f.service.snapshot();assertEquals("COMPLETED",history.list().stream().filter(row->row.id().equals(historyId)).findFirst().orElseThrow().state());verify(f.channels,times(1)).downloadHistoryPage("-1001",null);
+    }}
     @Test void batchSelectionRejectsStalePositionsForeignKeysAndPartialAlbums()throws Exception{try(var f=new Fixture()){
         f.pages.add(page(List.of(candidate(100)),null,true));var v=f.start("","");v=await(f.service.next(v.id(),new Position(1)));assertEquals(v,f.service.selection(v.id(),v.revision(),List.of(v.rows().getFirst().post().key())));String id=v.id();long revision=v.revision();assertThrows(IllegalArgumentException.class,()->f.service.selection(id,revision-1,List.of("1:-1001:100")));assertThrows(IllegalArgumentException.class,()->f.service.selection(id,revision,List.of("foreign")));assertThrows(IllegalArgumentException.class,()->f.service.selection(id,revision,List.of("1:-1001:100","1:-1001:100")));
     }try(var f=new Fixture()){
@@ -69,14 +82,50 @@ class DownloadChannelServiceTest {
     @Test void invalidFiltersNeverReachNativeAndIdlePreviewsExpireAndEvictBoundedly()throws Exception{try(var f=new Fixture()){
         assertThrows(IllegalArgumentException.class,()->f.service.start(new Input("-1001","tag!","")));verifyNoInteractions(f.channels);var first=f.start("","");for(int i=0;i<8;i++)f.start("","");assertThrows(IllegalArgumentException.class,()->f.service.get(first.id()));var last=f.start("","");f.clock.addAndGet(600000);assertThrows(IllegalArgumentException.class,()->f.service.get(last.id()));
     }}
-    @Test void previewResultLimitPausesRatherThanInventingHistoryEof()throws Exception{try(var f=new Fixture()){
-        AtomicInteger batch=new AtomicInteger();when(f.channels.downloadHistoryPage(anyString(),nullable(String.class))).thenAnswer(i->{int n=batch.getAndIncrement();var list=new ArrayList<Candidate>();for(int j=0;j<10;j++)list.add(candidate(10000-n*10-j));return page(list,cursor(9991-n*10),false);});var v=f.start("","");for(int i=0;i<200;i++)v=await(f.service.next(v.id(),new Position(v.revision())));assertEquals(200,v.rows().size());assertTrue(v.limitReached());assertFalse(v.exhausted());assertFalse(v.canContinue());
+    @Test void moreThan200MatchingPostsRemainSelectableWithoutInventingHistoryEof()throws Exception{try(var f=new Fixture()){
+        AtomicInteger batch=new AtomicInteger();when(f.channels.downloadHistoryPage(anyString(),nullable(String.class))).thenAnswer(i->{int n=batch.getAndIncrement();var list=new ArrayList<Candidate>();for(int j=0;j<10;j++)list.add(candidate(10000-n*10-j));return page(list,cursor(9991-n*10),false);});var v=f.start("","");for(int i=0;i<211;i++)v=await(f.service.next(v.id(),new Position(v.revision())));assertEquals(211,v.rows().size());assertFalse(v.limitReached());assertFalse(v.exhausted());assertTrue(v.canContinue());
+        assertEquals(v,f.service.selection(v.id(),v.revision(),v.rows().stream().map(row->row.post().key()).toList()));
     }}
     @Test void queueRejectionClearsBusyAndDoesNotAdvanceTheCheckpoint()throws Exception{try(var f=new Fixture()){
         var work=mock(ResourceService.class);when(work.readWork(any())).thenAnswer(i->CompletableFuture.supplyAsync((Supplier<?>)i.getArgument(0),Runnable::run));var service=new DownloadChannelService(work,f.channels,f.posts,f.telegram,f.clock::get);var v=await(service.start(new Input("-1001","","")));doThrow(new IllegalArgumentException("queue full")).when(work).readWork(any());assertThrows(IllegalArgumentException.class,()->service.next(v.id(),new Position(1)));assertFalse(service.get(v.id()).busy());assertEquals(1,service.get(v.id()).revision());
     }}
-    @Test void longEmptyHistoryStopsAtTheStepBudgetWithoutFalseEof()throws Exception{try(var f=new Fixture()){
-        AtomicInteger batch=new AtomicInteger();when(f.channels.downloadHistoryPage(anyString(),nullable(String.class))).thenAnswer(i->page(List.of(),cursor(10000-batch.getAndIncrement()),false));var v=f.start("","");for(int i=0;i<2000;i++)v=await(f.service.next(v.id(),new Position(v.revision())));assertEquals(0,v.scanned());assertTrue(v.limitReached());assertFalse(v.exhausted());assertFalse(v.canContinue());verifyNoInteractions(f.posts);
+    @Test void moreThan2000BoundedHistoryStepsCanContinueUntilConfirmedEof()throws Exception{try(var f=new Fixture()){
+        AtomicInteger batch=new AtomicInteger();when(f.channels.downloadHistoryPage(anyString(),nullable(String.class))).thenAnswer(i->page(List.of(),cursor(10000-batch.getAndIncrement()),false));var v=f.start("","");for(int i=0;i<2001;i++)v=await(f.service.next(v.id(),new Position(v.revision())));assertEquals(0,v.scanned());assertFalse(v.limitReached());assertFalse(v.exhausted());assertTrue(v.canContinue());verifyNoInteractions(f.posts);
+        when(f.channels.downloadHistoryPage(anyString(),nullable(String.class))).thenReturn(page(List.of(),null,true));v=await(f.service.next(v.id(),new Position(v.revision())));assertTrue(v.exhausted());assertFalse(v.canContinue());
+    }}
+    static long time(String value){return java.time.Instant.parse(value).toEpochMilli();}
+    @Test void publicationDateRangeIncludesBothBeijingCalendarDaysAndKeepsUnknownDatesUnverified()throws Exception{try(var f=new Fixture()){
+        f.pages.add(page(java.util.stream.LongStream.rangeClosed(100,104).mapToObj(DownloadChannelServiceTest::candidate).toList(),null,true));
+        f.values.put("100",post(100,"text").withPublishedAt(time("2026-10-31T15:59:59.999Z")));
+        f.values.put("101",post(101,"text").withPublishedAt(time("2026-10-31T16:00:00Z")));
+        f.values.put("102",post(102,"text").withPublishedAt(time("2026-11-02T15:59:59.999Z")));
+        f.values.put("103",post(103,"text").withPublishedAt(time("2026-11-02T16:00:00Z")));
+        f.values.put("104",post(104,"text"));
+        var v=await(f.service.start(new Input("-1001","","","2026-11-01","2026-11-02")));
+        while(v.canContinue())v=await(f.service.next(v.id(),new Position(v.revision())));
+        assertEquals(5,v.scanned());assertEquals(2,v.matched());assertEquals(1,v.unverified());
+        assertEquals(List.of("101","102","104"),v.rows().stream().map(row->row.post().mainMessageId()).toList());
+        assertEquals("UNVERIFIED",v.rows().getLast().match());assertTrue(v.warnings().stream().anyMatch(warning->warning.contains("发布时间未知")));
+        assertEquals("2026-11-01",f.service.get(v.id()).startDate());assertEquals("2026-11-02",f.service.get(v.id()).endDate());
+        String id=v.id();long revision=v.revision();assertThrows(IllegalArgumentException.class,()->f.service.selection(id,revision,List.of("1:-1001:104")));
+        assertEquals(v,f.service.selection(id,revision,List.of("1:-1001:101","1:-1001:102")));
+    }}
+    @Test void eitherDateBoundaryCanBeOpenAndNoDateFilterKeepsLegacyUnknownTimeBehavior()throws Exception{
+        for(var input:List.of(new Input("-1001","","","2026-11-01",null),new Input("-1001","","",null,"2026-11-01"),new Input("-1001","",""," ","")))try(var f=new Fixture()){
+            f.pages.add(page(List.of(candidate(100),candidate(99),candidate(98)),null,true));
+            f.values.put("100",post(100,"text").withPublishedAt(time("2026-10-31T15:59:59Z")));
+            f.values.put("99",post(99,"text").withPublishedAt(time("2026-11-01T16:00:00Z")));
+            var v=await(f.service.start(input));while(v.canContinue())v=await(f.service.next(v.id(),new Position(v.revision())));
+            if(input.startDate()!=null&&!input.startDate().isBlank()){assertEquals(1,v.matched());assertEquals("99",v.rows().getFirst().post().mainMessageId());assertEquals(1,v.unverified());}
+            else if(input.endDate()!=null&&!input.endDate().isBlank()){assertEquals(1,v.matched());assertEquals("100",v.rows().getFirst().post().mainMessageId());assertEquals(1,v.unverified());}
+            else{assertEquals(3,v.matched());assertEquals(0,v.unverified());assertNull(v.startDate());assertNull(v.endDate());}
+        }
+    }
+    @Test void invalidOrReversedDateRangesAreRejectedBeforeAccountOrNativeReads(){try(var f=new Fixture()){
+        for(String date:List.of("2026-02-29","2026-13-01","2026-1-01","2026-01-01T00:00:00","2026-01-01 "))
+            assertThrows(IllegalArgumentException.class,()->f.service.start(new Input("-1001","","",date,null)));
+        assertThrows(IllegalArgumentException.class,()->f.service.start(new Input("-1001","","","2026-11-02","2026-11-01")));
+        verifyNoInteractions(f.channels,f.posts,f.telegram);
     }}
     static final class Fixture implements AutoCloseable{
         final TelegramService telegram=mock(TelegramService.class);final ResourceRepository repository=mock(ResourceRepository.class);final ResourceReader posts=mock(ResourceReader.class);final ChannelReader channels=mock(ChannelReader.class);final AtomicReference<String> account=new AtomicReference<>("1");final AtomicLong generation=new AtomicLong(1),clock=new AtomicLong(1000000);final ResourceService work;final DownloadChannelService service;final Queue<HistoryPage> pages=new ArrayDeque<>();final Map<String,Post> values=new HashMap<>();boolean failPost;Runnable duringPost=()->{};

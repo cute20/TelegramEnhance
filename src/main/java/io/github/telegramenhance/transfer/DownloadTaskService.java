@@ -31,23 +31,28 @@ public final class DownloadTaskService {
     }
     public CompletableFuture<TaskView> create(Create input) {
         if (input == null || !uuid(input.operationId()) || !uuid(input.sourceId()) || input.mediaKeys() == null
-                || input.mediaKeys().isEmpty() || input.mediaKeys().size() > 100 || input.mediaKeys().stream().anyMatch(k -> k == null || k.isBlank() || k.length() > 512)
-                || new java.util.HashSet<>(input.mediaKeys()).size() != input.mediaKeys().size()) throw new IllegalArgumentException("请选择1至100个已加载媒体并填写保存目录");
+                || input.mediaKeys().isEmpty() || input.mediaKeys().stream().anyMatch(k -> k == null || k.isBlank() || k.length() > 512)
+                || new java.util.HashSet<>(input.mediaKeys()).size() != input.mediaKeys().size()) throw new CreationRejectedException("请选择已加载媒体并填写保存目录");
         String account = telegram.accountId(); long generation = telegram.sessionGeneration();
-        var root = paths.root(input.targetDirectory());
+        var root = CreationRejectedException.prepare(() -> paths.root(input.targetDirectory()));
         String fingerprint = DownloadPaths.hash(input.sourceId() + "\n" + String.join("\n", input.mediaKeys()) + "\n" + Boolean.TRUE.equals(input.includeMain()) + "\n" + DownloadPaths.key(root));
         Task existing = repository.byOperation(account, input.operationId());
         if (existing != null) {
             if (!existing.fingerprint().equals(fingerprint)) throw new IllegalArgumentException("同一操作的参数已变化，请重新创建任务");
             current(account, generation); return CompletableFuture.completedFuture(repository.view(existing));
         }
-        return sources.selection(input.sourceId(), List.copyOf(input.mediaKeys()), Boolean.TRUE.equals(input.includeMain())).thenCompose(selection -> work.readWork(() -> {
-            current(account, generation);
-            if (!account.equals(selection.post().accountId())) throw new IllegalArgumentException("来源账号已变化，请重新预览");
-            var frozen = files.freeze(selection.post(), selection.media(), generation); current(account, generation);
-            Task task = repository.create(account, input.operationId(), fingerprint, selection.post(), root, frozen);
-            current(account, generation); return repository.view(task);
-        }));
+        return CreationRejectedException.preparation(() -> sources.selection(input.sourceId(), List.copyOf(input.mediaKeys()), Boolean.TRUE.equals(input.includeMain())))
+                .thenCompose(selection -> CreationRejectedException.preparation(() -> work.readWork(() -> {
+                    current(account, generation);
+                    if (!account.equals(selection.post().accountId())) throw new IllegalArgumentException("来源账号已变化，请重新预览");
+                    var frozen = files.freeze(selection.post(), selection.media(), generation); current(account, generation);
+                    return frozen;
+                })).thenApply(frozen -> {
+                    current(account, generation);
+                    // A commit or a later context failure is uncertain, never a preparation refusal.
+                    Task task = repository.create(account, input.operationId(), fingerprint, selection.post(), root, frozen);
+                    current(account, generation); return repository.view(task);
+                }));
     }
     public record Listing(List<TaskView> items, String workerWarning) { public Listing { items = List.copyOf(items); } }
     public Listing list(int limit, int offset) {
@@ -64,6 +69,12 @@ public final class DownloadTaskService {
     public TaskView task(String id) { validateId(id); String account = telegram.accountId(); var task = repository.view(repository.task(account, id)); if (!account.equals(telegram.accountId())) throw new IllegalArgumentException("账号已变化"); return task; }
     public TaskView pause(String id) { validateId(id); String account = telegram.accountId(); long generation=telegram.sessionGeneration(); boolean bound=rules!=null&&rules.manualPause(account,id,()->current(account,generation)); var task = repository.view(bound?repository.task(account,id):repository.pause(account, id)); if (!account.equals(telegram.accountId())) throw new IllegalArgumentException("账号已变化，请刷新任务"); return task; }
     public TaskView resume(String id) { validateId(id); String account = telegram.accountId(); long generation=telegram.sessionGeneration(); boolean bound=rules!=null&&rules.manualResume(account,id,()->current(account,generation)); var task = repository.view(bound?repository.task(account,id):repository.resume(account, id)); if (!account.equals(telegram.accountId())) throw new IllegalArgumentException("账号已变化，请刷新任务"); return task; }
+    public record Deleted(String id,boolean alreadyDeleted) { }
+    public Deleted delete(String id){
+        validateId(id);String account=telegram.accountId();long generation=telegram.sessionGeneration();
+        boolean already=repository.deletePausedStandalone(account,id,()->current(account,generation));
+        current(account,generation);return new Deleted(id,already);
+    }
     public record Lookup(TaskView task) { }
     public record RepairedLinks(int processed,int updated,int remaining) { }
     public CompletableFuture<RepairedLinks> repairSourceLinks(){String account=telegram.accountId();long generation=telegram.sessionGeneration();return work.readWork(()->{

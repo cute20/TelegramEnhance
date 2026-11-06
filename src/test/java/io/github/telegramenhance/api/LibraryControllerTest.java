@@ -11,6 +11,16 @@ import org.junit.jupiter.api.Test;
 import org.springframework.test.web.servlet.setup.MockMvcBuilders;
 
 class LibraryControllerTest {
+    @Test void explicitSortAndCatalogAggregatesReachTheClient() throws Exception {
+        var service = mock(LibraryCatalogService.class);
+        when(service.catalog(null, "", "", 20, 0, "title-asc")).thenReturn(new CatalogPage(List.of(), 20, 0, 0, 0, 0, false,
+                "INDEXED_ONLY", new Facets(List.of(new TagFacet("旅行", 3)))));
+        MockMvcBuilders.standaloneSetup(new LibraryController(service)).setControllerAdvice(new ApiErrors()).build()
+                .perform(get("/api/library/catalog").param("sort", "title-asc"))
+                .andExpect(status().isOk()).andExpect(jsonPath("$.facets.tags[0].tag").value("旅行"))
+                .andExpect(jsonPath("$.facets.tags[0].count").value(3));
+        verify(service).catalog(null, "", "", 20, 0, "title-asc");
+    }
     @Test void catalogUsesBoundedDefaults() throws Exception {
         var service = mock(LibraryCatalogService.class);
         when(service.catalog(null, "", "", 20, 0)).thenReturn(new CatalogPage(List.of(), 20, 0, 0, 0, 0, false, "INDEXED_ONLY"));

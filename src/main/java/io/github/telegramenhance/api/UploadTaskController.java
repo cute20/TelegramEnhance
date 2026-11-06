@@ -18,6 +18,7 @@ public final class UploadTaskController {
     @GetMapping public UploadTaskService.Listing list(@RequestParam(defaultValue="20")int limit,@RequestParam(defaultValue="0")int offset){return tasks.list(limit,offset);}
     @GetMapping("/by-operation/{operation}")public UploadTaskService.Lookup lookup(@PathVariable String operation){return tasks.lookup(operation);}
     @GetMapping("/{id}")public View task(@PathVariable String id){return tasks.task(id);}
+    @GetMapping("/{id}/progress")public io.github.telegramenhance.transfer.UploadTaskModels.Progress progress(@PathVariable String id){return tasks.progress(id);}
     @PostMapping("/{id}/{action}")public View action(@PathVariable String id,@PathVariable String action){return tasks.action(id,action);}
     @PostMapping("/{id}/recover-pending")public CompletableFuture<View> recoverPending(@PathVariable String id){return tasks.recoverPending(id);}
     @PostMapping("/{id}/groups/{groupId}/accept-document")public View acceptDocument(@PathVariable String id,@PathVariable String groupId){return tasks.acceptDocument(id,groupId);}

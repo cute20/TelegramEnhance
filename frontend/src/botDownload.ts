@@ -1,4 +1,16 @@
 import type { Media } from './library'
+import { validTask, type DownloadTask } from './downloadTasks.ts'
+
+export interface BotPreparation {
+  operationId: string; state: 'PREPARING' | 'READY' | 'FAILED'; task: DownloadTask | null; error: string | null
+}
+export function validBotPreparation(value: unknown): value is BotPreparation {
+  if (!value || typeof value !== 'object') return false
+  const receipt = value as BotPreparation
+  return botUuid(receipt.operationId) && (receipt.state === 'PREPARING' ? receipt.task === null && receipt.error === null
+    : receipt.state === 'READY' ? validTask(receipt.task) && receipt.error === null
+      : receipt.state === 'FAILED' && receipt.task === null && typeof receipt.error === 'string' && !!receipt.error.trim() && receipt.error.length <= 8192)
+}
 
 export type BotMedia = Omit<Media, 'source'> & { source: 'BOT' }
 export interface BotButton {
@@ -65,9 +77,9 @@ export function validBotPreview(value: unknown): value is BotPreview {
     || !['READY', 'WAITING', 'NEEDS_REVIEW'].includes(view.state) || !['MORE', 'END', 'UNKNOWN'].includes(view.paginationStatus)
     || view.warning !== null && !text(view.warning, 8192, true) || view.historyEnd !== true || view.nextHistoryCursor !== null
     || view.wait != null && !validBotWait(view.wait)
-    || !Array.isArray(view.messages) || view.messages.length > 50 || !Array.isArray(view.media) || view.media.length > 500
+    || !Array.isArray(view.messages) || view.messages.length > 50 || !Array.isArray(view.media)
     || !view.media.every(item => mediaValid(item, bot.chatId)) || new Set(view.media.map(item => item.key)).size !== view.media.length) return false
-  if ([view.currentPage, view.totalPages].some(value => value !== null && (!count(value, 1_000_000) || value < 1))
+  if ([view.currentPage, view.totalPages].some(value => value !== null && (!count(value, Number.MAX_SAFE_INTEGER) || value < 1))
     || view.currentPage !== null && view.totalPages !== null && view.currentPage > view.totalPages) return false
   const media = new Map(view.media.map(item => [item.key, item])), buttons = new Map<string, BotButton>(), messageIds = new Set<string>()
   let totalButtons = 0

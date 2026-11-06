@@ -29,5 +29,16 @@ class UploadGroupByteLimitTest {
         assertThrows(IllegalArgumentException.class,()->UploadPreviewService.groups(List.of(file("huge.mp4","VIDEO",8*GIB+1)),"EMPTY"));
         assertThrows(IllegalArgumentException.class,()->UploadPreviewService.groups(List.of(file("huge.mp4","VIDEO",Long.MAX_VALUE)),"EMPTY"));
     }
+    @Test void customGroupSizesKeepTheByteBoundaryAndAnimationsRemainSingle(){
+        var files=new ArrayList<FileVersion>();
+        for(int i=1;i<=5;i++)files.add(file("clip"+i+".mp4","VIDEO",3*GIB));
+        for(int i=1;i<=5;i++)files.add(file("doc"+i+".txt","DOCUMENT",1));
+        files.add(file("a.gif","ANIMATION",1));files.add(file("b.gif","ANIMATION",1));
+        var groups=UploadPreviewService.groups(files,"FILENAME",3);
+        assertEquals(List.of(2,2,1,3,2,1,1),groups.stream().map(g->g.files().size()).toList());
+        assertTrue(groups.stream().allMatch(g->g.files().size()<=3&&g.files().stream().mapToLong(Member::size).sum()<=8*GIB));
+        assertThrows(IllegalArgumentException.class,()->UploadPreviewService.groups(files,"EMPTY",0));
+        assertThrows(IllegalArgumentException.class,()->UploadPreviewService.groups(files,"EMPTY",11));
+    }
     private static FileVersion file(String path,String type,long size){return new FileVersion(path,type,size,1,"synthetic-file-id","0".repeat(64));}
 }

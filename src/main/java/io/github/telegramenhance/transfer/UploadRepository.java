@@ -57,7 +57,39 @@ public final class UploadRepository {
         storeEvent(c,g.id(),acceptance(receipt));apply(c,account,id,g.id());
         sql(c,"UPDATE upload_tasks SET state='QUEUED',stop_requested=1,error=NULL,updated_at=? WHERE id=?",now(),id);return task(c,account,id);
     });}
-    public Task cancel(String account,String id){return database.write(c->{var t=task(c,account,id);if(!List.of("READY","PAUSED").contains(t.state())||t.groups().stream().anyMatch(g->!g.state().equals("READY")))throw new IllegalArgumentException("仅能取消尚未发起发送的任务，已有发送意图必须先核对");sql(c,"UPDATE upload_tasks SET state='CANCELLED',stop_requested=1,updated_at=? WHERE id=?",now(),id);sql(c,"DELETE FROM upload_claims WHERE task_id=?",id);return task(c,account,id);});}
+    public Task cancel(String account,String id){return database.write(c->{
+        var t=task(c,account,id);if(t.state().equals("CANCELLED"))return t;
+        if(!List.of("READY","PAUSED").contains(t.state())||!neverSent(c,t))throw new IllegalArgumentException("仅能取消尚未发起发送的任务，已有发送意图必须先核对");
+        sql(c,"UPDATE upload_tasks SET state='CANCELLED',stop_requested=1,updated_at=? WHERE id=?",now(),id);
+        // A task from an older enable may still be active when the rule is reauthorized.
+        // Freeze the authorization at cancellation, rather than at task creation, so the
+        // next monitor tick cannot recreate content that the user has just cancelled.
+        sql(c,"""
+            UPDATE auto_upload_bindings SET pause_kind='CANCELLED_REVISION:' ||
+              (SELECT r.revision FROM auto_rules r WHERE r.id=auto_upload_bindings.rule_id AND r.account_id=auto_upload_bindings.account_id)
+            WHERE task_id=? AND account_id=?
+            """,id,account);
+        sql(c,"DELETE FROM upload_claims WHERE task_id=?",id);return task(c,account,id);
+    });}
+    /** Local cache collection also runs before Telegram connects; no source or authorization is read. */
+    public List<Task> cancelledAfter(String after,int limit){return database.read(c->{
+        var refs=new ArrayList<String[]>();
+        try(var q=c.prepareStatement("SELECT account_id,id FROM upload_tasks WHERE state='CANCELLED' AND id>? ORDER BY id LIMIT ?")){
+            q.setString(1,after==null?"":after);q.setInt(2,Math.clamp(limit,1,20));try(var r=q.executeQuery()){while(r.next())refs.add(new String[]{r.getString(1),r.getString(2)});}
+        }
+        var result=new ArrayList<Task>();for(var ref:refs)result.add(task(c,ref[0],ref[1]));return List.copyOf(result);
+    });}
+    public Task cancelledForCleanup(String account,String id){return database.read(c->{
+        var saved=task(c,account,id);return saved.state().equals("CANCELLED")&&neverSent(c,saved)?saved:null;
+    });}
+    private boolean neverSent(Connection c,Task task)throws SQLException{
+        if(task.groups().stream().anyMatch(g->!g.state().equals("READY")||g.ownerRun()!=null||g.startedAt()!=null
+            ||g.items().stream().anyMatch(i->i.temporaryId()!=null||i.formalId()!=null||i.remoteUniqueId()!=null
+                ||i.archivePhase()!=null&&!i.archivePhase().equals("NONE")||i.archiveRelative()!=null||i.archiveIdentity()!=null)))return false;
+        try(var q=c.prepareStatement("SELECT 1 FROM upload_events e JOIN upload_groups g ON g.id=e.group_id WHERE g.task_id=? UNION ALL SELECT 1 FROM upload_retry_attempts WHERE task_id=? LIMIT 1")){
+            q.setString(1,task.id());q.setString(2,task.id());try(var r=q.executeQuery()){return !r.next();}
+        }
+    }
     public Task next(String account){return database.write(c->{queueConfirmedArchives(c,account);String id=null;try(var q=c.prepareStatement("SELECT id FROM upload_tasks WHERE account_id=? AND state='QUEUED' ORDER BY created_at LIMIT 1")){q.setString(1,account);try(var r=q.executeQuery()){if(r.next())id=r.getString(1);}}if(id==null)return null;sql(c,"UPDATE upload_tasks SET state='RUNNING',updated_at=? WHERE id=?",now(),id);return task(c,account,id);});}
     /** A late, fully proved receipt only resumes archive work. It never grants another send. */
     private void queueConfirmedArchives(Connection c,String account)throws SQLException{

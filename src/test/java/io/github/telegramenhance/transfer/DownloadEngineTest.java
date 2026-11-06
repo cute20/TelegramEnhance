@@ -53,8 +53,9 @@ class DownloadEngineTest {
     }
     @Test void aPreviouslyQueuedDuplicateIsSkippedBeforeAnyDirectoryOrNativeWork() throws Exception {
         try(var f=new Fixture()) {
-            var first=f.task();var queued=f.task();f.start();f.await(first.id(),"COMPLETED");var done=f.await(queued.id(),"COMPLETED");
-            assertEquals(1,f.repository.view(done).skipped());assertEquals(0,f.repository.view(done).completed());
+            var first=f.task();var queued=f.task();f.start();var firstDone=f.repository.view(f.await(first.id(),"COMPLETED"));var queuedDone=f.repository.view(f.await(queued.id(),"COMPLETED"));
+            // Equal creation timestamps allow either UUID to run first; exactly one copy must be downloaded.
+            assertEquals(1,firstDone.skipped()+queuedDone.skipped());assertEquals(1,firstDone.completed()+queuedDone.completed());
             verify(f.reader,times(1)).resolve(any(),any(),anyLong());verify(f.reader,times(1)).chunk(anyString(),anyLong(),anyInt(),anyString(),anyLong(),anyLong(),anyInt());
         }
     }
@@ -88,6 +89,21 @@ class DownloadEngineTest {
     }
     @Test void revalidatingAnExistingCompleteCacheDoesNotGrantPermissionToDeleteIt() throws Exception {
         try(var f=new Fixture()){var task=f.task();f.start();f.await(task.id(),"COMPLETED");verify(f.reader).start("1",1,7,"stable-unique",37);verify(f.reader,never()).release(anyString(),anyLong(),anyInt(),anyString(),eq(true));}
+    }
+    @Test void capturedBotStartsUseTheRepairedHandleForStatusChunksAndOwnedCacheCleanup()throws Exception{
+        try(var f=new Fixture()){
+            var ref=new io.github.telegramenhance.library.ResourceModels.MessageRef("9","100",null);
+            var media=new io.github.telegramenhance.library.ResourceModels.Media("1:9:100:0",ref,"BOT","DOCUMENT","captured.bin",37,"");
+            var post=new io.github.telegramenhance.library.ResourceModels.Post("bot:9:9:100","1","9","机器人","100","捕获的文件","",null,List.of(ref),List.of(media),null,null,List.of(),false,"PARTIAL",List.of());
+            var file=new FrozenFile(media,"stable-unique",37,"captured.bin",new BotFileReference(7,"private-remote"));
+            var task=f.repository.create("1",UUID.randomUUID().toString(),"captured",post,f.root,List.of(file));
+            when(f.reader.status(anyString(),anyLong(),anyInt(),anyString(),anyLong())).thenAnswer(call->new DownloadFileReader.Status((Integer)call.getArgument(2)==27?37:0,(Integer)call.getArgument(2)==27,false,true));
+            when(f.reader.startObservedBot(any(),eq(file),eq(1L),eq(7))).thenReturn(27);
+            f.start();assertEquals(1,f.repository.view(f.await(task.id(),"COMPLETED")).completed());
+            verify(f.reader).startObservedBot(any(),eq(file),eq(1L),eq(7));verify(f.reader,never()).start(anyString(),anyLong(),anyInt(),anyString(),anyLong());
+            verify(f.reader).chunk("1",1,27,"stable-unique",37,0,37);verify(f.reader).release("1",1,27,"stable-unique",true);
+            verify(f.reader,never()).release("1",1,7,"stable-unique",true);
+        }
     }
     private final class Fixture implements AutoCloseable {
         final AppPaths paths = new AppPaths(directory.resolve(UUID.randomUUID().toString())); final Database database = new Database(paths);

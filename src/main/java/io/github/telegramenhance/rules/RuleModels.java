@@ -23,10 +23,11 @@ public final class RuleModels {
             if(!next.isAfter(now))next=next.plusDays(1);return next.toInstant().toEpochMilli();
         }
     }
-    public record Input(String name,String link,String sourceDirectory,String archiveDirectory,boolean recursive,String captionMode,Window window,String executionMode){
-        public Input {if(executionMode==null)executionMode="OBSERVE_ONLY";if(!executionMode.equals("OBSERVE_ONLY")&&!executionMode.equals("AUTO_UPLOAD"))throw new IllegalArgumentException("请选择仅观察或自动上传");}
+    public record Input(String name,String link,String sourceDirectory,String archiveDirectory,boolean recursive,String captionMode,Window window,String executionMode,Integer albumSize){
+        public Input {if(executionMode==null)executionMode="OBSERVE_ONLY";if(!executionMode.equals("OBSERVE_ONLY")&&!executionMode.equals("AUTO_UPLOAD"))throw new IllegalArgumentException("请选择仅观察或自动上传");albumSize=UploadPreviewModels.normalizeAlbumSize(albumSize);}
+        public Input(String name,String link,String sourceDirectory,String archiveDirectory,boolean recursive,String captionMode,Window window,String executionMode){this(name,link,sourceDirectory,archiveDirectory,recursive,captionMode,window,executionMode,UploadPreviewModels.DEFAULT_ALBUM_SIZE);}
         public Input(String name,String link,String sourceDirectory,String archiveDirectory,boolean recursive,String captionMode,Window window){this(name,link,sourceDirectory,archiveDirectory,recursive,captionMode,window,"OBSERVE_ONLY");}
-        public UploadPreviewModels.Input uploadInput(){return new UploadPreviewModels.Input(link,sourceDirectory,archiveDirectory,recursive,captionMode);}
+        public UploadPreviewModels.Input uploadInput(){return new UploadPreviewModels.Input(link,sourceDirectory,archiveDirectory,recursive,captionMode,albumSize);}
     }
     public record Rule(String id,String accountId,long version,long revision,boolean enabled,long nextScanAt,long createdAt,long updatedAt,Input input,Observation observation){}
     public record UploadOutcome(String state,String message,String taskId,int claimed,long checkedAt){}

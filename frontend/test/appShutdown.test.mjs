@@ -12,17 +12,17 @@ const code = ts.transpileModule(compileScript(descriptor, { id: 'app-shutdown' }
 class ApiError extends Error { constructor(message, status) { super(message); this.status = status } }
 function mount(t) {
   const calls = [], responses = [], timers = new Map(), hooks = []
-  let clearedTokens = 0, serial = 0, dialogs = 0
+  let clearedTokens = 0, serial = 0, dialogs = 0, thumbnailInvalidations = 0
   const api = async (path, options) => { calls.push({ path, options }); assert.ok(responses.length, 'Unexpected request'); const value = responses.shift(); if (value instanceof Error) throw value; return value }
   const modules = { vue: { ...vue, onMounted() {}, onBeforeUnmount: hook => hooks.push(hook) }, './taskCategories': categories,
-    './api': { api, ApiError, hasAppToken: true, clearAppToken() { clearedTokens++ } } }
+    './api': { api, ApiError, hasAppToken: true, clearAppToken() { clearedTokens++ } }, './thumbnailMemory': { invalidateThumbnails() { thumbnailInvalidations++ } } }
   const module = { exports: {} }, fakeWindow = { setTimeout(fn) { timers.set(++serial, fn); return serial }, clearTimeout(id) { timers.delete(id) }, clearInterval() {} }
   new Function('require', 'module', 'exports', 'window', code)(name => { if (name.endsWith('.vue')) return {}; assert.ok(Object.hasOwn(modules, name), name); return modules[name] }, module, module.exports, fakeWindow)
   const scope = vue.effectScope(), state = scope.run(() => module.exports.default.setup({}, { expose() {} }))
   state.loading.value = false; state.serviceReachable.value = true
   state.dialog.value = { showModal() { dialogs++ }, close() {} }
   t.after(() => { hooks.forEach(hook => hook()); scope.stop(); assert.equal(responses.length, 0) })
-  return { state, calls, responses, timers, clearedTokens: () => clearedTokens, dialogs: () => dialogs }
+  return { state, calls, responses, timers, clearedTokens: () => clearedTokens, dialogs: () => dialogs, thumbnailInvalidations: () => thumbnailInvalidations }
 }
 test('one click requests only graceful project exit, without saving settings or logging out', async t => {
   const f = mount(t); f.state.authValue.value = 'sensitive'; f.state.form.apiHash = 'sensitive'; f.state.form.password = 'sensitive'
@@ -48,4 +48,19 @@ test('unavailable service or another action blocks shutdown; logout still requir
   await f.state.exitProject(); assert.equal(f.calls.length, 0)
   f.state.serviceReachable.value = true; await f.state.openConfirmation('logout'); assert.equal(f.dialogs(), 1); assert.equal(f.calls.length, 0)
   f.state.closeConfirmation(); assert.equal(f.calls.length, 0)
+})
+
+test('thumbnail memory clears on identity and authorization boundaries without clearing on status polling or navigation', t => {
+  const f=mount(t),status={authState:'READY',connectionState:'READY',userId:'1',nativeLoaded:true,nativeVersion:'synthetic',displayName:'first'}
+  f.state.applyTelegram(status);assert.equal(f.thumbnailInvalidations(),1)
+  f.state.applyTelegram({...status,displayName:'updated',connectionState:'UPDATING'});f.state.applyTelegram({...status})
+  f.state.serviceReachable.value=false;f.state.serviceReachable.value=true
+  f.state.navigate('tasks');f.state.navigate('rules');assert.equal(f.thumbnailInvalidations(),1)
+  f.state.applyTelegram({...status,authState:'CLOSED'});assert.equal(f.thumbnailInvalidations(),2)
+  f.state.applyTelegram({...status,authState:'CLOSED'});assert.equal(f.thumbnailInvalidations(),2)
+  f.state.applyTelegram(status);assert.equal(f.thumbnailInvalidations(),2)
+  f.state.applyTelegram({...status,userId:'2'});assert.equal(f.thumbnailInvalidations(),3)
+  f.state.applyTelegram({...status,userId:null,authState:'DISCONNECTED'});assert.equal(f.thumbnailInvalidations(),4,'simultaneous identity and auth changes are one boundary')
+  f.state.accessInvalid.value=true;f.state.accessInvalid.value=true;assert.equal(f.thumbnailInvalidations(),5)
+  f.state.exited.value=true;f.state.exited.value=true;assert.equal(f.thumbnailInvalidations(),6)
 })

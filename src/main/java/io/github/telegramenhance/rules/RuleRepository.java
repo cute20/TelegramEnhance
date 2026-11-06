@@ -4,6 +4,8 @@ import io.github.telegramenhance.storage.Database;
 import io.github.telegramenhance.rules.RuleModels.*;
 import io.github.telegramenhance.transfer.UploadPreviewModels.Scan;
 import io.github.telegramenhance.transfer.UploadPreviewModels.Target;
+import io.github.telegramenhance.transfer.UploadPreviewModels.FileVersion;
+import io.github.telegramenhance.transfer.UploadRepository;
 import java.sql.*;
 import java.util.*;
 import org.springframework.stereotype.Repository;
@@ -14,8 +16,40 @@ public final class RuleRepository {
     private final Database db;private final JsonMapper json=JsonMapper.builder().build();private final RuleUploadPolicy uploadPolicy;
     public RuleRepository(Database db){this.db=db;this.uploadPolicy=new RuleUploadPolicy(db);}
     public Job latestJob(String account,String rule){return uploadPolicy.latestJob(account,rule);}
+    /** Cancellation suppresses content for one explicit enable authorization, including regrouping. */
+    public Set<String> cancelledContent(Rule rule) { return db.read(c -> {
+        var cancelled = new HashSet<String>();
+        try (var q = c.prepareStatement("""
+                SELECT b.pause_kind,t.updated_at,i.file_json,a.created_at
+                FROM auto_upload_bindings b JOIN upload_tasks t ON t.id=b.task_id AND t.account_id=b.account_id
+                JOIN upload_items i ON i.task_id=t.id
+                JOIN auto_rule_authorizations a ON a.rule_id=b.rule_id AND a.version=b.rule_version AND a.revision=?
+                WHERE b.rule_id=? AND b.account_id=? AND b.rule_version=? AND t.state='CANCELLED'
+                """)) {
+            q.setLong(1, rule.revision()); q.setString(2, rule.id()); q.setString(3, rule.accountId()); q.setLong(4, rule.version());
+            try (var rows = q.executeQuery()) {
+                while (rows.next()) {
+                    String cancellation = rows.getString(1);
+                    boolean sameAuthorization;
+                    if (cancellation != null && cancellation.startsWith("CANCELLED_REVISION:")) {
+                        try {
+                            long revision = Long.parseLong(cancellation.substring("CANCELLED_REVISION:".length()));
+                            sameAuthorization = revision < 1 || revision >= rule.revision();
+                        }
+                        catch (RuntimeException malformed) { sameAuthorization = true; }
+                    } else {
+                        // Legacy cancellations lack a cancellation revision. Only an enable saved after
+                        // cancellation proves explicit permission to produce their content again.
+                        sameAuthorization = rows.getLong(4) <= rows.getLong(2);
+                    }
+                    if (sameAuthorization) cancelled.add(UploadRepository.contentKey(json.readValue(rows.getString(3), FileVersion.class)));
+                }
+            }
+        }
+        return Set.copyOf(cancelled);
+    }); }
     public Rule create(String account,String operation,Input input,long now){return db.write(c->{
-        String fingerprint=json.writeValueAsString(input);try(var q=c.prepareStatement("SELECT id,create_fingerprint FROM auto_rules WHERE account_id=? AND create_operation=?")){q.setString(1,account);q.setString(2,operation);try(var r=q.executeQuery()){if(r.next()){if(!fingerprint.equals(r.getString(2)))throw new IllegalArgumentException("同一保存操作的规则内容已变化，请先核对列表");return get(c,account,r.getString(1));}}}
+        String fingerprint=json.writeValueAsString(input);try(var q=c.prepareStatement("SELECT id,create_fingerprint FROM auto_rules WHERE account_id=? AND create_operation=?")){q.setString(1,account);q.setString(2,operation);try(var r=q.executeQuery()){if(r.next()){if(!input.equals(json.readValue(r.getString(2),Input.class)))throw new IllegalArgumentException("同一保存操作的规则内容已变化，请先核对列表");return get(c,account,r.getString(1));}}}
         try(var q=c.prepareStatement("SELECT COUNT(*) FROM auto_rules WHERE account_id=?")){q.setString(1,account);try(var r=q.executeQuery()){r.next();if(r.getInt(1)>=20)throw new IllegalArgumentException("此阶段每账号最多保存20条目录观察规则");}}
         String id=UUID.randomUUID().toString();sql(c,"INSERT INTO auto_rules VALUES(?,?,?,?,1,1,0,0,?,?)",id,account,operation,fingerprint,now,now);
         sql(c,"INSERT INTO auto_rule_versions VALUES(?,1,?,?)",id,fingerprint,now);return get(c,account,id);

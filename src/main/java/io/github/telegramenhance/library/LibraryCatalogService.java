@@ -23,6 +23,10 @@ public final class LibraryCatalogService {
         var query = PostSearch.parse(channels, tags, keywords);
         return read(account -> repository.catalog(account, query, limit, offset));
     }
+    public CatalogPage catalog(List<String> channels, String tags, String keywords, int limit, int offset, String sort) {
+        var query = PostSearch.parse(channels, tags, keywords);
+        return read(account -> repository.catalog(account, query, limit, offset, sort));
+    }
     public MediaPage media(String key, List<String> types, boolean includeMain, int limit, int offset) {
         Set<String> selected = new LinkedHashSet<>();
         if (types != null) {

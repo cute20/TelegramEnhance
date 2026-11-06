@@ -83,6 +83,28 @@ class BotDownloadControllerTest {
         verify(service).create(INPUT); verify(service).lookup(INPUT.operationId()); verifyNoMoreInteractions(service);
     }
 
+    @Test void preparationAcknowledgesPendingWorkAndPollingReturnsTheSameReadyOperation()throws Exception{
+        var service=mock(BotDownloadService.class);
+        var pending=new BotDownloadService.Preparation(INPUT.operationId(),"PREPARING",null,null);
+        when(service.prepare(INPUT)).thenReturn(CompletableFuture.completedFuture(pending));
+        var mvc=MockMvcBuilders.standaloneSetup(new BotDownloadController(service)).setControllerAdvice(new ApiErrors()).build();
+        var response=mvc.perform(post(ROOT+"/preparations").contentType("application/json").content(BODY)).andExpect(request().asyncStarted()).andReturn();
+        mvc.perform(asyncDispatch(response)).andExpect(status().isOk()).andExpect(jsonPath("$.operationId").value(INPUT.operationId())).andExpect(jsonPath("$.state").value("PREPARING")).andExpect(jsonPath("$.task").isEmpty()).andExpect(jsonPath("$.error").isEmpty());
+        when(service.preparation(INPUT.operationId())).thenReturn(new BotDownloadService.Preparation(INPUT.operationId(),"READY",task(),null));
+        mvc.perform(get(ROOT+"/preparations/"+INPUT.operationId())).andExpect(status().isOk()).andExpect(jsonPath("$.state").value("READY")).andExpect(jsonPath("$.task.id").value("original-task"));
+        verify(service).prepare(INPUT);verify(service).preparation(INPUT.operationId());verifyNoMoreInteractions(service);
+    }
+
+    @Test void failedPreparationKeepsItsActionableErrorAndAnAbsentOperationIsNotFound()throws Exception{
+        var service=mock(BotDownloadService.class);
+        when(service.preparation(INPUT.operationId())).thenReturn(new BotDownloadService.Preparation(INPUT.operationId(),"FAILED",null,"文件核对失败，未创建下载任务"));
+        var mvc=MockMvcBuilders.standaloneSetup(new BotDownloadController(service)).setControllerAdvice(new ApiErrors()).build();
+        mvc.perform(get(ROOT+"/preparations/"+INPUT.operationId())).andExpect(status().isOk()).andExpect(jsonPath("$.state").value("FAILED")).andExpect(jsonPath("$.task").isEmpty()).andExpect(jsonPath("$.error").value("文件核对失败，未创建下载任务"));
+        when(service.preparation(INPUT.operationId())).thenReturn(null);
+        mvc.perform(get(ROOT+"/preparations/"+INPUT.operationId())).andExpect(status().isNotFound());
+        verify(service,times(2)).preparation(INPUT.operationId());verifyNoMoreInteractions(service);
+    }
+
     private static TaskView task() {
         return new TaskView("original-task", "机器人资源", "机器人", "QUEUED", false, "D:/bot-test", "OBSERVED_SELECTION",
                 1, 0, 0, 11, null, 1, 1, List.of(), DownloadModels.KEEP_DUPLICATES, 0, "D:/bot-test/重复媒体", null);

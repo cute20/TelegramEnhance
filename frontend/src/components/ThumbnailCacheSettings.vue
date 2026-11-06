@@ -5,9 +5,9 @@ import { formatMediaBytes } from '../library'
 import AppIcon from './AppIcon.vue'
 
 interface CacheView { directory: string; defaultDirectory: string; files: number; bytes: number; maximumBytes: number; warning: string | null }
-const props = defineProps<{ available: boolean }>()
+const props = defineProps<{ available: boolean; active?:boolean }>()
 const emit = defineEmits<{ accessError: [cause: ApiError] }>()
-const saved = ref<CacheView | null>(null), directory = ref(''), busy = ref(''), error = ref(''), notice = ref(''), uncertain = ref(false)
+const saved = ref<CacheView | null>(null), directory = ref(''), maximumBytes = ref(256*1024*1024), busy = ref(''), error = ref(''), notice = ref(''), uncertain = ref(false)
 let generation = 0, disposed = false
 function valid(value: CacheView) {
   return value && typeof value.directory === 'string' && !!value.directory && typeof value.defaultDirectory === 'string'
@@ -15,22 +15,24 @@ function valid(value: CacheView) {
     && Number.isSafeInteger(value.maximumBytes) && value.maximumBytes > 0 && (value.warning == null || typeof value.warning === 'string')
 }
 async function perform(action: 'load' | 'save' | 'clear') {
-  if (!props.available || disposed || busy.value || action !== 'load' && uncertain.value || action === 'save' && !directory.value.trim()) return
+  if (!props.available || props.active===false || disposed || busy.value || action !== 'load' && uncertain.value || action === 'save' && !directory.value.trim()) return
   const request = ++generation
-  const current = () => !disposed && request === generation && props.available
+  const draftDirectory=directory.value,draftMaximum=maximumBytes.value
+  const keepDraft=!!saved.value&&(draftDirectory!==saved.value.directory||draftMaximum!==saved.value.maximumBytes)
+  const current = () => !disposed && request === generation && props.available && props.active!==false
   busy.value = action; error.value = ''; notice.value = ''
   try {
     const result = action === 'clear'
       ? await api<{ cache: CacheView; removed: number }>('/settings/thumbnail-cache/clear', { method: 'POST' })
-      : await api<CacheView>('/settings/thumbnail-cache', action === 'save' ? { method: 'PUT', body: { directory: directory.value.trim() } } : {})
+      : await api<CacheView>('/settings/thumbnail-cache', action === 'save' ? { method: 'PUT', body: { directory: directory.value.trim(), ...(maximumBytes.value!==saved.value?.maximumBytes ? {maximumBytes:maximumBytes.value} : {}) } } : {})
     if (!current()) return
     const value = 'cache' in result ? result.cache : result
     if (!valid(value)) throw new Error('缓存设置回执无法确认。')
     saved.value = value
-    if (action !== 'clear') directory.value = value.directory
+    if (action === 'save'||action==='load'&&!keepDraft&&directory.value===draftDirectory&&maximumBytes.value===draftMaximum) {directory.value = value.directory;maximumBytes.value=value.maximumBytes}
     uncertain.value = false
-    if (action === 'clear') notice.value = '缩略图缓存已清理，再次浏览时会按需生成。'
-    if (action === 'save') notice.value = '缓存保存位置已更新。'
+    if (action === 'clear') notice.value = '当前页面内存与本机缩略图缓存已清理，再次浏览时会按需生成。'
+    if (action === 'save') notice.value = '缓存位置与配额已更新。'
   } catch (cause) {
     if (!current()) return
     if (action !== 'load' && !(cause instanceof ApiError && cause.status === 400)) uncertain.value = true
@@ -38,28 +40,31 @@ async function perform(action: 'load' | 'save' | 'clear') {
     if (cause instanceof ApiError && [401, 403].includes(cause.status)) emit('accessError', cause)
   } finally { if (current()) busy.value = '' }
 }
-watch(() => props.available, value => { generation++; busy.value = ''; if (value) void perform('load') }, { immediate: true })
+watch([() => props.available,()=>props.active], () => { generation++; if(busy.value&&busy.value!=='load')uncertain.value=true; busy.value = ''; if (props.available&&props.active!==false) void perform('load') }, { immediate: true })
 onBeforeUnmount(() => { disposed = true; generation++ })
 </script>
 
 <template>
   <section class="settings-section thumbnail-cache-settings" aria-labelledby="thumbnail-cache-heading">
-    <div class="section-heading"><span class="section-icon"><AppIcon name="photo" /></span><div><h2 id="thumbnail-cache-heading">缩略图缓存</h2><p>主帖封面与评论缩略图保存在本机，再次浏览可直接复用。</p></div></div>
+    <div class="section-heading"><span class="section-icon"><AppIcon name="photo" /></span><div><h2 id="thumbnail-cache-heading">缩略图缓存</h2><p>当前页面内存与本机缓存可复用主帖封面和评论缩略图，减少重复读取。</p></div></div>
     <div class="field"><label for="thumbnail-cache-directory">保存目录</label><input id="thumbnail-cache-directory" v-model="directory" class="input mono" :disabled="!available || !!busy || uncertain" autocomplete="off" spellcheck="false" placeholder="填写本机文件夹的完整路径" @keydown.enter.prevent="perform('save')" /></div>
+    <div class="field"><label for="thumbnail-cache-limit">缓存上限</label><select id="thumbnail-cache-limit" v-model.number="maximumBytes" class="input" :disabled="!available || !!busy || uncertain"><option :value="256*1024*1024">256 MiB</option><option :value="512*1024*1024">512 MiB</option><option :value="1024*1024*1024">1024 MiB</option></select></div>
+    <meter v-if="saved" class="cache-meter" min="0" :max="saved.maximumBytes" :value="saved.bytes" aria-label="缩略图缓存占用" />
     <div v-if="saved" class="cache-statistics"><span>{{ saved.files }} 张 · {{ formatMediaBytes(saved.bytes) }}</span><span>最多 {{ formatMediaBytes(saved.maximumBytes) }}，自动清理较早使用的缓存</span></div>
     <div v-if="error" class="notice warning" role="alert">{{ error }}</div>
     <p v-if="saved?.warning" class="notice warning" role="status">{{ saved.warning }}</p>
     <p v-if="notice" class="cache-notice" role="status">{{ notice }}</p>
     <div class="cache-actions">
-      <button type="button" class="btn" :disabled="!available || !!busy || !saved || uncertain || !directory.trim() || directory===saved.directory" @click="perform('save')">{{ busy==='save' ? '正在保存…' : '保存位置' }}</button>
+      <button type="button" class="btn" :disabled="!available || !!busy || !saved || uncertain || !directory.trim() || directory===saved.directory&&maximumBytes===saved.maximumBytes" @click="perform('save')">{{ busy==='save' ? '正在保存…' : '保存缓存设置' }}</button>
       <button type="button" class="btn" :disabled="!available || !!busy || !saved || uncertain" @click="perform('clear')">{{ busy==='clear' ? '正在清理…' : '清理缩略图缓存' }}</button>
       <button type="button" class="btn" :disabled="!available || !!busy" @click="perform('load')">{{ uncertain ? '读取当前设置' : '刷新统计' }}</button>
       <button v-if="saved && directory!==saved.defaultDirectory" type="button" class="cache-default" :disabled="!available || !!busy || uncertain" @click="directory=saved.defaultDirectory">使用默认位置</button>
     </div>
-    <p class="section-footnote">清理只移除缓存图片。更换目录后，原位置的缓存会保留。</p>
+    <p class="section-footnote">清理会同时移除当前页面内存与所选目录中本应用的缩略图缓存，原始媒体不受影响。更换目录后，原位置的缓存会保留。</p>
   </section>
 </template>
 
 <style scoped>
+.cache-meter{display:block;width:100%;height:12px;margin:6px 0 12px;accent-color:var(--blue)}
 .cache-statistics{display:flex;flex-wrap:wrap;gap:6px 18px;font-size:10px;line-height:1.8;color:#8ca1b1;margin:12px 0 16px}.cache-statistics>span:first-child{color:#577b96}.cache-actions{display:flex;align-items:center;flex-wrap:wrap;gap:8px}.cache-actions>.btn{font-size:10px}.cache-default{border:0;background:none;color:#779ab5;font-size:10px;cursor:pointer;padding:8px}.cache-notice{font-size:11px;line-height:1.8;color:#6b9b86;margin:10px 0}.thumbnail-cache-settings .input{width:100%;min-width:0}.thumbnail-cache-settings .notice{overflow-wrap:anywhere}.section-footnote{margin-top:14px}
 </style>

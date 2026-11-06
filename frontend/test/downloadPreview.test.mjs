@@ -34,7 +34,7 @@ function mount(t, initialProps = {}) {
   const api = async (path, options) => {
     calls.push({ path, ...options })
     const next = expected.shift()
-    try { assert.ok(next, 'Unexpected API request'); assert.equal(path, next.path); assert.deepEqual(options, { method: 'POST', timeout: 120000, body: next.body }) }
+    try { assert.ok(next, 'Unexpected API request'); assert.equal(path, next.path); if(next.create){assert.equal(options.method,'POST');assert.equal(options.timeout,120000)}else assert.deepEqual(options, { method: 'POST', timeout: 120000, body: next.body }) }
     catch (cause) { failures.push(cause); throw cause }
     if (next.result instanceof Error) throw next.result
     return next.result
@@ -48,6 +48,7 @@ function mount(t, initialProps = {}) {
   t.after(() => { destroy(); assert.deepEqual(failures, []); assert.equal(expected.length, 0) })
   return { state, props, calls, events, destroy,
     expect: (result, next = false, value = state.preview.value) => expected.push({ path: next ? '/transfers/download/preview/next' : '/transfers/download/preview', body: next ? { id: value.id, cursor: value.comments.nextCursor, pageNumber: value.pageNumber } : { link: state.link.value.trim() }, result }),
+    expectCreate: result => expected.push({path:'/transfers/download/tasks',create:true,result}),
   }
 }
 async function show(t, result = preview()) {
@@ -59,6 +60,28 @@ test('source preview is explicit and never invokes library import or file transf
   f.state.link.value = LINK; await flush(); assert.equal(f.calls.length, 0)
   f.expect(preview()); await f.state.readPreview(); assert.equal(f.calls.length, 1)
   assert.equal(f.state.preview.value.observedMessages, 1); assert.equal(f.state.busy.value, false)
+})
+
+test('single-post browsing crosses 200 pages and twenty minutes without a business total stop',async t=>{
+  const f=await show(t);let time=0;t.mock.method(Date,'now',()=>time+=60000)
+  for(let n=2;n<=207;n++){
+    const before=f.state.preview.value,cursor=String(BigInt(CURSOR)-BigInt(n)),end=n===207
+    const next={...before,pageNumber:n,observedMessages:n,exhausted:end,canContinue:!end,comments:{...before.comments,media:[],messages:[{chatId:'-2001',messageId:cursor,link:null}],nextCursor:cursor,exhausted:end}}
+    f.expect(next,true);f.state.loadMore();await flush()
+  }
+  assert.equal(f.calls.length,207);assert.equal(f.state.preview.value.exhausted,true);assert.equal(f.state.preview.value.pageNumber,207)
+  assert.ok(f.calls.every(call=>call.path.includes('/preview')))
+})
+
+test('single-post selection and creation accept more than 500 retained media without a client count cap',async t=>{
+  const value=preview();value.comments.media=Array.from({length:501},(_,i)=>media('VIDEO','COMMENT',String(1000+i)))
+  assert.equal(download.validDownloadPreview(value,'1'),true)
+  const f=await show(t,value);f.state.targetDirectory.value='D:\\out'
+  const task={id:'task',title:'post',channelTitle:'channel',state:'QUEUED',pauseRequested:false,targetDirectory:'D:\\out',scope:'OBSERVED_SELECTION',total:501,completed:0,skipped:0,duplicates:0,totalBytes:501*123,error:null,createdAt:1,updatedAt:1,duplicatePolicy:'KEEP_DUPLICATES_V2',duplicateDirectory:'D:\\out\\重复媒体',
+    items:Array.from({length:501},(_,i)=>({id:'item-'+i,fileName:'synthetic',type:'VIDEO',state:'QUEUED',size:123,downloadedBytes:0,writtenBytes:0,outputPath:'D:\\out\\'+i,error:null}))}
+  f.expectCreate(task);await f.state.createDownload()
+  assert.equal(f.state.createdTask.value.total,501);assert.equal(f.calls.at(-1).body.mediaKeys.length,501)
+  assert.equal(new Set(f.calls.at(-1).body.mediaKeys).size,501);assert.equal(f.calls.filter(call=>call.path.endsWith('/tasks')).length,1)
 })
 test('opening a channel result switches to the original single-post readonly preview without creating a task',async t=>{const f=mount(t);f.state.downloadSourceKind.value='channel';f.state.link.value=LINK;await flush();f.expect(preview());await f.state.openChannelPost(LINK);assert.equal(f.state.downloadSourceKind.value,'post');assert.equal(f.state.preview.value.id,ID);assert.equal(f.calls.length,1);assert.equal(f.calls[0].path,'/transfers/download/preview')})
 

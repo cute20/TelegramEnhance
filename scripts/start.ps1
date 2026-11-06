@@ -33,6 +33,23 @@ if (!$running) {
         }
     }
     $jar = Join-Path $projectRoot 'target/telegram-resource-workbench-0.1.0-SNAPSHOT.jar'
+    $stagedJar = Join-Path $projectRoot 'target/staged/telegram-resource-workbench-0.1.0-SNAPSHOT.jar'
+    if (Test-Path -LiteralPath $stagedJar -PathType Leaf) {
+        $updateLock = $null
+        try {
+            New-Item -ItemType Directory -Path $dataRoot -Force | Out-Null
+            try { $updateLock = [IO.File]::Open((Join-Path $dataRoot 'instance.lock'), [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None) }
+            catch { throw '项目仍在运行，请先在设置中关闭项目，再重新启动以应用更新。' }
+            if (!(Test-Path -LiteralPath $jar -PathType Leaf) -or (Get-Item -LiteralPath $stagedJar).LastWriteTimeUtc -gt (Get-Item -LiteralPath $jar).LastWriteTimeUtc) {
+                Move-Item -LiteralPath $stagedJar -Destination $jar -Force
+                Write-Output '已应用已构建的项目更新。'
+            } else {
+                Remove-Item -LiteralPath $stagedJar
+            }
+        } finally {
+            if ($updateLock) { $updateLock.Dispose() }
+        }
+    }
     if (!(Test-Path -LiteralPath $jar)) { throw '请先运行 scripts/build.ps1' }
     $javaExe = if ($JavaHome) { Join-Path $JavaHome 'bin/java.exe' } else { (Get-Command java.exe).Source }
     New-Item -ItemType Directory -Path $dataRoot -Force | Out-Null

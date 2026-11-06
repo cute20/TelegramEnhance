@@ -10,6 +10,16 @@ import org.junit.jupiter.api.Test;
 import org.springframework.test.web.servlet.setup.MockMvcBuilders;
 
 class UploadPreviewControllerTest {
+    @Test void selectedAlbumSizeIsParsedAndOutOfRangeRequestsAreRejectedBeforeServiceWork() throws Exception {
+        var service=mock(UploadPreviewService.class);when(service.preview(any())).thenReturn(CompletableFuture.completedFuture(null));
+        var mvc=MockMvcBuilders.standaloneSetup(new UploadPreviewController(service)).setControllerAdvice(new ApiErrors()).build();
+        String body="{\"link\":\"https://t.me/test/1\",\"sourceDirectory\":\"D:/source\",\"archiveDirectory\":\"D:/archive\",\"recursive\":true,\"captionMode\":\"FILENAME\",\"albumSize\":%d}";
+        var request=mvc.perform(post("/api/transfers/upload/preview").contentType("application/json").content(body.formatted(3))).andExpect(request().asyncStarted()).andReturn();
+        mvc.perform(asyncDispatch(request)).andExpect(status().isOk());
+        verify(service).preview(new Input("https://t.me/test/1","D:/source","D:/archive",true,"FILENAME",3));
+        for(int invalid:java.util.List.of(0,11))mvc.perform(post("/api/transfers/upload/preview").contentType("application/json").content(body.formatted(invalid))).andExpect(status().isBadRequest());
+        verifyNoMoreInteractions(service);
+    }
     @Test void previewAndRecheckAreSeparateReadOnlyPreparationRoutes() throws Exception {
         var service = mock(UploadPreviewService.class); when(service.preview(any())).thenReturn(CompletableFuture.completedFuture(null)); when(service.verify("snapshot")).thenReturn(CompletableFuture.completedFuture(null));
         var mvc = MockMvcBuilders.standaloneSetup(new UploadPreviewController(service)).setControllerAdvice(new ApiErrors()).build();

@@ -6,6 +6,7 @@ import jakarta.servlet.ServletException;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
 import java.io.IOException;
+import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.attribute.AclEntry;
@@ -33,6 +34,12 @@ public class LocalAccess extends OncePerRequestFilter {
         this.paths = paths;
         byte[] bytes = new byte[32]; new SecureRandom().nextBytes(bytes);
         token = Base64.getUrlEncoder().withoutPadding().encodeToString(bytes);
+    }
+    /** Only trusted desktop code receives this URI; the token stays in the browser fragment. */
+    public URI launchUri() {
+        int boundPort = port;
+        if (boundPort < 1 || boundPort > 65535) throw new IllegalStateException("资源台尚未完成启动");
+        return URI.create("http://127.0.0.1:" + boundPort + "/#token=" + token);
     }
     @EventListener public void started(WebServerInitializedEvent event) throws IOException {
         port = event.getWebServer().getPort();

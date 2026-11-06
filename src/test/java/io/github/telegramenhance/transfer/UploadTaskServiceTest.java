@@ -11,6 +11,34 @@ import org.junit.jupiter.api.io.TempDir;
 
 class UploadTaskServiceTest {
     @TempDir Path root;
+    @Test void anExpiredPreviewIsADefiniteRejectionBeforeAnyTaskCanBeCommitted()throws Exception{
+        try(var f=new UploadTestFixture(root,1)){
+            var previews=mock(UploadPreviewService.class);String preview=UUID.randomUUID().toString();
+            when(previews.freeze(preview)).thenReturn(CompletableFuture.failedFuture(new IllegalArgumentException("preview expired")));
+            var telegram=mock(TelegramService.class);when(telegram.accountId()).thenReturn("1");when(telegram.sessionGeneration()).thenReturn(1L);
+            var repository=spy(f.repository);var service=new UploadTaskService(previews,repository,telegram,mock(UploadEngine.class),mock(io.github.telegramenhance.telegram.UploadTransport.class),mock(io.github.telegramenhance.library.ResourceService.class));
+            var failure=assertThrows(ExecutionException.class,()->service.create(new UploadTaskService.Create(UUID.randomUUID().toString(),preview)).get());
+            assertInstanceOf(CreationRejectedException.class,failure.getCause());verify(repository,never()).create(anyString(),anyString(),anyString(),any());
+        }
+    }
+    @Test void aPostCommitSessionChangeRemainsUnknownAndCannotCarryTheDefiniteRejectionType()throws Exception{
+        try(var f=new UploadTestFixture(root,1)){
+            f.repository.cancel("1",f.task.id());var previews=mock(UploadPreviewService.class);String preview=UUID.randomUUID().toString();when(previews.freeze(preview)).thenReturn(CompletableFuture.completedFuture(f.prepared));
+            var telegram=mock(TelegramService.class);when(telegram.accountId()).thenReturn("1");when(telegram.sessionGeneration()).thenReturn(1L);var repository=spy(f.repository);
+            doAnswer(call->{var result=call.callRealMethod();when(telegram.sessionGeneration()).thenReturn(2L);return result;}).when(repository).create(anyString(),anyString(),anyString(),any());
+            var service=new UploadTaskService(previews,repository,telegram,mock(UploadEngine.class),mock(io.github.telegramenhance.telegram.UploadTransport.class),mock(io.github.telegramenhance.library.ResourceService.class));
+            String operation=UUID.randomUUID().toString();var failure=assertThrows(ExecutionException.class,()->service.create(new UploadTaskService.Create(operation,preview)).get());
+            assertInstanceOf(IllegalArgumentException.class,failure.getCause());assertFalse(failure.getCause() instanceof CreationRejectedException);assertNotNull(repository.byOperation("1",operation));
+        }
+    }
+    @Test void cancellingCommitsBeforeRequestingCollectionOnTheSendingLane()throws Exception{
+        try(var f=new UploadTestFixture(root,1)){
+            var telegram=mock(TelegramService.class);when(telegram.accountId()).thenReturn("1");var engine=mock(UploadEngine.class);
+            doAnswer(call->{assertEquals("CANCELLED",f.fresh().state());return null;}).when(engine).cleanupCancelled(any());
+            var service=new UploadTaskService(mock(UploadPreviewService.class),f.repository,telegram,engine,mock(io.github.telegramenhance.telegram.UploadTransport.class),mock(io.github.telegramenhance.library.ResourceService.class));
+            assertEquals("CANCELLED",service.action(f.task.id(),"cancel").state());verify(engine).cleanupCancelled(any());
+        }
+    }
     @Test void createWaitsForExplicitStartAndRemainsIdempotentAfterThePreviewExpires()throws Exception{
         try(var f=new UploadTestFixture(root,1)){f.repository.cancel("1",f.task.id());var previews=mock(UploadPreviewService.class);var telegram=mock(TelegramService.class);when(telegram.accountId()).thenReturn("1");when(telegram.sessionGeneration()).thenReturn(1L);String preview=UUID.randomUUID().toString();when(previews.freeze(preview)).thenReturn(CompletableFuture.completedFuture(f.prepared));var engine=mock(UploadEngine.class);var service=new UploadTaskService(previews,f.repository,telegram,engine,mock(io.github.telegramenhance.telegram.UploadTransport.class),mock(io.github.telegramenhance.library.ResourceService.class));var input=new UploadTaskService.Create(UUID.randomUUID().toString(),preview);var first=service.create(input).get();assertEquals("READY",first.state());assertEquals(0,first.confirmed());when(previews.freeze(preview)).thenThrow(new IllegalArgumentException("expired"));var again=service.create(input).get();assertEquals(first.id(),again.id());verify(previews,times(1)).freeze(preview);verifyNoInteractions(engine);assertThrows(IllegalArgumentException.class,()->service.create(new UploadTaskService.Create(input.operationId(),UUID.randomUUID().toString())));}
     }

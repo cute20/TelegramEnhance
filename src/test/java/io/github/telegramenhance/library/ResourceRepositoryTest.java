@@ -241,6 +241,7 @@ class ResourceRepositoryTest {
              "canReadComments":true,"coverage":"COMPLETE","warnings":[]}
             """;
         Post legacy = json.readValue(legacyJson, Post.class);
+        assertNull(legacy.publishedAt());
         assertNull(legacy.albumEvidence());
         assertEquals("PARTIAL", legacy.mainCoverage(), "A legacy COMPLETE value does not prove the main album");
         try (Database database = new Database(new AppPaths(directory))) {

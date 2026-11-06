@@ -35,6 +35,39 @@ test('an explicit retry reuses its original operation and cannot change the prep
 test('changing selection or account drops a late readonly preparation result',async t=>{const f=mount(t);let release;prepare(f,new Promise(r=>release=r));const request=f.state.begin();await flush();f.props.postKeys=['other'];await flush();release(done());await request;assert.equal(f.state.preview.value,null);assert.equal(f.state.created.value,null);assert.equal(f.calls.length,2)})
 test('hiding mid-step only resumes after an explicit current-position check',async t=>{const f=mount(t);let release;prepare(f,new Promise(r=>release=r));const request=f.state.begin();await flush();f.props.active=false;await flush();release(done());await request;assert.equal(f.state.needsCheck.value,true);f.expect('/transfers/download/batches/preview/'+ID,done(),'GET');f.props.active=true;await flush();assert.equal(f.state.preview.value.exhausted,true);assert.equal(f.calls.length,3)})
 test('malformed totals, foreign accounts, changed paths and incomplete receipts are rejected',()=>{assert.equal(batch.validBatch(initial(),'1'),true);assert.equal(batch.validBatch(done(),'1',initial(),true),true);assert.equal(batch.validBatch(done(),'2'),false);assert.equal(batch.validBatch({...done(),total:2},'1'),false);assert.equal(batch.validBatch({...done(),targetDirectory:'other'},'1',initial(),true),false);assert.equal(batch.validBatchReceipt(receipt(),done(),{operationId:TASK,previewId:ID,revision:2}),true);assert.equal(batch.validBatchReceipt({...receipt(),taskIds:[]},done(),{operationId:TASK,previewId:ID,revision:2}),false)})
+
+test('preparation crosses 200 steps and twenty minutes until the selected range is actually complete',async t=>{
+  const f=mount(t);let time=0;t.mock.method(Date,'now',()=>time+=60000);f.state.directory.value='C:\\test'
+  f.expect('/transfers/download/batches/preview',initial())
+  for(let revision=2;revision<=207;revision++)f.expect('/transfers/download/batches/preview/'+ID+'/next',revision===207?{...done(),revision}:{...initial(),revision,posts:[{...initial().posts[0],state:'READING_COMMENTS'}]},'POST',{revision:revision-1})
+  await f.state.begin();assert.equal(f.calls.length,207);assert.equal(f.state.preview.value.exhausted,true);assert.equal(f.state.preview.value.revision,207)
+  assert.equal(f.calls.some(call=>call.path==='/transfers/download/batches'),false)
+})
+
+test('large batch receipts keep every selected post and every bounded child instead of imposing a total cap',()=>{
+  const posts=Array.from({length:60},(_,i)=>({...done().posts[0],key:'post-'+i,commentMedia:120,bytes:120*37}))
+  const dates={startDate:'2024-01-01',endDate:'2024-12-31'},preview={...done(),...dates,posts,total:7200,totalBytes:7200*37}
+  const value={...receipt(),snapshot:{...receipt().snapshot,...dates,postCount:60,total:7200,totalBytes:7200*37},taskIds:Array.from({length:120},(_,i)=>'00000000-0000-0000-0000-'+String(i+10).padStart(12,'0'))}
+  const command={operationId:TASK,previewId:ID,revision:2}
+  assert.equal(batch.validBatch(preview,'1'),true);assert.equal(batch.validBatchReceipt(value,preview,command),true)
+  assert.equal(batch.validBatchReceipt({...value,taskIds:value.taskIds.slice(1)},preview,command),false)
+  assert.equal(batch.validBatchReceipt({...value,snapshot:{...value.snapshot,startDate:null}},preview,command),false)
+  assert.equal(batch.validBatch({...preview,startDate:'2024-02-30'},'1'),false)
+  assert.equal(batch.validBatch({...preview,endDate:null},'1',preview),false)
+})
+
+test('batch preparation binds the channel date bounds without adding a second mutable date input to its command',async t=>{
+  const f=mount(t),dates={startDate:'2024-01-01',endDate:null};Object.assign(f.props,dates);await flush();f.state.directory.value='C:\\test'
+  f.expect('/transfers/download/batches/preview',{...initial(),...dates},'POST',{scanId:ID,revision:3,postKeys:['post'],types:['VIDEO'],includeMain:false,targetDirectory:'C:\\test'})
+  f.expect('/transfers/download/batches/preview/'+ID+'/next',{...done(),...dates},'POST',{revision:1})
+  await f.state.begin();assert.equal(f.state.preview.value.startDate,dates.startDate)
+  f.props.startDate='2024-02-01';await flush();assert.equal(f.state.preview.value,null)
+})
+
+test('a batch receipt that drops the channel date bounds cannot start another preparation step',async t=>{
+  const f=mount(t);f.props.startDate='2024-01-01';await flush();f.state.directory.value='C:\\test';f.expect('/transfers/download/batches/preview',initial())
+  await f.state.begin();assert.equal(f.state.preview.value,null);assert.equal(f.calls.length,1);assert.match(f.state.error.value,/发布时间筛选/)
+})
 test('batch creation keeps its frozen operation through connectivity loss and only GET unlocks the composer',async t=>{
   const f=mount(t);prepare(f);await f.state.begin();let release
   f.expect('/transfers/download/batches',new Promise(resolve=>{release=resolve}));const creating=f.state.create(),command=structuredClone(f.calls.at(-1).options.body)

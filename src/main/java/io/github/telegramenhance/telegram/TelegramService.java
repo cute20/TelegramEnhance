@@ -38,6 +38,9 @@ public class TelegramService {
     interface SendUpdateListener { void accept(String account,long generation,TdApi.Update update); }
     private final java.util.concurrent.CopyOnWriteArrayList<SendUpdateListener> sendListeners = new java.util.concurrent.CopyOnWriteArrayList<>();
     AutoCloseable observeSends(SendUpdateListener listener) { sendListeners.add(listener); return () -> sendListeners.remove(listener); }
+    interface FileUpdateListener { void accept(String account,long generation,TdApi.File file); }
+    private final java.util.concurrent.CopyOnWriteArrayList<FileUpdateListener> fileListeners=new java.util.concurrent.CopyOnWriteArrayList<>();
+    AutoCloseable observeFiles(FileUpdateListener listener){fileListeners.add(listener);return ()->fileListeners.remove(listener);}
     private volatile CompletableFuture<Void> closed = CompletableFuture.completedFuture(null);
 
     public TelegramService(SettingsService settings, AppPaths paths) {
@@ -75,6 +78,8 @@ public class TelegramService {
                 if (fresh == client && connecting) connectionState = c.state.getClass().getSimpleName().replace("ConnectionState", "").replaceAll("([a-z])([A-Z])", "$1_$2").toUpperCase(java.util.Locale.ROOT);
             } else if (fresh == client && userId != null && (update instanceof TdApi.UpdateMessageSendSucceeded || update instanceof TdApi.UpdateMessageSendFailed)) {
                 for (var listener : sendListeners) listener.accept(userId, freshGeneration, (TdApi.Update) update);
+            } else if (fresh == client && userId != null && update instanceof TdApi.UpdateFile file) {
+                for(var listener:fileListeners)listener.accept(userId,freshGeneration,file.file);
             }
         }), ignored -> error = "Telegram 更新处理异常，请断开后重新连接", ignored -> error = "Telegram 回调异常，请断开后重新连接");
     }
@@ -101,6 +106,23 @@ public class TelegramService {
             target = client;
         }
         return target.sendAsync(query).orTimeout(15, TimeUnit.SECONDS);
+    }
+    /** A final download receipt can outlive metadata requests, but never its account or native client. */
+    <R extends TdApi.Object> CompletableFuture<R> downloadInSession(long generation,TdApi.Function<R> query){
+        final TelegramClient target;final String account;
+        synchronized(sessionLock){
+            account=accountId();
+            if(generation!=clientGeneration)throw new IllegalArgumentException("Telegram会话已变化，请重试");
+            target=client;
+        }
+        return target.sendAsync(query).handle((result,failure)->{
+            synchronized(sessionLock){
+                if(generation!=clientGeneration||target!=client||!account.equals(accountId()))
+                    throw new IllegalArgumentException("Telegram账号或会话已变化，下载已暂停");
+            }
+            if(failure!=null)throw new CompletionException(failure);
+            return result;
+        });
     }
     private <T> CompletableFuture<T> submit(Supplier<T> action) {
         if (stopping) throw new IllegalStateException("后台正在退出");

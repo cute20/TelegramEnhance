@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
+import { computed, getCurrentInstance, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { api, ApiError } from '../api'
 import { validSourceChannels, type DownloadChannels } from '../downloadChannel'
 import { taskLabels } from '../downloadTasks'
@@ -16,7 +16,7 @@ import SourceChannelSelect from './SourceChannelSelect.vue'
 import RuleFormDialog from './RuleFormDialog.vue'
 import NewTransfer from './NewTransfer.vue'
 
-const props = defineProps<{ authorized: boolean; available: boolean; accountId: string | null; createOnly?: boolean; embedded?: boolean; refreshVersion?: number; selection?: DownloadCreationSelection }>()
+const props = defineProps<{ authorized: boolean; available: boolean; accountId: string | null; active?: boolean; createOnly?: boolean; embedded?: boolean; refreshVersion?: number; selection?: DownloadCreationSelection; actionTarget?: string }>()
 const emit = defineEmits<{ accessError: [cause: ApiError]; tasks: []; create: [direction: 'download' | 'upload']; saved: [direction: 'download' | 'upload']; close: []; locked: [value: boolean] }>()
 const items = ref<DownloadRuleView[]>([]), channels = ref<DownloadChannels | null>(null)
 const pending = ref(false), busy = ref(''), error = ref(''), listError = ref(''), channelError = ref(''), notice = ref('')
@@ -28,9 +28,13 @@ const confirmationDialog = ref<HTMLDialogElement | null>(null)
 const empty = (): DownloadRuleInput => ({ name: '', source: '', tags: '', keywords: '', types: ['VIDEO'], includeMain: false,
   targetDirectory: '', window: { mode: 'ALL_DAY', start: null, end: null, timezone: 'Asia/Shanghai' } })
 const form = reactive(empty())
+const formId='download-rule-form-'+(getCurrentInstance()?.uid??'standalone')
 const sourceMode = computed(() => downloadRuleSourceMode(form))
 const allTypesSelected = computed(() => downloadRuleTypes.every(item => form.types.includes(item.type)))
 const canAccess = computed(() => props.authorized && props.available && !!props.accountId)
+const pageActive = () => props.active !== false
+const enabledCount = computed(() => items.value.filter(view => view.rule.enabled).length)
+const attentionCount = computed(() => items.value.filter(view => view.state === 'ATTENTION' || !!alert(view)).length)
 const working = computed(() => pending.value && !!busy.value && !['list', 'channels'].includes(busy.value))
 const channelsLoading = computed(() => pending.value && busy.value === 'channels')
 const sourceEntry = computed(() => sourceMode.value === 'POST' ? 'POST' : manualSource.value ? 'MANUAL' : 'CHANNEL')
@@ -51,7 +55,7 @@ const clone = <T,>(value: T): T => JSON.parse(JSON.stringify(value)) as T
 type Ticket = { generation: number; sequence: number; account: string | null }
 function alive(ticket: Ticket) { return !disposed && ticket.generation === generation && ticket.sequence === requestSequence && ticket.account === props.accountId && canAccess.value }
 function begin(kind: string): Ticket | null {
-  if (disposed || !canAccess.value || pending.value) return null
+  if (disposed || !canAccess.value || !pageActive() || pending.value) return null
   pending.value = true; busy.value = kind
   return { generation, sequence: ++requestSequence, account: props.accountId }
 }
@@ -60,8 +64,8 @@ function finish(ticket: Ticket) {
   pending.value = false
   busy.value = ''
   if (disposed) return
-  if (channelsQueued && canAccess.value && formOpen.value && sourceEntry.value === 'CHANNEL') { channelsQueued = false; void loadChannels() }
-  else if (refreshQueued && canAccess.value) { refreshQueued = false; void refresh() }
+  if (channelsQueued && canAccess.value && pageActive() && formOpen.value && sourceEntry.value === 'CHANNEL') { channelsQueued = false; void loadChannels() }
+  else if (refreshQueued && canAccess.value && pageActive()) { refreshQueued = false; void refresh() }
 }
 function report(cause: unknown) { if (cause instanceof ApiError && [401, 403].includes(cause.status)) emit('accessError', cause) }
 const message = (cause: unknown) => cause instanceof Error ? cause.message : '操作未完成。'
@@ -75,7 +79,7 @@ async function refresh() {
   try {
     const result = await api<{ items: DownloadRuleView[]; intervalSeconds: number }>(base)
     if (!alive(ticket)) return
-    if (!result || !Number.isSafeInteger(result.intervalSeconds) || result.intervalSeconds < 1 || result.intervalSeconds > 60 || !Array.isArray(result.items) || result.items.length > 20
+    if (!result || !Number.isSafeInteger(result.intervalSeconds) || result.intervalSeconds < 1 || result.intervalSeconds > 60 || !Array.isArray(result.items)
       || !result.items.every(item => validDownloadRule(item, ticket.account, items.value.find(old => old.rule.id === item.rule.id)))
       || new Set(result.items.map(item => item.rule.id)).size !== result.items.length) throw new Error('持续下载规则列表无法确认，请刷新核对。')
     items.value = result.items; intervalSeconds.value = result.intervalSeconds; listError.value = ''
@@ -249,7 +253,7 @@ async function prepareConfirmation(view: DownloadRuleView, kind: 'enable' | 'tak
   if (!value || pending.value || uncertain.value || !canAccess.value || kind === 'enable' && value.rule.enabled
     || kind === 'takeover' && !canTakeoverDownloadRule(value)) return
   confirmation.value = { kind, view: clone(value) }; await nextTick()
-  if (!disposed && canAccess.value && confirmation.value && current(confirmation.value.view)) confirmationDialog.value?.showModal()
+  if (!disposed && canAccess.value && pageActive() && confirmation.value && current(confirmation.value.view)) confirmationDialog.value?.showModal()
 }
 async function confirm() {
   const selected = confirmation.value
@@ -306,6 +310,13 @@ watch(() => props.refreshVersion, () => {
   if (pending.value) refreshQueued = true
   else void refresh()
 })
+watch(() => props.active, async active => {
+  if (active === false) { confirmationDialog.value?.close(); return }
+  if (!canAccess.value) return
+  if (channelsQueued || formOpen.value) ensureChannels()
+  if (!pending.value && !uncertain.value && !formOpen.value) void refresh()
+  if (confirmation.value) { await nextTick(); if (pageActive() && confirmation.value && current(confirmation.value.view)) confirmationDialog.value?.showModal() }
+})
 if (props.createOnly) onMounted(() => { creationMounted = true; edit(null) })
 onBeforeUnmount(() => { disposed = true; generation++; closeConfirmation(); channels.value = null; items.value = [] })
 </script>
@@ -314,17 +325,18 @@ onBeforeUnmount(() => { disposed = true; generation++; closeConfirmation(); chan
   <section class="download-rules" :class="{ 'creation-only': createOnly }" :aria-label="createOnly ? '新建下载规则' : '持续下载规则'">
     <template v-if="!createOnly">
     <header class="download-rule-heading"><span class="rule-count">{{ items.length }} 条下载规则</span><div class="download-rule-actions"><button type="button" class="btn" :disabled="!canAccess || working" @click="refresh()">刷新</button><button type="button" class="btn primary" :disabled="!canAccess || working || !!uncertain" @click="emit('create','download')">新建下载规则</button></div></header>
+    <div class="rule-stats" aria-label="下载规则概况"><div><span>全部规则</span><strong>{{items.length}}</strong></div><div><span>已启用</span><strong>{{enabledCount}}</strong></div><div :class="{'needs-attention':attentionCount>0}"><span>需要关注</span><strong>{{attentionCount}}</strong></div></div>
     <p v-if="!canAccess" class="notice warning">请先连接 Telegram 并恢复本机服务，查看当前账号的持续下载规则。</p>
     <p v-if="listError" class="notice warning" role="status">{{ listError }}<span v-if="items.length">当前保留上次成功读取的规则。</span></p>
     <p v-if="error && !formOpen" class="notice danger" role="alert">{{ error }}</p><p v-if="notice" class="notice" role="status">{{ notice }}</p>
     <div v-if="uncertain && !formOpen" class="download-rule-uncertain"><span>本次操作需要核对，其他修改已暂停。</span><button type="button" class="btn" :disabled="working || !canAccess" @click="lookup">核对本次操作结果</button><button v-if="uncertain.kind === 'create' || uncertain.kind === 'update'" type="button" class="btn" :disabled="working || !canAccess" @click="reopenForm">返回表单</button></div>
     </template>
-    <RuleFormDialog :open="formOpen" :embedded="embedded" :title="editing ? '修改下载规则' : '新建下载规则'" :busy="working || (createOnly && !!uncertain)" @close="closeForm">
-    <form v-if="formOpen" class="download-rule-form" @submit.prevent="save">
+    <RuleFormDialog :open="formOpen&&active!==false" :embedded="embedded" :title="editing ? '修改下载规则' : '新建下载规则'" :busy="working || (createOnly && !!uncertain)" @close="closeForm">
+    <form v-if="formOpen" :id="formId" class="download-rule-form" @submit.prevent="save">
       <p v-if="!selection" class="download-rule-muted">选择下载范围，设置媒体与保存位置。保存后先暂停，启用后才开始自动下载。</p>
       <p v-if="!canAccess" class="notice warning" role="status">连接暂时中断，已保留填写内容；恢复连接后可继续。</p>
       <p v-if="error" class="notice danger" role="alert">{{ error }}</p>
-      <div v-if="uncertain" class="download-rule-uncertain"><span>保存结果尚未确认，请先核对。</span><button type="button" class="btn" :disabled="working || !canAccess" @click="lookup">核对本次操作结果</button></div>
+      <Teleport :to="actionTarget||'body'" :disabled="!actionTarget" defer><div v-if="uncertain" class="download-rule-uncertain creation-primary-actions"><span>保存结果尚未确认，请先核对。</span><button type="button" class="btn" :disabled="working || !canAccess" @click="lookup">核对本次操作结果</button></div></Teleport>
       <fieldset :disabled="working || !!uncertain || !canAccess">
         <template v-if="!selection">
         <div class="download-rule-source-modes" role="group" aria-label="下载范围"><button type="button" :class="{ selected: sourceEntry === 'CHANNEL' }" :aria-pressed="sourceEntry === 'CHANNEL'" @click="selectSourceEntry('CHANNEL')">频道筛选</button><button type="button" :class="{ selected: sourceEntry === 'POST' }" :aria-pressed="sourceEntry === 'POST'" @click="selectSourceEntry('POST')">指定主帖</button><button type="button" :class="{ selected: sourceEntry === 'MANUAL' }" :aria-pressed="sourceEntry === 'MANUAL'" @click="selectSourceEntry('MANUAL')">手动输入频道</button></div>
@@ -345,7 +357,7 @@ onBeforeUnmount(() => { disposed = true; generation++; closeConfirmation(); chan
         <div class="download-rule-window"><label>执行时段<select v-model="form.window.mode" class="input"><option value="ALL_DAY">全天</option><option value="WINDOW">指定北京时间时段</option></select></label><template v-if="form.window.mode === 'WINDOW'"><label>开始<input v-model="form.window.start" class="input" type="time" required /></label><label>结束<input v-model="form.window.end" class="input" type="time" required /></label></template></div>
         <small>北京时间，支持跨午夜。窗口结束或暂停后不启动下一个文件，已开始的当前文件继续完成。</small>
         <p v-if="editing" class="download-rule-warning">修改后规则会暂停，再次启用会重新检查来源，可能再次下载已有内容；已创建的任务保持原参数。</p>
-        <div class="download-rule-actions"><button class="btn primary" type="submit" :disabled="pending">{{ busy === 'create' || busy === 'update' ? '保存中…' : '保存并暂停' }}</button><button class="btn" type="button" @click="closeForm">取消</button></div>
+        <Teleport :to="actionTarget||'body'" :disabled="!actionTarget" defer><div class="download-rule-actions creation-primary-actions"><button class="btn primary" type="submit" :form="formId" :disabled="pending||!!uncertain||!canAccess">{{ busy === 'create' || busy === 'update' ? '保存中…' : '保存并暂停' }}</button><button v-if="!actionTarget" class="btn" type="button" @click="closeForm">取消</button></div></Teleport>
       </fieldset>
     </form>
     </RuleFormDialog>
@@ -362,16 +374,23 @@ onBeforeUnmount(() => { disposed = true; generation++; closeConfirmation(); chan
       <p v-if="view.summary.job" class="rule-latest">最近任务：{{ taskLabels[view.summary.job.state] ?? view.summary.job.state }} · 已保存 {{ view.summary.job.completed }}/{{ view.summary.job.total }}<span v-if="view.summary.job.manual"> · 已转为手动</span><span v-else-if="view.summary.job.ruleVersion !== view.rule.version"> · 旧版本任务</span></p>
       <p v-if="view.summary.job?.held" class="download-rule-warning">任务已手动暂停，请到任务中心处理。</p>
       <details class="rule-observation"><summary>读取进度</summary><p>{{ progress(view) }}</p><p>{{ rangeSummary(view) }}</p></details>
-      <div class="download-rule-actions"><button class="btn" type="button" :disabled="working || !!uncertain || !canAccess || !canCheckDownloadRule(view)" @click="check(view)">立即检查</button><button v-if="view.summary.job" class="btn" type="button" @click="emit('tasks')">查看任务</button><button v-if="canTakeoverDownloadRule(view)" class="btn" type="button" :disabled="working || !!uncertain || !canAccess" @click="prepareConfirmation(view, 'takeover')">将此任务转为手动</button></div>
-      <template #actions><button type="button" class="btn" :disabled="working || !canAccess" @click="browse(view)">浏览帖子</button><button type="button" class="btn" :disabled="working || !!uncertain || !canAccess" @click="view.rule.enabled ? pause(view) : prepareConfirmation(view, 'enable')">{{ view.rule.enabled ? '暂停' : '启用' }}</button><button type="button" class="btn" :disabled="working || !!uncertain || !canAccess" @click="edit(view)">修改规则</button></template>
+      <template #actions>
+        <div class="rule-at-a-glance"><div><span>执行时段 · 北京时间</span><strong>{{view.rule.input.window.mode==='ALL_DAY'?'全天':view.rule.input.window.start+'—'+view.rule.input.window.end}}</strong><small>{{view.state==='WAITING_WINDOW'?'下次 '+ruleTime(view.nextAllowedAt):view.rule.enabled?'按规则持续检查':'已暂停，等待手动启用'}}</small></div><div><span>扫描进度</span><strong>已检查 {{view.summary.scanned}} · 符合 {{view.summary.matched}}</strong><small>待读取 / 核对 {{view.summary.unresolved}} · 已观察 {{view.summary.media}} 个媒体</small></div><div><span>最近任务</span><strong>{{view.summary.job?(taskLabels[view.summary.job.state]??view.summary.job.state):'尚无任务'}}</strong><small>{{view.summary.job?'已保存 '+view.summary.job.completed+' / '+view.summary.job.total:'新规则保存后保持暂停'}}</small></div></div>
+        <button type="button" class="btn rule-toggle" :class="{'primary':!view.rule.enabled}" :disabled="working || !!uncertain || !canAccess" @click="view.rule.enabled ? pause(view) : prepareConfirmation(view, 'enable')">{{ view.rule.enabled ? '暂停' : '启用' }}</button><button type="button" class="btn" :disabled="working || !!uncertain || !canAccess" @click="edit(view)">修改规则</button><button type="button" class="btn" :disabled="working || !canAccess" @click="browse(view)">浏览帖子</button><button class="btn" type="button" :disabled="working || !!uncertain || !canAccess || !canCheckDownloadRule(view)" @click="check(view)">立即检查</button><button v-if="view.summary.job" class="btn" type="button" @click="emit('tasks')">查看任务</button><button v-if="canTakeoverDownloadRule(view)" class="btn" type="button" :disabled="working || !!uncertain || !canAccess" @click="prepareConfirmation(view, 'takeover')">将此任务转为手动</button>
+      </template>
     </CompactRecord>
     </template>
   </section>
-  <NewTransfer v-if="!createOnly && browsing" :key="browsing.rule.id + ':' + browsing.rule.revision" preview-only :browse-source="browsing.rule.input" :authorized="authorized" :available="available" :account-id="accountId" @close="browsing = null" @settings="browsing = null" @access-error="emit('accessError', $event)" />
+  <NewTransfer v-if="!createOnly && browsing && active!==false" :key="browsing.rule.id + ':' + browsing.rule.revision" preview-only :browse-source="browsing.rule.input" :authorized="authorized" :available="available" :account-id="accountId" @close="browsing = null" @settings="browsing = null" @access-error="emit('accessError', $event)" />
   <dialog v-if="!createOnly" ref="confirmationDialog" class="download-rule-dialog" @cancel="closeConfirmation"><template v-if="confirmation"><h2>{{ confirmation.kind === 'enable' ? '确认启用持续下载' : '确认转为手动处理' }}</h2><strong>{{ confirmation.view.rule.input.name }} · {{ confirmation.view.rule.channelTitle }}</strong><template v-if="confirmation.kind === 'enable'"><p v-if="downloadRuleSourceMode(confirmation.view.rule.input) === 'POST'">只持续检查这条指定主帖及其评论，所选媒体会实际下载，重复媒体单独保存。</p><p v-else>会扫描全部可读历史并持续检查新帖、旧帖评论，符合条件的媒体会实际下载，重复媒体单独保存。</p><p>{{ filterLabel(confirmation.view.rule.input) }}<br />{{ typeLabel(confirmation.view.rule.input) }}<br />{{ confirmation.view.rule.input.includeMain ? '包含主帖自身全部媒体' : '不含主帖自身媒体' }}</p><p>保存根目录：<code>{{ confirmation.view.rule.input.targetDirectory }}</code><br />{{ windowLabel(confirmation.view.rule.input) }}</p><p>当前文件继续完成后才受暂停和窗口结束限制。修改保存会新建版本从头扫描，可能再次下载已有内容；旧任务不改。</p></template><template v-else><p>仅将当前停稳的任务解除规则控制，参数、文件和状态保留，不会立即开始下载。之后请到任务中心继续或处理。</p><p>规则若仍启用，可以继续产生后续任务；原媒体声明保留，不会重复当前页。</p></template><div class="download-rule-actions"><button class="btn" type="button" :disabled="working" @click="closeConfirmation">取消</button><button class="btn" type="button" :disabled="working" @click="confirm">{{ confirmation.kind === 'enable' ? '确认启用并允许下载' : '确认转为手动' }}</button></div></template></dialog>
 </template>
 
 <style scoped>
 .download-rules.creation-only{margin:0;padding:0;border:0}.download-rules.creation-only .download-rule-form{margin:0;padding:0}
 .download-rules{margin-bottom:34px;padding-bottom:28px;border-bottom:1px solid #dce7f0;min-width:0}.download-rule-heading{display:flex;justify-content:space-between;gap:16px;align-items:center;margin-bottom:15px}.download-rule-heading>div:first-child{min-width:0;flex:1}.download-rule-heading h2{font-size:16px;color:#486a82;font-weight:600;margin:0 0 7px}.download-rule-heading p,.download-rule-empty{font-size:11px;line-height:1.9;color:#839dae}.download-rule-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap}.download-rule-actions>.btn{font-size:10px}.download-rule-heading>.download-rule-actions{justify-content:flex-end}.download-rule-empty{padding:25px 15px;text-align:center;background:#fff;border:1px solid #e0e9f1;border-radius:7px}.download-rule-form{margin:10px 0 0;min-width:0}.download-rule-form>fieldset{min-width:0}.download-rule-source-modes{display:flex;gap:8px;margin:15px 0;flex-wrap:wrap}.download-rule-source-modes button{border:1px solid #dce6ed;border-radius:6px;padding:9px 15px;background:#fff;color:#708fa6;font-size:12px;cursor:pointer}.download-rule-source-modes button.selected{background:#263f54;border-color:#263f54;color:#fff}.download-rule-form h3{font-size:14px;font-weight:550;color:#52748d;margin:0 0 15px}.download-rule-form label{display:flex;flex-direction:column;gap:7px;font-size:11px;color:#69879d;margin:15px 0}.download-rule-form small,.download-rule-muted{font-size:10px;line-height:1.9;color:#8aa2b4}.download-rule-form>fieldset>.download-rule-actions{margin-top:17px}.download-rule-fields{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:15px}.download-rule-channel{display:flex;align-items:flex-end;gap:10px;margin-bottom:12px}.download-rule-channel>.btn{font-size:10px;flex-shrink:0}.download-rule-media{margin-top:18px}.download-rule-media legend{font-size:11px;color:#67869e;margin-bottom:9px}.download-rule-types{display:flex;gap:7px;flex-wrap:wrap}.download-rule-types button{border:1px solid #dce6ed;background:#fff;color:#819aac;font-size:10px;border-radius:5px;padding:6px 11px}.download-rule-types button.selected{color:#fff;background:#263f54;border-color:#263f54}.download-rule-form .download-rule-main{flex-direction:row;align-items:flex-start;gap:7px;line-height:1.8}.download-rule-main input{accent-color:#263f54;margin-top:3px}.download-rule-window{display:flex;gap:15px;flex-wrap:wrap}.download-rule-window label{min-width:0}.download-rule-progress{flex-basis:100%;display:flex;flex-direction:column;gap:4px;font-size:10px;line-height:1.9;color:#7895a9;overflow-wrap:anywhere;margin:2px 0 5px;min-width:0}.download-rule-warning{font-size:10px;line-height:1.9;color:#ab824e;overflow-wrap:anywhere}.download-rule-uncertain{display:flex;gap:10px;flex-wrap:wrap;align-items:center;font-size:11px;color:#a4824d;margin:10px 0 18px}.download-rules :deep(.record-body){font-size:11px;line-height:1.9;color:#7a95a9}.download-rules :deep(.record-body)>p{margin:8px 0;overflow-wrap:anywhere}.download-rule-path code{font-size:10px;overflow-wrap:anywhere}.download-rule-job{padding:10px;background:#f4f8fb;border-radius:5px}.download-rules details{font-size:10px;line-height:1.9;overflow-wrap:anywhere}.download-rules details p{margin-top:10px}.download-rules summary{cursor:pointer}.download-rule-dialog{width:min(600px,calc(100vw - 30px));max-height:85vh;overflow:auto;padding:23px;border:1px solid #d9e5ef;border-radius:9px;color:#587a92;font-size:12px;line-height:1.9}.download-rule-dialog::backdrop{background:#12283b88}.download-rule-dialog h2{font-size:16px;margin:0 0 12px}.download-rule-dialog p{margin:13px 0;overflow-wrap:anywhere}.download-rule-dialog strong{overflow-wrap:anywhere}.download-rule-dialog code{font-size:11px;overflow-wrap:anywhere}@media(max-width:700px){.download-rule-heading{flex-direction:column}.download-rule-fields{grid-template-columns:minmax(0,1fr);gap:0}.download-rule-channel{align-items:stretch;flex-direction:column}.download-rule-channel>.btn{align-self:flex-end}.download-rule-form{padding:17px 13px}.download-rule-window{gap:0 10px}.download-rule-window label:first-child{flex-basis:100%}.download-rule-dialog{padding:17px}}
+.rule-stats{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px;margin:0 0 22px}.rule-stats>div{display:flex;align-items:center;justify-content:space-between;gap:12px;border:1px solid var(--line,#e1e9f1);border-radius:11px;padding:16px 18px;background:#fff}.rule-stats span{font-size:12px;color:var(--muted,#6c8297)}.rule-stats strong{font-size:22px;line-height:1.3;font-weight:650;color:var(--ink,#243f55)}.rule-stats .needs-attention strong{color:#a47732}
+.rule-at-a-glance{flex-basis:100%;display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px;padding:14px 0 16px;margin-bottom:4px;border-bottom:1px solid var(--line,#e5edf4)}.rule-at-a-glance>div{min-width:0;display:flex;flex-direction:column;gap:5px}.rule-at-a-glance span{font-size:12px;color:#71869a;line-height:1.7}.rule-at-a-glance strong{font-size:13px;font-weight:600;line-height:1.7;color:#345773;overflow-wrap:anywhere}.rule-at-a-glance small{font-size:12px;line-height:1.7;color:#6c859a;overflow-wrap:anywhere}
+:deep(.compact-record){border-radius:11px;margin-bottom:15px}:deep(.record-summary){padding:16px 18px;gap:8px 16px}:deep(.record-title){font-size:14px;line-height:1.7}:deep(.record-meta),:deep(.record-state),:deep(.record-hint),:deep(.record-alert){font-size:12px;line-height:1.7}:deep(.record-actions){padding:0 18px 16px;gap:8px}:deep(.record-actions .btn){font-size:12px;min-height:34px;padding:6px 11px}
+@media(max-width:680px){.rule-stats{gap:9px}.rule-stats>div{padding:13px 12px;align-items:flex-start;flex-direction:column;gap:6px}.rule-stats strong{font-size:20px}.rule-at-a-glance{grid-template-columns:minmax(0,1fr);gap:12px;padding-top:12px}.rule-at-a-glance>div{display:grid;grid-template-columns:120px minmax(0,1fr);gap:2px 9px}.rule-at-a-glance small{grid-column:2}.rule-at-a-glance span{grid-row:span 2}:deep(.record-summary){padding:14px}:deep(.record-actions){padding:0 14px 14px}}
+.download-rules{margin:0;padding:0;border:0}.download-rule-heading{margin-bottom:16px}.rule-count{font-size:13px;color:#657f94}.download-rule-actions>.btn{font-size:12px;min-height:34px}.download-rule-form label{font-size:13px;color:#4c6c84}.download-rule-form .input{font-size:14px;min-height:40px}.download-rule-form small,.download-rule-muted,.download-rule-warning,.download-rule-uncertain,.download-rules details{font-size:12px;line-height:1.8}.download-rule-empty{border:1px dashed #cedde9;border-radius:11px;background:#fff;font-size:13px;padding:46px 20px;line-height:1.8;color:#698298}.download-rules :deep(.record-body){font-size:12px;line-height:1.8}.download-rule-types button{font-size:12px;padding:7px 11px}.download-rule-dialog{font-size:13px}.download-rule-dialog h2{font-size:18px}.download-rule-dialog .btn{font-size:13px}
 </style>

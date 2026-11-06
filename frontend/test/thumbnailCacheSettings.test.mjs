@@ -38,6 +38,14 @@ test('clear is explicit, serial and updates counts only after its own receipt', 
   resolve({ cache: view({ files: 0, bytes: 0 }), removed: 2 }); await clearing
   assert.equal(f.state.saved.value.files, 0); assert.equal(f.state.saved.value.bytes, 0)
   assert.deepEqual(f.calls[1], { path: '/settings/thumbnail-cache/clear', method: 'POST' }); assert.match(f.state.notice.value, /已清理/)
+  assert.match(f.state.notice.value,/页面内存与本机/)
+})
+
+test('changing cache quota sends the explicit limit and keeps the selected directory',async t=>{
+  const f=mount(t);await flush();f.state.maximumBytes.value=512*1024*1024
+  f.responses.push(view({maximumBytes:512*1024*1024}));await f.state.perform('save')
+  assert.deepEqual(f.calls.at(-1),{path:'/settings/thumbnail-cache',method:'PUT',body:{directory:view().directory,maximumBytes:512*1024*1024}})
+  assert.equal(f.state.saved.value.maximumBytes,512*1024*1024)
 })
 test('unknown saves are not automatically resent and require a GET before another mutation', async t => {
   const f = mount(t); await flush(); f.state.directory.value = 'D:\\images'; f.responses.push(new Error('Timeout'))
@@ -55,4 +63,10 @@ test('leaving settings during clear ignores its late response', async t => {
   const f = mount(t); await flush(); let resolve; f.responses.push(new Promise(yes => { resolve = yes }))
   const clearing = f.state.perform('clear'); f.destroy(); resolve({ cache: view({ files: 0, bytes: 0 }), removed: 2 }); await clearing
   assert.equal(f.state.saved.value.files, 2); assert.equal(f.state.notice.value, '')
+})
+test('returning to the cache panel keeps an unsaved location and quota draft',async t=>{
+  const f=mount(t);await flush();f.state.directory.value='D:\\draft-images';f.state.maximumBytes.value=512*1024*1024
+  f.props.active=false;await flush();f.responses.push(view());f.props.active=true;await flush()
+  assert.equal(f.state.directory.value,'D:\\draft-images');assert.equal(f.state.maximumBytes.value,512*1024*1024)
+  assert.equal(f.state.saved.value.directory,view().directory)
 })

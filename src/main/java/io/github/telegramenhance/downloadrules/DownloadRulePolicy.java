@@ -54,6 +54,7 @@ public final class DownloadRulePolicy {
             guard.run(); if (!bound(c, account, taskId)) return false;
             String state = taskState(c, account, taskId);
             if (!"COMPLETED".equals(state)) {
+                update(c, "DELETE FROM download_task_retries WHERE account_id=? AND task_id=?", account, taskId);
                 update(c, "UPDATE download_rule_tasks SET held=1 WHERE task_id=? AND account_id=? AND manual=0", taskId, account);
                 update(c, "UPDATE download_tasks SET pause_requested=1,state=CASE WHEN state='RUNNING' THEN 'RUNNING' ELSE 'PAUSED' END,updated_at=? WHERE task_id=? AND account_id=?", clock.millis(), taskId, account);
             }
@@ -69,6 +70,7 @@ public final class DownloadRulePolicy {
             if (!"PAUSED".equals(state) && !"FAILED".equals(state)) throw new IllegalArgumentException("任务当前不能继续，请刷新状态");
             String reason = block(c, account, taskId, clock.instant(), true);
             if (reason != null) throw new Blocked(reason);
+            update(c, "DELETE FROM download_task_retries WHERE account_id=? AND task_id=?", account, taskId);
             update(c, "UPDATE download_rule_tasks SET held=0 WHERE task_id=? AND account_id=?", taskId, account);
             update(c, "UPDATE download_tasks SET state='QUEUED',pause_requested=0,error_message=NULL,updated_at=? WHERE task_id=? AND account_id=?", clock.millis(), taskId, account);
             update(c, "UPDATE download_items SET error_message=NULL WHERE task_id=? AND state NOT IN ('COMPLETED','SKIPPED_HISTORY')", taskId);
@@ -89,6 +91,7 @@ public final class DownloadRulePolicy {
                 }
             }
             if (block(c, account, taskId, instant, false) != null) return false;
+            update(c, "DELETE FROM download_task_retries WHERE account_id=? AND task_id=?", account, taskId);
             update(c, "UPDATE download_tasks SET state='QUEUED',pause_requested=0,error_message=NULL,updated_at=? WHERE task_id=? AND account_id=?", clock.millis(), taskId, account);
             guard.run(); return true;
         });
