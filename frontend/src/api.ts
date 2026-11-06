@@ -1,6 +1,6 @@
 import { invalidateThumbnails } from './thumbnailMemory'
 
-export type ProxyType = 'DIRECT' | 'SOCKS5' | 'HTTP'
+export type ProxyType = 'DIRECT' | 'SYSTEM' | 'SOCKS5' | 'HTTP'
 export interface Settings {
   apiId: number
   apiHashStored: boolean

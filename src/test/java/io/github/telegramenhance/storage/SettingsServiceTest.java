@@ -111,6 +111,18 @@ class SettingsServiceTest {
     }
 
     @Test
+    void systemProxyCanBeSavedWithoutManualAddress() {
+        try (Database database = new Database(new AppPaths(directory))) {
+            SettingsService settings = new SettingsService(database, new SecretProtector());
+            settings.save(new SettingsUpdate(0, "", new ProxyInput("SYSTEM", "", 0, "", "")));
+            assertEquals("SYSTEM", settings.view().proxy().type());
+            assertEquals("SYSTEM", settings.credentials().proxy().type());
+            assertEquals("", settings.view().proxy().host());
+            assertEquals(0, settings.view().proxy().port());
+        }
+    }
+
+    @Test
     void firstCredentialsRequireACompleteHashAndDirectAcceptsEmptyHostAndZeroPort() {
         try (Database database = new Database(new AppPaths(directory))) {
             SettingsService settings = new SettingsService(database, new SecretProtector());

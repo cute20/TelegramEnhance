@@ -21,6 +21,7 @@ public class TelegramService {
                          String userId, String displayName, String error, String authHint, AuthCodeDelivery.View codeDelivery) {}
     public record ProxyResult(String level, String message, long milliseconds) {}
     private final SettingsService settings;
+    private final SystemProxyResolver systemProxy = new SystemProxyResolver();
     private final AppPaths paths;
     private final AuthCodeDelivery codeDelivery = new AuthCodeDelivery();
     private final ExecutorService commands = new ThreadPoolExecutor(1, 1, 0, TimeUnit.MILLISECONDS,
@@ -133,6 +134,7 @@ public class TelegramService {
         if (connecting) return status();
         connection = settings.credentials();
         if (connection.apiId() <= 0 || connection.apiHash().isBlank()) throw new IllegalArgumentException("请先保存 API ID 和 API Hash");
+        connection = new ConnectionConfig(connection.apiId(), connection.apiHash(), systemProxy.resolve(connection.proxy()));
         if (closed.isDone()) newClient();
         connecting = true; authState = "STARTING"; error = null; authHint = null;
         try { onAuth(await(client.sendAsync(new TdApi.GetAuthorizationState()))); }
@@ -226,8 +228,11 @@ public class TelegramService {
         return status();
     }); }
     public CompletableFuture<ProxyResult> testProxy() { return submit(() -> {
-        long started = System.nanoTime(); var p = settings.credentials().proxy();
-        if ("DIRECT".equals(p.type())) return new ProxyResult("INFO", "已选择直连。请点击连接 Telegram，以实际连接状态验证网络。", 0);
+        long started = System.nanoTime(); var configured = settings.credentials().proxy();
+        var p = systemProxy.resolve(configured);
+        if ("DIRECT".equals(p.type())) return new ProxyResult("INFO", "SYSTEM".equals(configured.type())
+                ? "Windows 未启用手动代理，当前使用直连。请连接 Telegram 验证网络。"
+                : "已选择直连。请点击连接 Telegram，以实际连接状态验证网络。", 0);
         // TestProxy is explicitly supported before SetTdlibParameters by this pinned TDLight build.
         if (closed.isDone()) newClient();
         try {

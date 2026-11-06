@@ -65,6 +65,16 @@ function nodes(node) {
 }
 const component = (tree, name) => nodes(tree).find(node => node.type?.__name === name)
 
+test('system proxy saves without manual host and hides manual proxy fields', t => {
+  const f = mount(t)
+  f.state.page.value = 'settings'
+  Object.assign(f.state.form, { proxyType: 'SYSTEM', host: '', port: '', username: '', password: '' })
+  assert.equal(f.state.settingsPayload().proxy.type, 'SYSTEM')
+  const tree = nodes(f.render())
+  assert.ok(tree.some(node => node.type === 'option' && node.props?.value === 'SYSTEM'))
+  assert.ok(!tree.some(node => node.props?.id === 'proxy-host'))
+})
+
 test('a connected first visit opens the library while an explicitly selected settings page is retained',async t=>{
   const f=mount(t)
   f.state.applyTelegram({...f.state.telegram.value,authState:'READY'})

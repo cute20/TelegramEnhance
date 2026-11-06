@@ -238,7 +238,7 @@ function settingsPayload() {
   if (!savedSettings.value?.apiHashStored && !form.apiHash.trim()) throw new Error('请填写 Telegram API Hash。')
   if (form.apiHash.trim() && !/^[a-fA-F0-9]{32}$/.test(form.apiHash.trim())) throw new Error('API Hash 应为 32 位十六进制字符，请检查应用凭证。')
   const port = Number(form.port)
-  if (form.proxyType !== 'DIRECT') {
+  if ((form.proxyType === 'HTTP' || form.proxyType === 'SOCKS5')) {
     if (!form.host.trim()) throw new Error('请填写代理主机地址。')
     if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('代理端口应为 1–65535 之间的整数。')
   }
@@ -347,9 +347,9 @@ onBeforeUnmount(() => { disposed = true; stopPolling(); window.clearInterval(clo
       </div>
     </aside>
     <div class="workspace">
-      <header class="topbar"><div class="topbar-leading"><button type="button" class="icon-btn navigation-toggle" :aria-label="railCollapsed?'展开导航':'折叠导航'" :aria-expanded="!railCollapsed" @click="toggleNavigation"><AppIcon name="chevron" /></button><div class="breadcrumb"><span>工作空间</span><AppIcon name="chevron" /><strong>{{ currentPage.label }}</strong></div></div><div class="top-actions"><button class="btn primary new-transfer" :disabled="!canOperate" @click="openTransfer()"><AppIcon name="plus" />新建传输</button><button class="icon-btn" type="button" aria-label="账号与代理设置" title="账号与代理设置" @click="navigate('settings')"><AppIcon name="settings" /></button></div></header>
+      <header class="topbar"><div class="topbar-leading"><button type="button" class="icon-btn navigation-toggle" :aria-label="railCollapsed?'展开导航':'折叠导航'" :aria-expanded="!railCollapsed" @click="toggleNavigation"><AppIcon name="chevron" /></button><div class="breadcrumb"><span>工作空间</span><AppIcon name="chevron" /><strong>{{ currentPage.label }}</strong></div></div><div class="top-actions"><button class="btn primary new-transfer" :disabled="!canOperate" @click="openTransfer()"><AppIcon name="plus" />新建传输</button><button type="button" class="btn close-project" :disabled="!canOperate" @click="exitProject"><AppIcon name="power" />{{ busy === 'exit' ? '正在关闭…' : '关闭项目' }}</button><button class="icon-btn" type="button" aria-label="账号与代理设置" title="账号与代理设置" @click="navigate('settings')"><AppIcon name="settings" /></button></div></header>
       <main id="main" tabindex="-1">
-        <div v-if="page !== 'library'" :class="['page-heading',{'settings-heading':page==='settings'}]"><div><h1>{{ currentPage.label }}</h1><p>{{pageDescription}}</p></div><button v-if="page === 'settings'" type="button" class="btn close-project" :disabled="!canOperate" @click="exitProject"><AppIcon name="power" />{{ busy === 'exit' ? '正在关闭…' : '关闭项目' }}</button></div>
+        <div v-if="page !== 'library'" :class="['page-heading',{'settings-heading':page==='settings'}]"><div><h1>{{ currentPage.label }}</h1><p>{{pageDescription}}</p></div></div>
         <div v-if="exited" class="notice success service-notice" role="status"><AppIcon name="check" /><div><strong>已请求关闭项目</strong><p>后台正在保存并退出，Telegram 会话保留。再次使用时，请重新运行项目启动脚本。</p></div></div>
         <div v-else-if="accessInvalid" class="notice warning service-notice" role="alert"><AppIcon name="lock" /><div><strong>请从项目启动脚本打开界面</strong><p>当前页面缺少有效的本机访问令牌。请使用启动脚本打开的新链接进入。</p></div></div>
         <div v-else-if="!loading && !serviceReachable" class="notice warning service-notice" role="alert"><AppIcon name="info" /><div><strong>本机服务连接中断</strong><p>请确认 Java 后台仍在运行。恢复后会自动重查 Telegram 状态。</p></div><button class="btn" :disabled="!!busy" @click="bootstrap">重新读取</button></div>
@@ -369,8 +369,8 @@ onBeforeUnmount(() => { disposed = true; stopPolling(); window.clearInterval(clo
                   </section>
                   <section class="settings-section" aria-labelledby="proxy-heading">
                     <div class="section-heading"><span class="section-icon"><AppIcon name="rules" /></span><div><h2 id="proxy-heading">软件独立代理</h2><p>只用于此应用的 Telegram 连接，不修改系统代理。</p></div></div>
-                    <div class="field"><label for="proxy-type">连接方式</label><select id="proxy-type" v-model="form.proxyType" class="input"><option value="DIRECT">直连 · 不使用代理</option><option value="SOCKS5">SOCKS5 代理</option><option value="HTTP">HTTP 代理</option></select></div>
-                    <template v-if="form.proxyType !== 'DIRECT'">
+                    <div class="field"><label for="proxy-type">连接方式</label><select id="proxy-type" v-model="form.proxyType" class="input"><option value="DIRECT">直连 · 不使用代理</option><option value="SYSTEM">使用系统代理</option><option value="SOCKS5">SOCKS5 代理</option><option value="HTTP">HTTP 代理</option></select></div>
+                    <p v-if="form.proxyType === 'SYSTEM'" class="muted">连接或检查时读取 Windows 当前用户的手动代理配置，无需填写地址。系统未启用手动代理时直连；修改系统代理后请断开并重新连接。暂不支持 PAC / 自动检测及系统代理认证，需要时请选择手动 HTTP 或 SOCKS5 代理。</p><template v-if="(form.proxyType === 'HTTP' || form.proxyType === 'SOCKS5')">
                       <div class="form-grid proxy-address"><div class="field"><label for="proxy-host">代理主机</label><input id="proxy-host" v-model="form.host" class="input mono" placeholder="127.0.0.1" spellcheck="false" required /><small>填写主机名或 IP 地址，不包含协议前缀。</small></div><div class="field"><label for="proxy-port">端口</label><input id="proxy-port" v-model="form.port" class="input mono" inputmode="numeric" pattern="[0-9]+" placeholder="例如 7890" required /></div></div>
                       <div class="form-grid"><div class="field"><label for="proxy-username">代理用户名 <span class="optional">可选</span></label><input id="proxy-username" v-model="form.username" class="input" autocomplete="off" spellcheck="false" /></div><div class="field"><label for="proxy-password">代理密码 <span class="optional">可选</span></label><input id="proxy-password" v-model="form.password" class="input" type="password" autocomplete="new-password" :placeholder="savedSettings?.proxy.passwordStored ? '已保存，留空保持不变' : '代理无认证时留空'" /></div></div>
                     </template>
@@ -432,7 +432,8 @@ onBeforeUnmount(() => { disposed = true; stopPolling(); window.clearInterval(clo
 </template>
 
 <style scoped>
-.page-heading>div{min-width:0}.close-project{flex-shrink:0;align-self:flex-start;margin-top:20px;color:#ad6b68;border-color:#e5d3d1;background:#fff;font-size:11px}.close-project>.icon{width:15px;height:15px}
-.settings-heading>.close-project{margin-top:6px}
+.page-heading>div{min-width:0}.close-project{flex-shrink:0;margin-top:0;color:#ad6b68;border-color:#e5d3d1;background:#fff;font-size:11px}.close-project>.icon{width:15px;height:15px}
+.top-actions{gap:12px}
+@media(max-width:680px){.topbar{height:auto;min-height:58px;flex-wrap:wrap;padding-top:10px;padding-bottom:10px;gap:8px}.top-actions{gap:8px;margin-left:auto}.top-actions .close-project{min-height:30px;font-size:10px;padding:5px 8px}}
 @media(max-width:480px){.page-heading{flex-wrap:wrap;gap:12px}.close-project{margin-top:0}}
 </style>

@@ -122,15 +122,15 @@ public final class SettingsService {
     private ProxyInput validateProxy(ProxyInput proxy) {
         if (proxy == null) throw invalid("缺少代理设置");
         String type = proxy.type() == null ? "" : proxy.type().strip().toUpperCase(Locale.ROOT);
-        if (!type.equals("DIRECT") && !type.equals("SOCKS5") && !type.equals("HTTP")) {
-            throw invalid("代理类型必须为 DIRECT、SOCKS5 或 HTTP");
+        if (!type.equals("DIRECT") && !type.equals("SYSTEM") && !type.equals("SOCKS5") && !type.equals("HTTP")) {
+            throw invalid("代理类型必须为 DIRECT、SYSTEM、SOCKS5 或 HTTP");
         }
         String username = proxy.username() == null ? "" : proxy.username();
         if (username.length() > 256 || containsControl(username)) throw invalid("代理用户名格式无效");
         if (proxy.password() != null && (proxy.password().length() > 4096 || containsControl(proxy.password()))) {
             throw invalid("代理密码格式无效");
         }
-        if (type.equals("DIRECT")) return new ProxyInput(type, "", 0, "", proxy.password());
+        if (type.equals("DIRECT") || type.equals("SYSTEM")) return new ProxyInput(type, "", 0, "", proxy.password());
         String host = proxy.host() == null ? "" : proxy.host().strip();
         if (host.isEmpty() || host.length() > 253 || host.chars().anyMatch(c -> Character.isWhitespace(c) || Character.isISOControl(c))
                 || host.chars().anyMatch(c -> "/\\?#@".indexOf(c) >= 0)) {
