@@ -102,6 +102,39 @@ test('single-post shared preview is explicitly clicked in the footer then hands 
   assert.equal(button(tree, '重新预览来源').location, 'body'); assert.equal(hasClass(button(tree, '重新预览来源').node, 'primary'), false)
   assert.equal(primary(tree).length, 1); assert.match(text(primary(tree)[0].node), /创建并开始下载/)
 })
+
+test('post preview never exposes the hidden channel scan action in the shared footer', async t => {
+  const f = mount(t, 'NewTransfer', { embedded: true, selection: selection() }); await flush()
+  const channelNode = located(f.render()).find(({ node }) => node.type?.__name?.endsWith('DownloadChannelPreview.vue')).node
+  const channelProps = Object.fromEntries(Object.entries(channelNode.props).map(([key, value]) => [key.replace(/-([a-z])/g, (_, letter) => letter.toUpperCase()), value]))
+  const child = mount(t, 'DownloadChannelPreview', channelProps); await flush()
+  const actions = [...primary(f.render()), ...primary(child.render())]
+  assert.deepEqual(actions.map(({ node }) => text(node)), ['预览下载来源'])
+  assert.equal(f.calls.length + child.calls.length, 0)
+})
+
+test('switching between channel and post preview transfers footer ownership without losing the channel scan', async t => {
+  const f = mount(t, 'NewTransfer', { embedded: true, selection: { ...selection(), entry: 'CHANNEL', source: '-1001' } }); await flush()
+  const channelProps = () => {
+    const node = located(f.render()).find(({ node }) => node.type?.__name?.endsWith('DownloadChannelPreview.vue')).node
+    return Object.fromEntries(Object.entries(node.props).map(([key, value]) => [key.replace(/-([a-z])/g, (_, letter) => letter.toUpperCase()), value]))
+  }
+  const child = mount(t, 'DownloadChannelPreview', channelProps()); await flush()
+  const labels = () => [...primary(f.render()), ...primary(child.render())].map(({ node }) => text(node))
+  assert.deepEqual(labels(), ['开始扫描预览'])
+
+  f.state.downloadSourceKind.value = 'post'; Object.assign(child.props, channelProps()); await flush()
+  assert.deepEqual(labels(), ['预览下载来源'])
+  f.state.backToChannel(); Object.assign(child.props, channelProps()); await flush()
+  assert.deepEqual(labels(), ['开始扫描预览'])
+
+  child.state.scan.value = { id: ID, channel: { title: '合成频道' }, rows: [], tags: [], keywords: [], scanned: 0, matched: 0, unverified: 0, exhausted: true, canContinue: false, warnings: [] }
+  f.state.downloadSourceKind.value = 'post'; Object.assign(child.props, channelProps()); await flush()
+  f.state.backToChannel(); Object.assign(child.props, channelProps()); await flush()
+  assert.equal(child.state.scan.value.id, ID)
+  assert.match(text(child.render()), /合成频道/)
+  assert.equal(f.calls.length + child.calls.length, 0)
+})
 test('external single-post preview button retains the source form association when teleported', async t => {
   const f = mount(t, 'NewTransfer', { embedded: true, authorized: false }); f.state.link.value = LINK; await flush()
   const tree = f.render(), first = button(tree, '预览下载来源')

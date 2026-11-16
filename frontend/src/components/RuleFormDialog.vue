@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { nextTick, onBeforeUnmount, ref, useId, watch } from 'vue'
 
-const props=withDefaults(defineProps<{open:boolean;title:string;busy?:boolean;embedded?:boolean;stableSize?:boolean;scrollKey?:string}>(),{busy:false,embedded:false,stableSize:false,scrollKey:'default'})
+const props=withDefaults(defineProps<{open:boolean;title:string;busy?:boolean;embedded?:boolean;stableSize?:boolean;scrollKey?:string;persistent?:boolean}>(),{busy:false,embedded:false,stableSize:false,scrollKey:'default',persistent:false})
 const emit=defineEmits<{close:[]}>()
 const dialog=ref<HTMLDialogElement|null>(null),closeButton=ref<HTMLButtonElement|null>(null)
 const body=ref<HTMLElement|null>(null),scrollPositions=new Map<string,number>()
@@ -22,13 +22,15 @@ async function syncDialog(){
 function requestClose(){if(!props.busy)emit('close')}
 function cancel(event:Event){event.preventDefault();requestClose()}
 function backdrop(event:MouseEvent){
+  if(props.persistent)return
   const element=dialog.value;if(!element||event.target!==element)return
   const bounds=element.getBoundingClientRect()
   if(event.clientX<bounds.left||event.clientX>bounds.right||event.clientY<bounds.top||event.clientY>bounds.bottom)requestClose()
 }
 function closed(){
   if(disposed)return
-  if(props.open){if(props.busy)void syncDialog();else requestClose()}
+  // Keep the mounted form and its draft when the browser closes a persistent dialog.
+  if(props.open){if(props.busy||props.persistent)void syncDialog();else requestClose()}
   else restoreFocus()
 }
 watch([()=>props.open,()=>dialog.value],()=>void syncDialog(),{flush:'post',immediate:true})
